@@ -1,15 +1,18 @@
 #!/bin/bash
 
-# Function to display logs for a given service
-show_logs() {
-    service_name=$1
-    docker compose logs "$service_name"
+# Funktion zum Verfolgen von Logs eines Containers
+follow_logs() {
+    container_name=$1
+    docker logs -f "$container_name"
 }
 
-# Display logs for haven-relay
-show_logs haven-relay
+# Logs für haven-relay verfolgen
+follow_logs haven-relay &
 
-# Display logs for haven-tor if specified as an argument
+# Logs für haven-tor verfolgen, wenn als Argument angegeben
 if [[ "$1" == "haven-tor" || "$2" == "haven-tor" ]]; then
-    show_logs haven-tor
+    follow_logs haven-tor &
 fi
+
+# Auf STRG+C warten, um die Protokollanzeige abzubrechen
+wait
