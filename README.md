@@ -108,16 +108,27 @@ To access the logs of the services, run the following command:
 ./scripts/logs.sh
 ```
 
+Hier ist die aktualisierte README-Sektion, die den Abruf neuer Release-Tags berücksichtigt:
+
 ### 9. Update the Relay
 
-To update the relay, switch your git branch to the latest version and pull the changes:
+To update the relay, first fetch the latest tags to ensure you have access to any new releases:
+
+```bash
+git fetch --tags
+```
+
+Then, to switch to a specific version, checkout the tag for that version:
 
 ```bash
 git checkout tags/<tag_name>
-git pull
 ```
 
-The master branch is the latest version.
+If you want to use the latest version on the master branch, execute:
+
+```bash
+git checkout master
+```
 
 Then, restart the relay:
 
@@ -126,4 +137,3 @@ Then, restart the relay:
 # or
 ./scripts/start-relay-tor.sh
 ```
-
