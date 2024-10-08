@@ -1,18 +1,18 @@
-#!/bin/bash
+#!/bin/sh
 
-# Funktion zum Verfolgen von Logs eines Containers
+# Function to track the last 100 logs of a container
 follow_logs() {
     container_name=$1
-    docker logs -f "$container_name"
+    docker logs --tail 100 -f "$container_name"
 }
 
-# Logs für haven-relay verfolgen
+# Track logs for haven-relay
 follow_logs haven-relay &
 
-# Logs für haven-tor verfolgen, wenn als Argument angegeben
+# Track logs for haven-tor when specified as an argument
 if [[ "$1" == "haven-tor" || "$2" == "haven-tor" ]]; then
     follow_logs haven-tor &
 fi
 
-# Auf STRG+C warten, um die Protokollanzeige abzubrechen
+# Wait for CTRL+C to cancel log display
 wait
