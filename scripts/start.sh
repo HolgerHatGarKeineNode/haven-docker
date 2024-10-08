@@ -1,11 +1,5 @@
 #!/bin/sh
 
-# Check if Docker is installed
-if ! command -v docker &> /dev/null; then
-    echo "Docker is not installed. Please install Docker."
-    exit 1
-fi
-
 # Check if either docker-compose or the Docker Compose plugin is installed
 if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
     echo "Docker Compose is not installed. Please install Docker Compose."
