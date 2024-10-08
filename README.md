@@ -6,6 +6,12 @@ features like web of trust, inbox relay, cloud backups, blastr, and the ability 
 
 ### The Dockerfile is available here: [Dockerfile](https://github.com/HolgerHatGarKeineNode/haven-docker/blob/master/Dockerfile)
 
+### Requirements
+
+- **Docker**: Ensure you have Docker installed on your system. You can download it from [here](https://docs.docker.com/get-docker/).
+- **Docker Compose**: Ensure you have Docker Compose installed on your system. You can download it from [here](https://docs.docker.com/compose/install/).
+  - we need the Docker Compose Plugin, so `docker compose` should be available in your terminal
+
 ### 0. Clone the Repository
 
 Start by cloning the repository to access the necessary files:
