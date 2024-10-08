@@ -4,6 +4,8 @@ HAVEN (High Availability Vault for Events on Nostr) is the most sovereign person
 storing and backing up sensitive notes like eCash, private chats, and drafts. It is a relay that is not so dumb, with
 features like web of trust, inbox relay, cloud backups, blastr, and the ability to import old notes.
 
+### The Dockerfile is available here: [Dockerfile](Dockerfile)
+
 ### 0. Clone the Repository
 
 Start by cloning the repository to access the necessary files:
