@@ -63,7 +63,7 @@ mkdir -p ./db ./templates
 To start the services using Docker Compose, run the following command:
 
 ```bash
-./scripts/start.sh
+./scripts/start-relay.sh
 ```
 
 This script will start all the services defined in your `docker-compose.yml`.
@@ -73,7 +73,7 @@ This script will start all the services defined in your `docker-compose.yml`.
 To start the services with Tor enabled, use the following command:
 
 ```bash
-./scripts/start_tor.sh
+./scripts/start-relay-tor.sh
 ```
 
 This script will start the services as per the configuration in your `docker-compose.tor.yml`, including the Tor
@@ -85,6 +85,12 @@ To stop the services, run the following command:
 
 ```bash
 ./scripts/stop.sh
-# or
-./scripts/stop_tor.sh
+```
+
+### 8. Access logs
+
+To access the logs of the services, run the following command:
+
+```bash
+./scripts/logs.sh
 ```

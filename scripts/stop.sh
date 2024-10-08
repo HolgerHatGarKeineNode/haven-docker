@@ -2,6 +2,11 @@
 
 DOCKER_COMPOSE_COMMAND="docker compose"
 
-# Pull the latest images and start the services
-echo "Stopping Docker Compose services..."
-$DOCKER_COMPOSE_COMMAND stop
+stop_service() {
+    service_name=$1
+    echo "Stopping $service_name..."
+    $DOCKER_COMPOSE_COMMAND stop "$service_name"
+}
+
+stop_service haven-relay
+stop_service haven-tor
