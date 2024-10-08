@@ -4,6 +4,15 @@ HAVEN (High Availability Vault for Events on Nostr) is the most sovereign person
 storing and backing up sensitive notes like eCash, private chats, and drafts. It is a relay that is not so dumb, with
 features like web of trust, inbox relay, cloud backups, blastr, and the ability to import old notes.
 
+### 0. Clone the Repository
+
+Start by cloning the repository to access the necessary files:
+
+```bash
+git clone https://github.com/HolgerHatGarKeineNode/haven-docker
+cd haven-docker
+```
+
 ### 1. Copy `.env.example` to `.env`
 
 You'll need to create an `.env` file based on the example provided in the repository.
@@ -59,4 +68,5 @@ To start the services with Tor enabled, use the following command:
 ./scripts/start_tor.sh
 ```
 
-This script will start the services as per the configuration in your `docker-compose.tor.yml`, including the Tor service.
+This script will start the services as per the configuration in your `docker-compose.tor.yml`, including the Tor
+service.

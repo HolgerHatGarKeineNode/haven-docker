@@ -1,10 +1,9 @@
 name: Docker Image CI
 
 on:
-  push:
-    branches:
-      - master
-  workflow_dispatch:
+  release:
+    types:
+      - published
 
 jobs:
   build:
@@ -23,17 +22,12 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract version from Git tags
-        id: vars
-        run: |
-          #VERSION=$(git ls-remote --tags https://github.com/bitvora/haven.git | awk '{print $2}' | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 | sed 's/refs\/tags\///')
-          VERSION=v0.4.0
-          echo "version=$VERSION" >> $GITHUB_ENV
-
       - name: Build and tag Docker image
         run: |
-          docker build --build-arg VERSION=${{ env.version }} -t holgerhatgarkeinenode/haven-docker:${{ env.version }} .
+          VERSION=${GITHUB_REF#refs/tags/}
+          docker build --build-arg VERSION=$VERSION -t holgerhatgarkeinenode/haven-docker:$VERSION .
 
       - name: Push Docker image
         run: |
-          docker push holgerhatgarkeinenode/haven-docker:${{ env.version }}
+          VERSION=${GITHUB_REF#refs/tags/}
+          docker push holgerhatgarkeinenode/haven-docker:$VERSION
