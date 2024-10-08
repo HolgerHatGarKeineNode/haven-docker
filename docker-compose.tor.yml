@@ -13,6 +13,8 @@ services:
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     restart: unless-stopped
     image: holgerhatgarkeinenode/haven-docker:v0.4.0
+    depends_on:
+      - tor
 
   tor:
     image: lncm/tor:0.4.7.9@sha256:86c2fe9d9099e6376798979110b8b9a3ee5d8adec27289ac4a5ee892514ffe92
