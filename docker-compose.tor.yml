@@ -1,0 +1,24 @@
+services:
+  relay:
+    container_name: haven-relay
+    env_file:
+      - .env
+    volumes:
+      - "./db:/app/db"
+      - "./templates:/app/templates"
+    ports:
+      - "3355"
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    restart: unless-stopped
+    image: holgerhatgarkeinenode/haven-docker:v0.4.0
+
+  tor:
+    image: lncm/tor:0.4.7.9@sha256:86c2fe9d9099e6376798979110b8b9a3ee5d8adec27289ac4a5ee892514ffe92
+    container_name: haven-tor
+    depends_on:
+      - relay
+    volumes:
+      - ./tor/torrc:/etc/tor/torrc
+      - ./tor/data:/var/lib/tor
+    restart: on-failure
+    stop_grace_period: 10m30s

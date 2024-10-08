@@ -1,0 +1,38 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract version from Git tags
+        id: vars
+        run: |
+          VERSION=$(git ls-remote --tags https://github.com/bitvora/haven.git | awk '{print $2}' | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 | sed 's/refs\/tags\///')
+          echo "version=$VERSION" >> $GITHUB_ENV
+
+      - name: Build and tag Docker image
+        run: |
+          docker build --build-arg VERSION=${{ env.version }} -t haven-docker:${{ env.version }} .
+
+      - name: Push Docker image
+        run: |
+          docker push haven-docker:${{ env.version }}
