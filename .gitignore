@@ -1,2 +1,6 @@
 .idea
-.db
+db
+templates
+.env
+relays_import.json
+relays_blastr.json
