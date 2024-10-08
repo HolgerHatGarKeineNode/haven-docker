@@ -32,8 +32,8 @@ jobs:
 
       - name: Build and tag Docker image
         run: |
-          docker build --build-arg VERSION=${{ env.version }} -t haven-docker:${{ env.version }} .
+          docker build --build-arg VERSION=${{ env.version }} -t holgerhatgarkeinenode/haven-docker:${{ env.version }} .
 
       - name: Push Docker image
         run: |
-          docker push haven-docker:${{ env.version }}
+          docker push holgerhatgarkeinenode/haven-docker:${{ env.version }}
