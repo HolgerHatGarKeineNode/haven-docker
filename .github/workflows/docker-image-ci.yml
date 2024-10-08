@@ -5,6 +5,10 @@ on:
     types:
       - published
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image version'
+        required: true
 
 jobs:
   build:
@@ -25,7 +29,11 @@ jobs:
 
       - name: Build and tag Docker image
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=${{ github.event.inputs.version }}
+          fi
           docker build --build-arg VERSION=$VERSION -t holgerhatgarkeinenode/haven-docker:$VERSION .
 
       - name: Push Docker image
