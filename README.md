@@ -70,3 +70,13 @@ To start the services with Tor enabled, use the following command:
 
 This script will start the services as per the configuration in your `docker-compose.tor.yml`, including the Tor
 service.
+
+### 7. Stop the Services
+
+To stop the services, run the following command:
+
+```bash
+./scripts/stop.sh
+# or
+./scripts/stop_tor.sh
+```
