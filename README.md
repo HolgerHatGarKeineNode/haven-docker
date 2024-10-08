@@ -4,13 +4,17 @@ HAVEN (High Availability Vault for Events on Nostr) is the most sovereign person
 storing and backing up sensitive notes like eCash, private chats, and drafts. It is a relay that is not so dumb, with
 features like web of trust, inbox relay, cloud backups, blastr, and the ability to import old notes.
 
+See the [Haven repository](https://github.com/bitvora/haven) for more information.
+
 ### The Dockerfile is available here: [Dockerfile](https://github.com/HolgerHatGarKeineNode/haven-docker/blob/master/Dockerfile)
 
 ### Requirements
 
-- **Docker**: Ensure you have Docker installed on your system. You can download it from [here](https://docs.docker.com/get-docker/).
-- **Docker Compose**: Ensure you have Docker Compose installed on your system. You can download it from [here](https://docs.docker.com/compose/install/).
-  - we need the Docker Compose Plugin, so `docker compose` should be available in your terminal
+- **Docker**: Ensure you have Docker installed on your system. You can download it
+  from [here](https://docs.docker.com/get-docker/).
+- **Docker Compose**: Ensure you have Docker Compose installed on your system. You can download it
+  from [here](https://docs.docker.com/compose/install/).
+    - we need the Docker Compose Plugin, so `docker compose` should be available in your terminal
 
 ### 0. Clone the Repository
 
@@ -20,6 +24,15 @@ Start by cloning the repository to access the necessary files:
 git clone https://github.com/HolgerHatGarKeineNode/haven-docker
 cd haven-docker
 ```
+
+If you want a specific version, checkout the tag for that version.
+You can find the available tags here: [Tags](https://github.com/bitvora/haven/releases)
+
+```bash
+git checkout tags/<tag_name>
+```
+
+The master branch is the latest version.
 
 ### 1. Copy `.env.example` to `.env`
 
@@ -94,3 +107,23 @@ To access the logs of the services, run the following command:
 ```bash
 ./scripts/logs.sh
 ```
+
+### 9. Update the Relay
+
+To update the relay, switch your git branch to the latest version and pull the changes:
+
+```bash
+git checkout tags/<tag_name>
+git pull
+```
+
+The master branch is the latest version.
+
+Then, restart the relay:
+
+```bash
+./scripts/start-relay.sh
+# or
+./scripts/start-relay-tor.sh
+```
+
