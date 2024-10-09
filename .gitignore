@@ -1,5 +1,4 @@
 .idea
-db
 templates
 .env
 relays_import.json
