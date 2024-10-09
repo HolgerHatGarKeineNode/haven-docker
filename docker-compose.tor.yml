@@ -1,6 +1,11 @@
 services:
   relay:
     container_name: haven-relay
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: v0.4.0
     env_file:
       - .env
     volumes:
@@ -9,10 +14,9 @@ services:
       - "./relays_import.json:/app/relays_import.json"
       - "./relays_blastr.json:/app/relays_blastr.json"
     ports:
-      - "3355"
+      - "3355:3355" # port binding korrigiert
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     restart: unless-stopped
-    image: holgerhatgarkeinenode/haven-docker:v0.4.0
 
   tor:
     image: lncm/tor:0.4.7.9@sha256:86c2fe9d9099e6376798979110b8b9a3ee5d8adec27289ac4a5ee892514ffe92

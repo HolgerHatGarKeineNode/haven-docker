@@ -1,11 +1,11 @@
 #!/bin/sh
 
-DOCKER_COMPOSE_COMMAND="docker compose"
-
 stop_service() {
     service_name=$1
     echo "Stopping $service_name..."
-    $DOCKER_COMPOSE_COMMAND stop "$service_name"
+    docker stop "$service_name"
+    echo "Removing $service_name..."
+    docker rm "$service_name"
 }
 
 stop_service haven-relay

@@ -1,6 +1,11 @@
 services:
   relay:
     container_name: haven-relay
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: v0.4.0
     env_file:
       - .env
     volumes:
@@ -12,4 +17,3 @@ services:
       - "3355:3355"
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     restart: unless-stopped
-    image: holgerhatgarkeinenode/haven-docker:v0.4.0
