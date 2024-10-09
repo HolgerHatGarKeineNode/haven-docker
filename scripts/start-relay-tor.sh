@@ -2,12 +2,12 @@
 
 DOCKER_COMPOSE_COMMAND="docker compose"
 
-# Stop and remove the old container if it exists
-if [ "$(docker ps -aq -f name=haven-tor)" ]; then
-    echo "Stopping and removing old container 'haven-tor'..."
-    docker stop haven-tor
-    docker rm haven-tor
-fi
+echo "Stopping and removing old container 'haven-relay'..."
+docker stop haven-relay
+docker rm haven-relay
+echo "Stopping and removing old container 'haven-tor'..."
+docker stop haven-tor
+docker rm haven-tor
 
 # Pull the latest images and start the services
 echo "Starting Docker Compose services..."
