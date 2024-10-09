@@ -137,3 +137,16 @@ Then, restart the relay:
 # or
 ./scripts/start-relay-tor.sh
 ```
+
+### 10. Updating environment variables or relay JSON files
+
+If you need to update the environment variables or relay JSON files, you can do so by editing the `.env` file or the
+`relays_import.json` and `relays_blastr.json` files. After making the changes, restart the relay:
+
+```bash
+./scripts/stop.sh
+# then
+./scripts/start-relay.sh
+# or
+./scripts/start-relay-tor.sh
+``` 

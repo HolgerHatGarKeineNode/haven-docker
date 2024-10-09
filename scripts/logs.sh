@@ -9,10 +9,5 @@ follow_logs() {
 # Track logs for haven-relay
 follow_logs haven-relay &
 
-# Track logs for haven-tor when specified as an argument
-if [[ "$1" == "haven-tor" || "$2" == "haven-tor" ]]; then
-    follow_logs haven-tor &
-fi
-
 # Wait for CTRL+C to cancel log display
 wait
