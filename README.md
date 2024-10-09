@@ -27,7 +27,7 @@ cd haven-docker
 ```
 
 If you want a specific version, checkout the tag for that version.
-You can find the available tags here: [Tags](https://github.com/bitvora/haven/releases)
+You can find the available tags here: [Tags](https://github.com/HolgerHatGarKeineNode/haven-docker/releases)
 
 ```bash
 git checkout tags/<tag_name>
