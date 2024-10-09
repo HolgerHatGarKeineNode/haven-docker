@@ -10,6 +10,7 @@ See the [Haven repository](https://github.com/bitvora/haven) for more informatio
 
 ### Requirements
 
+- the scripts are compatible with Linux
 - **Docker**: Ensure you have Docker installed on your system. You can download it
   from [here](https://docs.docker.com/get-docker/).
 - **Docker Compose**: Ensure you have Docker Compose installed on your system. You can download it
