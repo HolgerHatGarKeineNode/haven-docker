@@ -1,30 +1,37 @@
-# Build stage
-FROM golang:bookworm AS builder
+# Use Golang image based on Debian Bookworm
+FROM golang:bookworm
 
+# Set the working directory within the container
 WORKDIR /app
+
 ARG REPO_URL=https://github.com/bitvora/haven.git
 ARG VERSION
 
-# Clone and build application
-RUN git clone $REPO_URL . && git checkout $VERSION
+# Clone the repository
+RUN git clone --branch ${VERSION} ${REPO_URL} .
+
+# Download dependencies
 RUN go mod download
+
+# Build the Go application
 RUN go build -o main .
 
-# Final stage
-FROM debian:bookworm-slim
-
-WORKDIR /app
-
-COPY --from=builder /app/main .
-
-# Use a non-root user in final image for better security
+# Add environment variables for UID and GID
 ARG DOCKER_UID=1000
 ARG DOCKER_GID=1000
-RUN groupadd -g ${DOCKER_GID} appgroup && \
-    useradd -u ${DOCKER_UID} -g appgroup -m appuser && \
-    chown -R appuser:appgroup /app
 
+# Create a new group and user
+RUN groupadd -g ${DOCKER_GID} appgroup && \
+    useradd -u ${DOCKER_UID} -g appgroup -m appuser
+
+# Change ownership of the working directory
+RUN chown -R appuser:appgroup /app
+
+# Switch to the new user
 USER appuser
 
+# Expose the port that the application will run on
 EXPOSE 3355
+
+# Set the command to run the executable
 CMD ["./main"]
