@@ -35,12 +35,18 @@ git checkout tags/<tag_name>
 
 The master branch is the latest version.
 
-### 1. Copy `.env.example` to `.env`
+### 1. Copy `.env.example` to `.env` and also the template files
 
 You'll need to create an `.env` file based on the example provided in the repository.
 
 ```bash
 cp .env.example .env
+```
+
+You'll also need to copy the template files to the `templates` directory:
+
+```bash
+cp -r templates-example/* templates/
 ```
 
 ### 2. Set your environment variables

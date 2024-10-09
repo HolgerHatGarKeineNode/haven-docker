@@ -1,5 +1,7 @@
 .idea
-templates
 .env
 relays_import.json
 relays_blastr.json
+db.zip
+.DS_Store
+templates
