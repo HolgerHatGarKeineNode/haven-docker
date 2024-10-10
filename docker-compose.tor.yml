@@ -14,7 +14,7 @@ services:
       - "./relays_import.json:/app/relays_import.json"
       - "./relays_blastr.json:/app/relays_blastr.json"
     ports:
-      - "3355:3355" # port binding korrigiert
+      - "3355:3355"
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     restart: unless-stopped
 
