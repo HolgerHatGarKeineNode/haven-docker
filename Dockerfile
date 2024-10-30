@@ -11,6 +11,7 @@ ARG VERSION
 RUN git clone --branch ${VERSION} ${REPO_URL} .
 
 # Download dependencies
+ENV GOPROXY=https://proxy.golang.org
 RUN go mod download
 
 # Build the Go application
