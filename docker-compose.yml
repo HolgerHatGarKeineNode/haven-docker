@@ -1,19 +1,16 @@
 services:
   relay:
     container_name: haven-relay
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        VERSION: v1.0.0
+    image: holgerhatgarkeinenode/haven-docker:v1.0.0
     env_file:
       - .env
     volumes:
       - "./db:/app/db"
       - "./templates:/app/templates"
+      - "./blossom:/app/blossom"
       - "./relays_import.json:/app/relays_import.json"
       - "./relays_blastr.json:/app/relays_blastr.json"
     ports:
-      - "3355:3355"
+      - "3355:${RELAY_PORT:-3355}"
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     restart: unless-stopped
