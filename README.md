@@ -135,6 +135,7 @@ If you want to use the latest version on the master branch, execute:
 
 ```bash
 git checkout master
+git pull
 ```
 
 Then, restart the relay:
