@@ -1,7 +1,7 @@
 services:
   relay:
     container_name: haven-relay
-    image: holgerhatgarkeinenode/haven-docker:v1.0.4
+    image: holgerhatgarkeinenode/haven-docker:v1.0.5
     env_file:
       - .env
     volumes:

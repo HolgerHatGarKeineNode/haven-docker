@@ -115,8 +115,6 @@ To access the logs of the services, run the following command:
 ./scripts/logs.sh
 ```
 
-Hier ist die aktualisierte README-Sektion, die den Abruf neuer Release-Tags berücksichtigt:
-
 ### 9. Update the Relay
 
 To update the relay, first fetch the latest tags to ensure you have access to any new releases:
