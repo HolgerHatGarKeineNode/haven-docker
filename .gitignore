@@ -1,5 +1,6 @@
 .idea
 .env
+.env.bak
 relays_import.json
 relays_blastr.json
 db.zip

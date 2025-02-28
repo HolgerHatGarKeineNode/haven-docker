@@ -53,6 +53,15 @@ cp -r templates-example/* templates/
 
 Open the `.env` file and set the necessary environment variables.
 
+Setting the HAVEN_IMPORT_FLAG Environment Variable
+You can control whether the --import flag is passed to the application by setting the HAVEN_IMPORT_FLAG=true environment
+variable.
+
+This can be done either through a user prompt in the provided scripts or manually before running the docker
+compose command.
+
+`HAVEN_IMPORT_FLAG=true`
+
 ### 3. Create the relays JSON files
 
 Copy the example relay JSON files for your seed and blastr relays:

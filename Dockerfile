@@ -15,19 +15,38 @@ ARG REPO_URL=https://github.com/bitvora/haven.git
 ARG VERSION
 RUN git clone --branch ${VERSION} --single-branch ${REPO_URL} .
 RUN --mount=type=cache,target=/gomod-cache --mount=type=cache,target=/go-cache \
-    go build -ldflags="-w -s" -o main .
+    go build -a -tags netgo -ldflags '-w -s -extldflags "-static"' -o haven .
 
-# Final Distroless image
-FROM gcr.io/distroless/base
+# Final Alpine image
+FROM alpine:latest
+
+ENV HAVEN_IMPORT_FLAG=false
+
+# Install libc6-compat for Go binary compatibility
+RUN apk add --no-cache libc6-compat
 
 # Add non-root user specification
-USER nonroot
+RUN adduser -D -g '' nonroot
 
 WORKDIR /app
 
 # Copy Go application
-COPY --from=builder /app/main .
+COPY --from=builder /app/haven .
 
-# Expose port and set command
+# Ensure the main executable has the correct permissions
+RUN chmod +x /app/haven
+
+# Copy the entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+
+# Ensure the entrypoint script has the correct permissions
+RUN chmod +x /entrypoint.sh
+
+# Set the entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Switch to non-root user
+USER nonroot
+
+# Expose port
 EXPOSE 3355
-CMD ["./main"]
