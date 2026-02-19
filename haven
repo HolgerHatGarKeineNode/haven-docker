@@ -1,0 +1,2370 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME="$(basename "$0")"
+
+CLR_RESET=""
+CLR_RED=""
+CLR_GREEN=""
+CLR_YELLOW=""
+CLR_BLUE=""
+CLR_DIM=""
+
+if [[ -t 1 ]]; then
+  CLR_RESET="\033[0m"
+  CLR_RED="\033[31m"
+  CLR_GREEN="\033[32m"
+  CLR_YELLOW="\033[33m"
+  CLR_BLUE="\033[34m"
+  CLR_DIM="\033[2m"
+fi
+
+MODE="auto"
+IMPORT_MODE="auto"
+SKIP_IMPORT_PROMPT=0
+TAIL_COUNT=100
+LOG_SERVICE=""
+FOLLOW_LOGS=1
+BUILD_IMAGES=1
+COMMAND=""
+JSON_TOOL=""
+VALIDATION_ERROR=""
+VALIDATION_VALUE=""
+RUN_OUTPUT=""
+RUN_STATUS=0
+TUI_ACTIVE=0
+TUI_STTY_ORIG=""
+TUI_COLS=0
+TUI_LINES=0
+LEFT_W=0
+RIGHT_W=0
+LEFT_X=1
+RIGHT_X=0
+LEFT_CONTENT_W=0
+RIGHT_CONTENT_W=0
+LEFT_CONTENT_ROW=2
+RIGHT_CONTENT_ROW=2
+LEFT_CONTENT_HEIGHT=0
+RIGHT_CONTENT_HEIGHT=0
+TUI_VIEW="main"
+TUI_SEL=0
+TUI_OFFSET=0
+TUI_NEED_FRAME=1
+TUI_NEED_LEFT=1
+TUI_NEED_RIGHT=1
+TUI_NEED_RESIZE=0
+TUI_MESSAGE_TITLE=""
+TUI_MESSAGE_TEXT=""
+CURRENT_ENV_KEY=""
+CURRENT_JSON_FILE=""
+LOG_FIFO=""
+LOG_FD=""
+LOG_PID=""
+LOG_LINES=()
+LOG_MAX_LINES=0
+MENU_IDS=()
+MENU_LABELS=()
+MENU_TITLE=""
+MENU_SUBTITLE=""
+TUI_DOCKER_OK=0
+TUI_LAST_DOCKER_CHECK=0
+TUI_LAST_LOG_RESTART=0
+
+DOCKER_COMPOSE=()
+COMPOSE_FILE_PLAIN="$ROOT_DIR/docker-compose.yml"
+COMPOSE_FILE_TOR="$ROOT_DIR/docker-compose.tor.yml"
+
+JSON_FILES=(
+  "relays_import.json"
+  "relays_blastr.json"
+  "blacklisted_npubs.json"
+  "whitelisted_npubs.json"
+)
+
+JSON_LABELS=(
+  "Relays Import"
+  "Relays Blastr"
+  "Blacklisted npubs"
+  "Whitelisted npubs"
+)
+
+json_label_for() {
+  local file="$1"
+  local count=${#JSON_FILES[@]}
+  for ((i=0; i<count; i++)); do
+    if [[ "${JSON_FILES[$i]}" == "$file" ]]; then
+      printf "%s" "${JSON_LABELS[$i]}"
+      return
+    fi
+  done
+  printf "%s" "$file"
+}
+
+print_usage() {
+  cat <<USAGE
+Haven CLI & TUI
+
+Usage:
+  $SCRIPT_NAME [command] [options]
+
+Commands:
+  tui                 Open interactive TUI (default)
+  start               Start relay (Docker Compose)
+  stop                Stop services
+  restart             Restart services
+  logs                Stream logs
+  status              Show status
+  onion               Show Tor onion hostname (if available)
+  import              Set HAVEN_IMPORT_FLAG (interactive)
+  env                 Edit .env (TUI)
+  json                Open JSON list editor
+  help                Show this help
+
+Options:
+  -t, --tor            Use docker-compose.tor.yml
+  --plain              Force docker-compose.yml
+  --import             Set HAVEN_IMPORT_FLAG=true
+  --no-import          Set HAVEN_IMPORT_FLAG=false
+  --prompt-import      Ask for HAVEN_IMPORT_FLAG
+  --tail N             Tail last N log lines (default: 100)
+  -s, --service NAME   Logs: follow a specific service
+  --all                Logs: follow all services
+  --no-follow          Logs: do not follow (no -f)
+  --no-build           Start/Restart without --build
+  --build              Start/Restart with --build (default)
+  -h, --help           Show this help
+
+Examples:
+  $SCRIPT_NAME
+  $SCRIPT_NAME start
+  $SCRIPT_NAME start --tor --prompt-import
+  $SCRIPT_NAME logs --service relay --tail 200
+  $SCRIPT_NAME json
+  $SCRIPT_NAME env
+USAGE
+}
+
+tui_update_layout() {
+  TUI_COLS="$(tput cols 2>/dev/null || echo 80)"
+  TUI_LINES="$(tput lines 2>/dev/null || echo 24)"
+
+  LEFT_W=$((TUI_COLS * 38 / 100))
+  if [[ "$LEFT_W" -lt 28 ]]; then
+    LEFT_W=28
+  fi
+  if [[ "$LEFT_W" -gt $((TUI_COLS - 30)) ]]; then
+    LEFT_W=$((TUI_COLS - 30))
+  fi
+
+  RIGHT_X=$((LEFT_W + 1))
+  RIGHT_W=$((TUI_COLS - RIGHT_X))
+
+  LEFT_CONTENT_W=$((LEFT_W - 2))
+  RIGHT_CONTENT_W=$((RIGHT_W - 2))
+  if [[ "$LEFT_CONTENT_W" -lt 20 ]]; then
+    LEFT_CONTENT_W=20
+  fi
+  if [[ "$RIGHT_CONTENT_W" -lt 20 ]]; then
+    RIGHT_CONTENT_W=20
+  fi
+
+  LEFT_CONTENT_ROW=2
+  RIGHT_CONTENT_ROW=2
+  LEFT_CONTENT_HEIGHT=$((TUI_LINES - LEFT_CONTENT_ROW - 1))
+  RIGHT_CONTENT_HEIGHT=$((TUI_LINES - RIGHT_CONTENT_ROW - 1))
+  if [[ "$LEFT_CONTENT_HEIGHT" -lt 6 ]]; then
+    LEFT_CONTENT_HEIGHT=6
+  fi
+  if [[ "$RIGHT_CONTENT_HEIGHT" -lt 6 ]]; then
+    RIGHT_CONTENT_HEIGHT=6
+  fi
+
+  LOG_MAX_LINES=$RIGHT_CONTENT_HEIGHT
+}
+
+tui_init() {
+  TUI_ACTIVE=1
+  TUI_STTY_ORIG="$(stty -g)"
+  stty -echo -icanon time 0 min 0
+  tput smcup
+  tput civis
+  tui_update_layout
+  trap 'tui_cleanup' EXIT
+  trap 'tui_cleanup; exit 130' INT TERM
+}
+
+tui_cleanup() {
+  stop_log_stream || true
+  if [[ -n "$TUI_STTY_ORIG" ]]; then
+    stty "$TUI_STTY_ORIG"
+  fi
+  tput cnorm 2>/dev/null || true
+  tput rmcup 2>/dev/null || true
+  TUI_ACTIVE=0
+}
+
+tui_read_key() {
+  local key=""
+  if ! IFS= read -rsn1 -t 0.05 key; then
+    return 1
+  fi
+
+  if [[ "$key" == $'\x03' ]]; then
+    printf "quit"
+    return 0
+  fi
+
+  if [[ "$key" == $'\x1b' ]]; then
+    local seq=""
+    IFS= read -rsn2 -t 0.01 seq || seq=""
+    case "$seq" in
+      "[A") printf "up" ;;
+      "[B") printf "down" ;;
+      "[C") printf "right" ;;
+      "[D") printf "left" ;;
+      *) printf "esc" ;;
+    esac
+    return 0
+  fi
+
+  if [[ -z "$key" ]]; then
+    printf "enter"
+    return 0
+  fi
+
+  case "$key" in
+    $'\n'|$'\r') printf "enter" ;;
+    q|Q) printf "quit" ;;
+    *) printf "%s" "$key" ;;
+  esac
+}
+
+tui_clear() {
+  tput clear
+}
+
+tui_draw_frame() {
+  local do_clear="${1:-0}"
+  local row
+  if [[ "$do_clear" == "1" ]]; then
+    tui_clear
+  fi
+  for ((row=0; row<TUI_LINES; row++)); do
+    tput cup "$row" "$LEFT_W"
+    printf "|"
+  done
+  tput cup 0 "$LEFT_X"
+  printf "Haven Dashboard"
+  tput cup 0 "$RIGHT_X"
+  printf "Logs"
+  tput cup 1 "$LEFT_X"
+  printf "%-*s" "$LEFT_CONTENT_W" "$(printf '%*s' "$LEFT_CONTENT_W" | tr ' ' '-')"
+  tput cup 1 "$RIGHT_X"
+  printf "%-*s" "$RIGHT_CONTENT_W" "$(printf '%*s' "$RIGHT_CONTENT_W" | tr ' ' '-')"
+}
+
+tui_truncate() {
+  local text="$1"
+  local width="$2"
+  if [[ ${#text} -le "$width" ]]; then
+    printf "%s" "$text"
+  else
+    local cutoff=$((width - 3))
+    if [[ "$cutoff" -lt 0 ]]; then
+      cutoff=0
+    fi
+    printf "%s..." "${text:0:$cutoff}"
+  fi
+}
+
+tui_print_left() {
+  local row="$1"
+  local text="$2"
+  tput cup "$row" "$LEFT_X"
+  printf "%-*s" "$LEFT_CONTENT_W" "$text"
+}
+
+tui_print_right() {
+  local row="$1"
+  local text="$2"
+  tput cup "$row" "$RIGHT_X"
+  printf "%-*s" "$RIGHT_CONTENT_W" "$text"
+}
+
+tui_wait_key() {
+  local _=""
+  while ! IFS= read -rsn1 _; do :; done
+}
+
+tui_prompt() {
+  local prompt="$1"
+  local default="$2"
+  local input=""
+
+  while IFS= read -rsn1 -t 0.01 _; do :; done
+  tput cup $((TUI_LINES - 2)) "$LEFT_X"
+  printf "%-*s" "$LEFT_CONTENT_W" ""
+  tput cup $((TUI_LINES - 2)) "$LEFT_X"
+  printf "%s" "$prompt"
+  tput cnorm
+  stty echo icanon
+  read -r input
+  stty -echo -icanon time 0 min 0
+  tput civis
+
+  if [[ -z "$input" ]]; then
+    input="$default"
+  fi
+  printf "%s" "$input"
+}
+
+tui_confirm() {
+  local prompt="$1"
+  local default_answer="$2"
+  local selection=0
+
+  if [[ "$default_answer" == "n" || "$default_answer" == "N" ]]; then
+    selection=1
+  fi
+
+  local yes_label="[ Yes ]"
+  local no_label="[ No ]"
+  local row=$((LEFT_CONTENT_ROW + 2))
+
+  tui_draw_frame 1
+  tui_render_right_logs
+  tui_print_left "$LEFT_CONTENT_ROW" "$prompt"
+
+  while true; do
+    if [[ "$selection" -eq 0 ]]; then
+      tput cup "$row" "$LEFT_X"
+      printf "\033[7m%s\033[0m  %s" "$yes_label" "$no_label"
+    else
+      tput cup "$row" "$LEFT_X"
+      printf "%s  \033[7m%s\033[0m" "$yes_label" "$no_label"
+    fi
+
+    local key=""
+    key="$(tui_read_key)" || continue
+    case "$key" in
+      left|up) selection=0 ;;
+      right|down) selection=1 ;;
+      enter)
+        if [[ "$selection" -eq 0 ]]; then
+          return 0
+        fi
+        return 1
+        ;;
+      esc) return 1 ;;
+    esac
+  done
+}
+
+tui_message() {
+  local title="$1"
+  local text="$2"
+  local row="$LEFT_CONTENT_ROW"
+  tui_draw_frame 1
+  tui_render_right_logs
+  tui_print_left "$row" "$title"
+  row=$((row + 1))
+  local line
+  while IFS= read -r line; do
+    if [[ "$row" -ge $((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT)) ]]; then
+      break
+    fi
+    tui_print_left "$row" "$line"
+    row=$((row + 1))
+  done < <(printf "%s" "$text" | fold -s -w "$LEFT_CONTENT_W")
+  tui_print_left $((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT)) "Press any key to continue."
+  tui_wait_key
+}
+
+info() {
+  printf "%b\n" "${CLR_BLUE}INFO${CLR_RESET} $*"
+}
+
+success() {
+  printf "%b\n" "${CLR_GREEN}OK${CLR_RESET} $*"
+}
+
+warn() {
+  printf "%b\n" "${CLR_YELLOW}WARN${CLR_RESET} $*"
+}
+
+die() {
+  printf "%b\n" "${CLR_RED}ERROR${CLR_RESET} $*" >&2
+  exit 1
+}
+
+ensure_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"
+}
+
+detect_compose() {
+  ensure_cmd docker
+  if docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE=(docker compose)
+    return
+  fi
+  if command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE=(docker-compose)
+    return
+  fi
+  die "Docker Compose not found. Install Docker Compose v2 or docker-compose."
+}
+
+ensure_docker() {
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker daemon not reachable. Is Docker running?"
+  fi
+}
+
+tui_require_docker() {
+  if docker info >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    tui_message "Docker" "Docker daemon not reachable. Start Docker and try again."
+  else
+    warn "Docker daemon not reachable. Start Docker and try again."
+  fi
+  return 1
+}
+
+has_tor_container() {
+  docker ps -a --format '{{.Names}}' | grep -qx 'haven-tor'
+}
+
+resolve_mode() {
+  local action="$1"
+  if [[ "$MODE" == "tor" ]]; then
+    printf '%s' "tor"
+    return
+  fi
+  if [[ "$MODE" == "plain" ]]; then
+    printf '%s' "plain"
+    return
+  fi
+  if [[ "$action" == "start" ]]; then
+    printf '%s' "plain"
+    return
+  fi
+  if has_tor_container; then
+    printf '%s' "tor"
+  else
+    printf '%s' "plain"
+  fi
+}
+
+compose_file_for() {
+  local mode="$1"
+  if [[ "$mode" == "tor" ]]; then
+    printf '%s' "$COMPOSE_FILE_TOR"
+  else
+    printf '%s' "$COMPOSE_FILE_PLAIN"
+  fi
+}
+
+require_compose_file() {
+  [[ -f "$1" ]] || die "Compose file not found: $1"
+}
+
+dc() {
+  local compose_file="$1"
+  shift
+  "${DOCKER_COMPOSE[@]}" -f "$compose_file" "$@"
+}
+
+read_env_var() {
+  local key="$1"
+  local env_file="$ROOT_DIR/.env"
+  [[ -f "$env_file" ]] || return 1
+  awk -v key="$key" '
+    function strip_inline(v,    i,c,quote,out) {
+      quote=""
+      out=""
+      for (i=1; i<=length(v); i++) {
+        c=substr(v,i,1)
+        if (c=="\"" || c=="\047") {
+          if (quote==c) quote=""
+          else if (quote=="") quote=c
+        }
+        if (c=="#" && quote=="") break
+        out=out c
+      }
+      sub(/[ \t]+$/, "", out)
+      return out
+    }
+    $0 ~ "^[ \t]*export[ \t]+" key "=" {
+      line=$0
+      sub(/^[ \t]*export[ \t]+/, "", line)
+      sub(/^[^=]+=*/, "", line)
+      print strip_inline(line)
+      found=1
+      next
+    }
+    $0 ~ "^" key "=" {
+      line=$0
+      sub(/^[^=]+=*/, "", line)
+      print strip_inline(line)
+      found=1
+      next
+    }
+    END {if(!found) exit 1}
+  ' "$env_file"
+}
+
+set_env_var() {
+  local key="$1"
+  local value="$2"
+  local env_file="$ROOT_DIR/.env"
+  local tmp_file="$env_file.tmp"
+
+  if [[ ! -f "$env_file" ]]; then
+    touch "$env_file"
+  else
+    cp "$env_file" "$env_file.bak"
+  fi
+
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found=0 }
+    $0 ~ "^[ \t]*export[ \t]+" key "=" { print "export " key "=" value; found=1; next }
+    $0 ~ "^" key "=" { print key "=" value; found=1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$env_file" > "$tmp_file"
+
+  mv "$tmp_file" "$env_file"
+}
+
+run_capture() {
+  RUN_OUTPUT=""
+  RUN_STATUS=0
+  set +e
+  RUN_OUTPUT="$("$@" 2>&1)"
+  RUN_STATUS=$?
+  set -e
+}
+
+is_quoted() {
+  local raw="$1"
+  [[ ${#raw} -ge 2 ]] || return 1
+  local first="${raw:0:1}"
+  local last="${raw: -1}"
+  [[ ( "$first" == "\"" && "$last" == "\"" ) || ( "$first" == "'" && "$last" == "'" ) ]]
+}
+
+strip_quotes() {
+  local raw="$1"
+  if is_quoted "$raw"; then
+    printf "%s" "${raw:1:${#raw}-2}"
+  else
+    printf "%s" "$raw"
+  fi
+}
+
+wrap_like_raw() {
+  local raw="$1"
+  local value="$2"
+  if is_quoted "$raw"; then
+    local quote="${raw:0:1}"
+    printf "%s%s%s" "$quote" "$value" "$quote"
+  else
+    printf "%s" "$value"
+  fi
+}
+
+value_has_unquoted_spaces() {
+  local raw="$1"
+  if is_quoted "$raw"; then
+    return 1
+  fi
+  [[ "$raw" =~ [[:space:]] ]]
+}
+
+is_int() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_port() {
+  local value="$1"
+  is_int "$value" || return 1
+  [[ "$value" -ge 1 && "$value" -le 65535 ]]
+}
+
+is_bool() {
+  local value="${1,,}"
+  [[ "$value" == "true" || "$value" == "false" ]]
+}
+
+is_mixed_case() {
+  [[ "$1" =~ [a-z] ]] && [[ "$1" =~ [A-Z] ]]
+}
+
+is_npub() {
+  local value="${1,,}"
+  [[ "$value" =~ ^npub1[023456789acdefghjklmnpqrstuvwxyz]+$ ]]
+}
+
+is_relay_address() {
+  local value="$1"
+  [[ -n "$value" ]] || return 1
+  [[ "$value" =~ [[:space:]] ]] && return 1
+  [[ "$value" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)?(\\[[0-9a-fA-F:]+\\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?(/.*)?$ ]]
+}
+
+is_http_url() {
+  local value="$1"
+  [[ "$value" =~ ^https?://.+$ ]]
+}
+
+is_date() {
+  [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+}
+
+is_duration() {
+  [[ "$1" =~ ^[0-9]+[smhd]$ ]]
+}
+
+is_log_level() {
+  case "${1^^}" in
+    DEBUG|INFO|WARNING|ERROR) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_backup_provider() {
+  case "${1,,}" in
+    ""|none|s3) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_ipv4() {
+  local value="$1"
+  [[ "$value" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]] || return 1
+  local o1 o2 o3 o4
+  IFS=. read -r o1 o2 o3 o4 <<<"$value"
+  for octet in "$o1" "$o2" "$o3" "$o4"; do
+    [[ "$octet" -ge 0 && "$octet" -le 255 ]] || return 1
+  done
+}
+
+is_ipv6() {
+  local value="$1"
+  [[ "$value" =~ : ]] || return 1
+  [[ "$value" =~ ^[0-9a-fA-F:]+$ ]]
+}
+
+ensure_json_file_value() {
+  local raw="$1"
+  local allow_empty="$2"
+  local value="$3"
+
+  if [[ -z "$value" ]]; then
+    [[ "$allow_empty" == "1" ]] && return 0
+    VALIDATION_ERROR="Value cannot be empty."
+    return 1
+  fi
+
+  if [[ "$value" != *.json ]]; then
+    VALIDATION_ERROR="File must end with .json"
+    return 1
+  fi
+
+  local path="$ROOT_DIR/$value"
+  if [[ -f "$path" ]]; then
+    return 0
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    if ask_yes_no "File $value not found. Create empty file now? [y/N] " "n"; then
+      printf "[]\n" > "$path"
+      success "Created $value"
+      return 0
+    fi
+  fi
+
+  VALIDATION_ERROR="File not found: $value"
+  return 1
+}
+
+validate_env_value() {
+  local key="$1"
+  local raw="$2"
+  local value=""
+  local provider=""
+
+  VALIDATION_ERROR=""
+  VALIDATION_VALUE="$raw"
+
+  if [[ -n "$raw" ]]; then
+    value="$(strip_quotes "$raw")"
+  fi
+
+  if value_has_unquoted_spaces "$raw"; then
+    VALIDATION_ERROR="Values with spaces must be quoted."
+    return 1
+  fi
+
+  case "$key" in
+    *_NPUB|OWNER_NPUB|PRIVATE_RELAY_NPUB|CHAT_RELAY_NPUB|OUTBOX_RELAY_NPUB|INBOX_RELAY_NPUB)
+      if [[ -z "$value" ]]; then
+        VALIDATION_ERROR="NPUB cannot be empty."
+        return 1
+      fi
+      if is_mixed_case "$value"; then
+        VALIDATION_ERROR="NPUB must be all lowercase or all uppercase."
+        return 1
+      fi
+      if ! is_npub "$value"; then
+        VALIDATION_ERROR="Invalid npub format."
+        return 1
+      fi
+      VALIDATION_VALUE="$(wrap_like_raw "$raw" "${value,,}")"
+      ;;
+    RELAY_URL)
+      if ! is_relay_address "$value"; then
+        VALIDATION_ERROR="Invalid relay host or URL."
+        return 1
+      fi
+      ;;
+    RELAY_PORT)
+      if ! is_port "$value"; then
+        VALIDATION_ERROR="Port must be 1-65535."
+        return 1
+      fi
+      VALIDATION_VALUE="$value"
+      ;;
+    RELAY_BIND_ADDRESS)
+      if [[ -z "$value" ]]; then
+        VALIDATION_VALUE="$raw"
+        return 0
+      fi
+      if ! is_ipv4 "$value" && ! is_ipv6 "$value"; then
+        VALIDATION_ERROR="Bind address must be IPv4, IPv6, or empty."
+        return 1
+      fi
+      ;;
+    DB_ENGINE)
+      case "${value,,}" in
+        badger|lmdb) VALIDATION_VALUE="$(wrap_like_raw "$raw" "${value,,}")" ;;
+        *) VALIDATION_ERROR="DB_ENGINE must be badger or lmdb."; return 1 ;;
+      esac
+      ;;
+    LMDB_MAPSIZE)
+      if ! is_int "$value"; then
+        VALIDATION_ERROR="LMDB_MAPSIZE must be a number >= 0."
+        return 1
+      fi
+      VALIDATION_VALUE="$value"
+      ;;
+    BLOSSOM_PATH)
+      if [[ -z "$value" ]]; then
+        VALIDATION_ERROR="BLOSSOM_PATH cannot be empty."
+        return 1
+      fi
+      ;;
+    *_ICON)
+      if [[ -n "$value" ]] && ! is_http_url "$value"; then
+        VALIDATION_ERROR="Icon must be a http(s) URL or empty."
+        return 1
+      fi
+      ;;
+    *_ALLOW_EMPTY_FILTERS|*_ALLOW_COMPLEX_FILTERS)
+      if ! is_bool "$value"; then
+        VALIDATION_ERROR="Value must be true or false."
+        return 1
+      fi
+      VALIDATION_VALUE="${value,,}"
+      ;;
+    *_TOKENS_PER_INTERVAL|*_INTERVAL|*_MAX_TOKENS|*_INTERVAL_SECONDS|*_TIMEOUT_SECONDS|*_DEPTH|*_MINIMUM_FOLLOWERS|*_INTERVAL_HOURS|INBOX_PULL_INTERVAL_SECONDS)
+      if ! is_int "$value"; then
+        VALIDATION_ERROR="Value must be a number >= 0."
+        return 1
+      fi
+      VALIDATION_VALUE="$value"
+      ;;
+    IMPORT_START_DATE)
+      if ! is_date "$value"; then
+        VALIDATION_ERROR="Date must be YYYY-MM-DD."
+        return 1
+      fi
+      ;;
+    IMPORT_SEED_RELAYS_FILE)
+      ensure_json_file_value "$raw" 0 "$value" || return 1
+      ;;
+    BLASTR_RELAYS_FILE)
+      ensure_json_file_value "$raw" 0 "$value" || return 1
+      ;;
+    WHITELISTED_NPUBS_FILE|BLACKLISTED_NPUBS_FILE)
+      ensure_json_file_value "$raw" 1 "$value" || return 1
+      ;;
+    BACKUP_PROVIDER)
+      if ! is_backup_provider "$value"; then
+        VALIDATION_ERROR="BACKUP_PROVIDER must be s3, none, or empty."
+        return 1
+      fi
+      VALIDATION_VALUE="$(wrap_like_raw "$raw" "${value,,}")"
+      ;;
+    BACKUP_INTERVAL_HOURS)
+      if ! is_int "$value"; then
+        VALIDATION_ERROR="BACKUP_INTERVAL_HOURS must be a number >= 0."
+        return 1
+      fi
+      VALIDATION_VALUE="$value"
+      ;;
+    S3_ACCESS_KEY_ID|S3_SECRET_KEY|S3_ENDPOINT|S3_REGION|S3_BUCKET_NAME)
+      provider="$(read_env_var BACKUP_PROVIDER 2>/dev/null || true)"
+      provider="$(strip_quotes "$provider")"
+      provider="${provider,,}"
+      if [[ "$provider" == "s3" && -z "$value" ]]; then
+        VALIDATION_ERROR="$key is required when BACKUP_PROVIDER=s3."
+        return 1
+      fi
+      if [[ "$key" == "S3_ENDPOINT" && -n "$value" ]]; then
+        if ! is_relay_address "$value"; then
+          VALIDATION_ERROR="S3_ENDPOINT must be a host or URL."
+          return 1
+        fi
+      fi
+      if [[ "$key" == "S3_BUCKET_NAME" && -n "$value" ]]; then
+        if [[ ! "$value" =~ ^[a-z0-9.-]{3,63}$ ]]; then
+          VALIDATION_ERROR="S3_BUCKET_NAME must be 3-63 chars (lowercase, numbers, dot, dash)."
+          return 1
+        fi
+      fi
+      ;;
+    WOT_REFRESH_INTERVAL)
+      if ! is_duration "$value"; then
+        VALIDATION_ERROR="WOT_REFRESH_INTERVAL must look like 24h, 30m, or 10s."
+        return 1
+      fi
+      ;;
+    HAVEN_LOG_LEVEL)
+      if ! is_log_level "$value"; then
+        VALIDATION_ERROR="HAVEN_LOG_LEVEL must be DEBUG, INFO, WARNING, or ERROR."
+        return 1
+      fi
+      VALIDATION_VALUE="$(wrap_like_raw "$raw" "${value^^}")"
+      ;;
+    *)
+      ;;
+  esac
+
+  return 0
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default_answer="$2"
+  local reply=""
+
+  if [[ "$TUI_ACTIVE" == "1" && -t 1 ]]; then
+    if tui_confirm "$prompt" "$default_answer"; then
+      return 0
+    fi
+    return 1
+  fi
+
+  while true; do
+    read -r -p "$prompt" reply
+    if [[ -z "$reply" ]]; then
+      reply="$default_answer"
+    fi
+    case "$reply" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO) return 1 ;;
+      *) printf "Please answer y or n.\n" ;;
+    esac
+  done
+}
+
+prompt_import_flag() {
+  local current=""
+  local default_answer="n"
+  local prompt="Import old notes on next start? [y/N] "
+
+  if current="$(read_env_var HAVEN_IMPORT_FLAG 2>/dev/null)"; then
+    current="${current,,}"
+  fi
+
+  if [[ "$current" == "true" ]]; then
+    default_answer="y"
+    prompt="Import old notes on next start? [Y/n] "
+  fi
+
+  if ask_yes_no "$prompt" "$default_answer"; then
+    set_env_var HAVEN_IMPORT_FLAG true
+    success "HAVEN_IMPORT_FLAG set to true"
+  else
+    set_env_var HAVEN_IMPORT_FLAG false
+    success "HAVEN_IMPORT_FLAG set to false"
+  fi
+}
+
+apply_import_flag() {
+  case "$IMPORT_MODE" in
+    true)
+      set_env_var HAVEN_IMPORT_FLAG true
+      success "HAVEN_IMPORT_FLAG set to true"
+      ;;
+    false)
+      set_env_var HAVEN_IMPORT_FLAG false
+      success "HAVEN_IMPORT_FLAG set to false"
+      ;;
+    prompt)
+      prompt_import_flag
+      ;;
+    auto)
+      if [[ "$SKIP_IMPORT_PROMPT" == "0" && -t 0 && -t 1 ]]; then
+        prompt_import_flag
+      fi
+      ;;
+  esac
+}
+
+ensure_example_jsons() {
+  local example
+  for example in "$ROOT_DIR"/*.example.json; do
+    [[ -e "$example" ]] || continue
+    local target="${example/.example.json/.json}"
+    if [[ ! -f "$target" ]]; then
+      local example_name
+      local target_name
+      example_name="$(basename "$example")"
+      target_name="$(basename "$target")"
+      if [[ -t 0 && -t 1 ]]; then
+        if ask_yes_no "Missing $target_name. Copy from $example_name now? [Y/n] " "y"; then
+          cp "$example" "$target"
+          success "Created $target_name"
+        else
+          warn "Skipped $target_name. You can copy it later."
+        fi
+      else
+        warn "Missing $target_name. Run: cp $example_name $target_name"
+      fi
+    fi
+  done
+}
+
+ensure_templates_dir() {
+  local src="$ROOT_DIR/templates-example"
+  local dst="$ROOT_DIR/templates"
+  local needs_copy=0
+
+  [[ -d "$src" ]] || return 0
+
+  if [[ ! -d "$dst" ]]; then
+    needs_copy=1
+  else
+    if ! find "$dst" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+      needs_copy=1
+    fi
+  fi
+
+  if [[ "$needs_copy" == "1" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      if ask_yes_no "Templates missing. Copy templates-example -> templates now? [Y/n] " "y"; then
+        mkdir -p "$dst"
+        cp -R "$src"/. "$dst"/
+        success "Templates copied."
+      else
+        warn "Templates not copied. Start may fail."
+      fi
+    else
+      warn "Templates missing. Run: cp -R templates-example/. templates/"
+    fi
+  fi
+}
+
+detect_json_tool() {
+  if command -v jq >/dev/null 2>&1; then
+    JSON_TOOL="jq"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    JSON_TOOL="python"
+    return 0
+  fi
+  warn "Missing dependency: jq or python3 (needed for JSON editor)."
+  return 1
+}
+
+ensure_env_file() {
+  local env_file="$ROOT_DIR/.env"
+  if [[ -f "$env_file" ]]; then
+    return 0
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    if ask_yes_no ".env not found. Create empty .env now? [Y/n] " "y"; then
+      touch "$env_file"
+      success "Created .env"
+      return 0
+    fi
+    warn ".env missing."
+    return 1
+  fi
+
+  warn ".env missing. Create one before editing."
+  return 1
+}
+
+list_env_keys() {
+  local env_file="$ROOT_DIR/.env"
+  [[ -f "$env_file" ]] || return 0
+  awk '
+    /^[ \t]*#/ {next}
+    /^[ \t]*$/ {next}
+    /^[ \t]*export[ \t]+[A-Za-z_][A-Za-z0-9_]*=/ {
+      line=$0
+      sub(/^[ \t]*export[ \t]+/, "", line)
+      split(line, a, "=")
+      key=a[1]
+      if (!(key in seen)) { print key; seen[key]=1 }
+      next
+    }
+    /^[A-Za-z_][A-Za-z0-9_]*=/ {
+      split($0, a, "=")
+      key=a[1]
+      if (!(key in seen)) { print key; seen[key]=1 }
+    }
+  ' "$env_file"
+}
+
+remove_env_var() {
+  local key="$1"
+  local env_file="$ROOT_DIR/.env"
+  local tmp_file="$env_file.tmp"
+  [[ -f "$env_file" ]] || return 1
+  cp "$env_file" "$env_file.bak"
+  awk -v key="$key" '
+    $0 ~ "^[ \t]*export[ \t]+" key "=" { next }
+    $0 ~ "^" key "=" { next }
+    { print }
+  ' "$env_file" > "$tmp_file"
+  mv "$tmp_file" "$env_file"
+}
+
+ensure_json_array_file() {
+  local file="$1"
+  local path="$ROOT_DIR/$file"
+  local example="$ROOT_DIR/${file/.json/.example.json}"
+
+  if [[ -f "$path" ]]; then
+    return 0
+  fi
+
+  if [[ -f "$example" ]]; then
+    if ask_yes_no "Create $file from $(basename "$example")? [Y/n] " "y"; then
+      cp "$example" "$path"
+      success "Created $file"
+      return 0
+    fi
+  fi
+
+  if ask_yes_no "$file is missing. Create empty list now? [Y/n] " "y"; then
+    printf "[]\n" > "$path"
+    success "Created $file"
+  else
+    warn "JSON file missing: $file"
+    return 1
+  fi
+}
+
+json_list_items() {
+  local path="$1"
+  if [[ "$JSON_TOOL" == "jq" ]]; then
+    jq -e 'type=="array"' "$path" >/dev/null 2>&1 || die "Invalid JSON array in $(basename "$path")"
+    jq -r '.[]' "$path"
+  else
+    python3 - "$path" <<'PY'
+import json,sys
+path=sys.argv[1]
+with open(path,"r",encoding="utf-8") as f:
+    data=json.load(f)
+if not isinstance(data,list):
+    raise SystemExit(1)
+for item in data:
+    print(item)
+PY
+  fi
+}
+
+json_write_tmp() {
+  local path="$1"
+  local tmp="$path.tmp"
+  cat > "$tmp"
+  mv "$tmp" "$path"
+}
+
+json_add_item() {
+  local path="$1"
+  local item="$2"
+  if [[ "$JSON_TOOL" == "jq" ]]; then
+    jq --arg item "$item" '. + [$item]' "$path" | json_write_tmp "$path"
+  else
+    python3 - "$path" "$item" <<'PY'
+import json,sys,os
+path=sys.argv[1]
+item=sys.argv[2]
+with open(path,"r",encoding="utf-8") as f:
+    data=json.load(f)
+if not isinstance(data,list):
+    raise SystemExit(1)
+data.append(item)
+with open(path+".tmp","w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=True,indent=2)
+    f.write("\n")
+os.replace(path+".tmp",path)
+PY
+  fi
+}
+
+json_remove_index() {
+  local path="$1"
+  local index="$2"
+  if [[ "$JSON_TOOL" == "jq" ]]; then
+    jq --argjson idx "$index" 'del(.[$idx])' "$path" | json_write_tmp "$path"
+  else
+    python3 - "$path" "$index" <<'PY'
+import json,sys,os
+path=sys.argv[1]
+index=int(sys.argv[2])
+with open(path,"r",encoding="utf-8") as f:
+    data=json.load(f)
+if not isinstance(data,list):
+    raise SystemExit(1)
+if index < 0 or index >= len(data):
+    raise SystemExit(2)
+data.pop(index)
+with open(path+".tmp","w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=True,indent=2)
+    f.write("\n")
+os.replace(path+".tmp",path)
+PY
+  fi
+}
+
+json_clear() {
+  local path="$1"
+  if [[ "$JSON_TOOL" == "jq" ]]; then
+    printf "[]\n" | json_write_tmp "$path"
+  else
+    printf "[]\n" > "$path"
+  fi
+}
+
+json_item_kind() {
+  local file="$1"
+  case "$file" in
+    relays_import.json|relays_blastr.json) printf "relay" ;;
+    blacklisted_npubs.json|whitelisted_npubs.json) printf "npub" ;;
+    *) printf "string" ;;
+  esac
+}
+
+json_item_is_valid() {
+  local file="$1"
+  local item="$2"
+  local kind
+  kind="$(json_item_kind "$file")"
+
+  case "$kind" in
+    relay)
+      is_relay_address "$item"
+      ;;
+    npub)
+      if is_mixed_case "$item"; then
+        return 1
+      fi
+      is_npub "$item"
+      ;;
+    *)
+      [[ -n "$item" ]]
+      ;;
+  esac
+}
+
+validate_json_item() {
+  local file="$1"
+  local item="$2"
+  local kind
+  kind="$(json_item_kind "$file")"
+
+  VALIDATION_VALUE="$item"
+  if [[ -z "$item" ]]; then
+    VALIDATION_ERROR="Item cannot be empty."
+    return 1
+  fi
+
+  case "$kind" in
+    relay)
+      if ! is_relay_address "$item"; then
+        VALIDATION_ERROR="Relay must be a host or URL."
+        return 1
+      fi
+      ;;
+    npub)
+      if is_mixed_case "$item"; then
+        VALIDATION_ERROR="NPUB must be all lowercase or all uppercase."
+        return 1
+      fi
+      if ! is_npub "$item"; then
+        VALIDATION_ERROR="Invalid npub format."
+        return 1
+      fi
+      VALIDATION_VALUE="${item,,}"
+      ;;
+    *)
+      ;;
+  esac
+
+  return 0
+}
+
+list_services() {
+  local compose_file="$1"
+  dc "$compose_file" config --services 2>/dev/null || true
+}
+
+show_onion_host() {
+  local host_file="$ROOT_DIR/tor/data/haven/hostname"
+  if [[ -f "$host_file" ]]; then
+    printf "Onion Host: %s\n" "$(cat "$host_file")"
+  else
+    warn "Onion host file not found. Tor may still be initializing."
+  fi
+}
+
+prepare_start() {
+  ensure_templates_dir
+  ensure_example_jsons
+  apply_import_flag
+}
+
+start_services() {
+  local mode="$1"
+  local compose_file
+  local args=(up -d)
+
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+
+  prepare_start
+
+  if [[ "$BUILD_IMAGES" == "1" ]]; then
+    args+=(--build)
+  fi
+
+  info "Starting services ($mode)..."
+  dc "$compose_file" "${args[@]}"
+  dc "$compose_file" ps
+
+  if [[ "$mode" == "tor" ]]; then
+    show_onion_host
+  fi
+}
+
+stop_services() {
+  local mode="$1"
+  local compose_file
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+
+  info "Stopping services ($mode)..."
+  if ! dc "$compose_file" down --remove-orphans; then
+    warn "Nothing to stop or compose down failed."
+  fi
+}
+
+restart_services() {
+  local mode="$1"
+  stop_services "$mode"
+  start_services "$mode"
+}
+
+show_status() {
+  local mode="$1"
+  local compose_file
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+
+  info "Status ($mode):"
+  dc "$compose_file" ps
+
+  if [[ "$mode" == "tor" ]]; then
+    show_onion_host
+  fi
+}
+
+stream_logs() {
+  local mode="$1"
+  local compose_file="$2"
+  local service="$3"
+  local args=(logs --tail "$TAIL_COUNT")
+
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then
+    args+=(-f)
+  fi
+
+  if [[ -n "$service" && "$service" != "all" ]]; then
+    args+=("$service")
+  fi
+
+  info "Streaming logs ($mode). Press Ctrl+C to return."
+  dc "$compose_file" "${args[@]}"
+}
+
+log_sanitize_line() {
+  local line="$1"
+  line="${line//$'\r'/}"
+  line="${line//$'\t'/  }"
+  line="$(printf "%s" "$line" | sed -E 's/\x1B\\[[0-9;]*[[:alpha:]]//g')"
+  printf "%s" "$line"
+}
+
+log_append() {
+  local line="$1"
+  LOG_LINES+=("$line")
+  if (( ${#LOG_LINES[@]} > LOG_MAX_LINES )); then
+    LOG_LINES=("${LOG_LINES[@]: -$LOG_MAX_LINES}")
+  fi
+}
+
+stop_log_stream() {
+  if [[ -n "$LOG_PID" ]]; then
+    kill "$LOG_PID" >/dev/null 2>&1 || true
+    wait "$LOG_PID" >/dev/null 2>&1 || true
+  fi
+  LOG_PID=""
+  if [[ -n "${LOG_FD:-}" ]]; then
+    exec {LOG_FD}<&- || true
+  fi
+  LOG_FD=""
+  if [[ -n "$LOG_FIFO" ]]; then
+    rm -f "$LOG_FIFO"
+  fi
+  LOG_FIFO=""
+}
+
+start_log_stream() {
+  stop_log_stream
+  LOG_LINES=()
+
+  if ! docker info >/dev/null 2>&1; then
+    return
+  fi
+
+  local mode
+  local compose_file
+  local args=(logs --tail "$TAIL_COUNT")
+  mode="$(resolve_mode "logs")"
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then
+    args+=(-f)
+  fi
+  if [[ -n "$LOG_SERVICE" && "$LOG_SERVICE" != "all" ]]; then
+    args+=("$LOG_SERVICE")
+  fi
+
+  LOG_FIFO="$(mktemp -u)"
+  mkfifo "$LOG_FIFO"
+  set +e
+  dc "$compose_file" "${args[@]}" >"$LOG_FIFO" 2>&1 &
+  LOG_PID=$!
+  set -e
+  exec {LOG_FD}<"$LOG_FIFO"
+}
+
+refresh_log_snapshot() {
+  LOG_LINES=()
+  if ! docker info >/dev/null 2>&1; then
+    return
+  fi
+  local mode
+  local compose_file
+  local args=(logs --tail "$TAIL_COUNT")
+  mode="$(resolve_mode "logs")"
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+  if [[ -n "$LOG_SERVICE" && "$LOG_SERVICE" != "all" ]]; then
+    args+=("$LOG_SERVICE")
+  fi
+
+  run_capture dc "$compose_file" "${args[@]}"
+  if [[ "$RUN_STATUS" -ne 0 ]]; then
+    log_append "Logs unavailable."
+    return
+  fi
+
+  local line
+  while IFS= read -r line; do
+    log_append "$(log_sanitize_line "$line")"
+  done <<<"$RUN_OUTPUT"
+}
+
+drain_log_stream() {
+  if [[ -z "${LOG_FD:-}" ]]; then
+    return
+  fi
+  local updated=0
+  local line
+  while IFS= read -r -t 0.01 line <&$LOG_FD; do
+    log_append "$(log_sanitize_line "$line")"
+    updated=1
+  done
+  if [[ "$updated" -eq 1 ]]; then
+    TUI_NEED_RIGHT=1
+  fi
+}
+
+tui_refresh_logs_view() {
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then
+    start_log_stream
+  else
+    refresh_log_snapshot
+  fi
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    TUI_NEED_RIGHT=1
+  fi
+}
+
+tui_ensure_log_stream() {
+  if [[ -n "$LOG_PID" ]] && ! kill -0 "$LOG_PID" >/dev/null 2>&1; then
+    stop_log_stream
+    TUI_NEED_RIGHT=1
+  fi
+
+  if [[ "$FOLLOW_LOGS" != "1" || "$TUI_DOCKER_OK" -ne 1 ]]; then
+    return
+  fi
+
+  if [[ -z "$LOG_PID" ]]; then
+    local now
+    now="$(date +%s)"
+    if [[ -z "$TUI_LAST_LOG_RESTART" || $((now - TUI_LAST_LOG_RESTART)) -ge 1 ]]; then
+      start_log_stream
+      TUI_LAST_LOG_RESTART="$now"
+      TUI_NEED_RIGHT=1
+    fi
+    return
+  fi
+
+  if ! kill -0 "$LOG_PID" >/dev/null 2>&1; then
+    local now
+    now="$(date +%s)"
+    if [[ -z "$TUI_LAST_LOG_RESTART" || $((now - TUI_LAST_LOG_RESTART)) -ge 1 ]]; then
+      stop_log_stream
+      start_log_stream
+      TUI_LAST_LOG_RESTART="$now"
+      TUI_NEED_RIGHT=1
+    fi
+  fi
+}
+
+tui_render_right_logs() {
+  local header="Logs: ${LOG_SERVICE:-all} | Tail: ${TAIL_COUNT} | Follow: "
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then
+    header+="on"
+  else
+    header+="off"
+  fi
+  header="$(tui_truncate "$header" "$RIGHT_CONTENT_W")"
+  tput cup 0 "$RIGHT_X"
+  printf "%-*s" "$RIGHT_CONTENT_W" "$header"
+
+  local count=${#LOG_LINES[@]}
+  local start=$((count - RIGHT_CONTENT_HEIGHT))
+  if [[ "$start" -lt 0 ]]; then
+    start=0
+  fi
+  local row
+  local idx
+  for ((row=0; row<RIGHT_CONTENT_HEIGHT; row++)); do
+    idx=$((start + row))
+    local line=""
+    if [[ "$idx" -lt "$count" ]]; then
+      line="${LOG_LINES[$idx]}"
+    elif [[ "$count" -eq 0 && "$row" -eq 0 ]]; then
+      line="Waiting for logs..."
+    fi
+    line="$(tui_truncate "$line" "$RIGHT_CONTENT_W")"
+    tui_print_right $((RIGHT_CONTENT_ROW + row)) "$line"
+  done
+}
+
+prompt_tail_count() {
+  local input=""
+  read -r -p "Tail lines (current: $TAIL_COUNT): " input
+  if [[ -n "$input" ]]; then
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+      TAIL_COUNT="$input"
+    else
+      warn "Invalid number. Keeping $TAIL_COUNT."
+    fi
+  fi
+}
+
+pause() {
+  if [[ "$TUI_ACTIVE" == "1" && -t 1 ]]; then
+    tui_message "Continue" "Press any key to continue."
+  else
+    read -r -p "Press Enter to continue..." _
+  fi
+}
+
+print_header() {
+  printf "%b\n" "${CLR_BLUE}Haven Control${CLR_RESET}"
+  printf "%b\n\n" "${CLR_DIM}$ROOT_DIR${CLR_RESET}"
+}
+
+show_help_screen() {
+  local text
+  text=$(cat <<'HELP'
+Quick help
+
+- Start: prepares missing *.json files, asks import flag, then starts Docker.
+- Tor: uses docker-compose.tor.yml and shows the onion address when ready.
+- Logs: choose a service and tail size.
+- JSON editor: edit arrays inside relays/npubs JSON files.
+- Env editor: edit .env values; saving restarts running containers.
+
+JSON files
+- relays_import.json: list of relays to import from
+- relays_blastr.json: list of relays for blastr
+- blacklisted_npubs.json: npubs to block
+- whitelisted_npubs.json: npubs allowed (if whitelist mode)
+
+Tip: If a .example.json exists, the start flow will offer to copy it.
+HELP
+)
+
+  if [[ "$TUI_ACTIVE" == "1" && -t 1 ]]; then
+    tui_message "Help" "$text"
+  else
+    clear
+    print_header
+    printf "%s\n" "$text"
+    pause
+  fi
+}
+
+tui_update_docker_status() {
+  local now
+  now="$(date +%s)"
+  if [[ -z "$TUI_LAST_DOCKER_CHECK" || $((now - TUI_LAST_DOCKER_CHECK)) -ge 2 ]]; then
+    local prev="$TUI_DOCKER_OK"
+    local next=0
+    if docker info >/dev/null 2>&1; then
+      next=1
+    else
+      next=0
+    fi
+    if [[ "$next" -ne "$prev" ]]; then
+      TUI_NEED_LEFT=1
+    fi
+    TUI_DOCKER_OK="$next"
+    TUI_LAST_DOCKER_CHECK="$now"
+  fi
+}
+
+tui_set_view() {
+  TUI_VIEW="$1"
+  TUI_SEL=0
+  TUI_OFFSET=0
+  TUI_NEED_LEFT=1
+  TUI_NEED_RIGHT=1
+}
+
+tui_build_menu() {
+  MENU_IDS=()
+  MENU_LABELS=()
+  MENU_TITLE=""
+  MENU_SUBTITLE=""
+
+  case "$TUI_VIEW" in
+    main)
+      local docker_status="offline"
+      local mode="unknown"
+      if [[ "$TUI_DOCKER_OK" -eq 1 ]]; then
+        docker_status="running"
+        mode="$(resolve_mode "status")"
+      fi
+      MENU_TITLE="Haven"
+      MENU_SUBTITLE="Docker: $docker_status | Mode: $mode | Logs: ${LOG_SERVICE:-all}"
+      MENU_IDS=(start_plain start_tor stop restart json onion import help quit)
+      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" "JSON Editor" "Show Onion Host" "Set Import Flag" "Help" "Quit")
+      ;;
+    logs)
+      MENU_TITLE="Logs Settings"
+      MENU_SUBTITLE="Service: ${LOG_SERVICE:-all} | Tail: ${TAIL_COUNT} | Follow: $([[ "$FOLLOW_LOGS" == "1" ]] && echo on || echo off)"
+      MENU_IDS=(service tail follow back)
+      MENU_LABELS=("Select service" "Tail lines" "Toggle follow" "Back")
+      ;;
+    logs_service)
+      MENU_TITLE="Log Services"
+      MENU_SUBTITLE="Choose which service to stream."
+      MENU_IDS=(all)
+      MENU_LABELS=("All services")
+      local svc
+      while IFS= read -r svc; do
+        [[ -n "$svc" ]] || continue
+        MENU_IDS+=("$svc")
+        MENU_LABELS+=("$svc")
+      done < <(list_services "$(compose_file_for "$(resolve_mode "logs")")")
+      if [[ "${#MENU_IDS[@]}" -eq 1 ]]; then
+        MENU_IDS+=(relay tor)
+        MENU_LABELS+=("relay" "tor")
+      fi
+      MENU_IDS+=(back)
+      MENU_LABELS+=("Back")
+      ;;
+    env_list)
+      MENU_TITLE=".env Editor"
+      MENU_SUBTITLE="Select a variable"
+      MENU_IDS=(add)
+      MENU_LABELS=("Add variable")
+      local key
+      while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        local value=""
+        value="$(read_env_var "$key" 2>/dev/null || true)"
+        MENU_IDS+=("key:$key")
+        MENU_LABELS+=("$key = $value")
+      done < <(list_env_keys)
+      MENU_IDS+=(back)
+      MENU_LABELS+=("Back")
+      ;;
+    env_item)
+      MENU_TITLE=".env: $CURRENT_ENV_KEY"
+      MENU_SUBTITLE="Edit or remove this variable."
+      MENU_IDS=(edit remove back)
+      MENU_LABELS=("Edit value" "Remove variable" "Back")
+      ;;
+    json_files)
+      MENU_TITLE="JSON Editor"
+      MENU_SUBTITLE="Select a list"
+      local count=${#JSON_FILES[@]}
+      local file label
+      for ((i=0; i<count; i++)); do
+        file="${JSON_FILES[$i]}"
+        label="${JSON_LABELS[$i]}"
+        MENU_IDS+=("$file")
+        MENU_LABELS+=("$label ($file)")
+      done
+      MENU_IDS+=(back)
+      MENU_LABELS+=("Back")
+      ;;
+    json_items)
+      MENU_TITLE="JSON: $CURRENT_JSON_FILE"
+      MENU_SUBTITLE="Edit list items"
+      MENU_IDS=(add clear)
+      MENU_LABELS=("Add item" "Clear list")
+      local path="$ROOT_DIR/$CURRENT_JSON_FILE"
+      local output=""
+      if ! output="$(json_list_items "$path" 2>/dev/null)"; then
+        MENU_IDS=(back)
+        MENU_LABELS=("Invalid JSON (back)")
+      else
+        local idx=0
+        local item
+        while IFS= read -r item; do
+          MENU_IDS+=("item:$idx")
+          if json_item_is_valid "$CURRENT_JSON_FILE" "$item"; then
+            MENU_LABELS+=("$item")
+          else
+            MENU_LABELS+=("$item (invalid)")
+          fi
+          idx=$((idx + 1))
+        done <<<"$output"
+        MENU_IDS+=(back)
+        MENU_LABELS+=("Back")
+      fi
+      ;;
+  esac
+}
+
+tui_render_left_menu() {
+  local row="$LEFT_CONTENT_ROW"
+  local visible_rows="$LEFT_CONTENT_HEIGHT"
+
+  tui_build_menu
+
+  if [[ -n "$MENU_TITLE" ]]; then
+    tui_print_left "$row" "$MENU_TITLE"
+    row=$((row + 1))
+    visible_rows=$((visible_rows - 1))
+  fi
+  if [[ -n "$MENU_SUBTITLE" ]]; then
+    tui_print_left "$row" "$MENU_SUBTITLE"
+    row=$((row + 1))
+    visible_rows=$((visible_rows - 1))
+  fi
+
+  local count=${#MENU_LABELS[@]}
+  if [[ "$count" -le 0 ]]; then
+    tui_print_left "$row" "(empty)"
+    return
+  fi
+
+  if [[ "$TUI_SEL" -lt 0 ]]; then
+    TUI_SEL=0
+  fi
+  if [[ "$TUI_SEL" -ge "$count" ]]; then
+    TUI_SEL=$((count - 1))
+  fi
+
+  if [[ "$TUI_SEL" -lt "$TUI_OFFSET" ]]; then
+    TUI_OFFSET="$TUI_SEL"
+  fi
+  if [[ "$TUI_SEL" -ge $((TUI_OFFSET + visible_rows)) ]]; then
+    TUI_OFFSET=$((TUI_SEL - visible_rows + 1))
+  fi
+
+  local i
+  for ((i=0; i<visible_rows; i++)); do
+    local idx=$((TUI_OFFSET + i))
+    local label=""
+    if [[ "$idx" -lt "$count" ]]; then
+      label="${MENU_LABELS[$idx]}"
+    fi
+    local display
+    display="$(tui_truncate "$label" "$LEFT_CONTENT_W")"
+    tput cup $((row + i)) "$LEFT_X"
+    if [[ "$idx" -eq "$TUI_SEL" ]]; then
+      printf "\033[7m%-*s\033[0m" "$LEFT_CONTENT_W" "$display"
+    else
+      printf "%-*s" "$LEFT_CONTENT_W" "$display"
+    fi
+  done
+}
+
+tui_handle_back() {
+  case "$TUI_VIEW" in
+    main) return 1 ;;
+    logs) tui_set_view "main" ;;
+    logs_service) tui_set_view "logs" ;;
+    env_list) tui_set_view "main" ;;
+    env_item) tui_set_view "env_list" ;;
+    json_files) tui_set_view "main" ;;
+    json_items) tui_set_view "json_files" ;;
+    *) tui_set_view "main" ;;
+  esac
+  return 0
+}
+
+tui_run_action() {
+  local title="$1"
+  shift
+  if [[ "$TUI_ACTIVE" == "1" && "$FOLLOW_LOGS" == "1" ]]; then
+    stop_log_stream
+  fi
+  run_capture "$@"
+  local text=""
+  if [[ "$RUN_STATUS" -eq 0 ]]; then
+    text="Done."
+  else
+    text="Failed (exit $RUN_STATUS)."
+  fi
+  if [[ -n "$RUN_OUTPUT" ]]; then
+    text="$text\n\n$RUN_OUTPUT"
+  fi
+  tui_message "$title" "$text"
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    tui_refresh_logs_view
+    TUI_NEED_LEFT=1
+  fi
+}
+
+tui_handle_enter() {
+  local id="${MENU_IDS[$TUI_SEL]}"
+
+  case "$TUI_VIEW" in
+    main)
+      case "$id" in
+        start_plain)
+          tui_require_docker || return
+          if tui_confirm "Start services (Docker)?" "y"; then
+            tui_run_action "Start" start_services "plain"
+          fi
+          ;;
+        start_tor)
+          tui_require_docker || return
+          if tui_confirm "Start services (Tor)?" "y"; then
+            tui_run_action "Start" start_services "tor"
+          fi
+          ;;
+        stop)
+          tui_require_docker || return
+          local mode_stop
+          mode_stop="$(resolve_mode "stop")"
+          if tui_confirm "Stop services ($mode_stop)?" "y"; then
+            tui_run_action "Stop" stop_services "$mode_stop"
+          fi
+          ;;
+        restart)
+          tui_require_docker || return
+          local mode_restart
+          mode_restart="$(resolve_mode "restart")"
+          if tui_confirm "Restart services ($mode_restart)?" "y"; then
+            tui_run_action "Restart" restart_services "$mode_restart"
+          fi
+          ;;
+        logs)
+          tui_set_view "logs"
+          ;;
+        status)
+          tui_require_docker || return
+          local mode_status
+          local compose_file
+          mode_status="$(resolve_mode "status")"
+          compose_file="$(compose_file_for "$mode_status")"
+          run_capture dc "$compose_file" ps
+          tui_message "Status" "$RUN_OUTPUT"
+          ;;
+        env)
+          if ! ensure_env_file; then
+            tui_message ".env" ".env missing."
+            return
+          fi
+          tui_set_view "env_list"
+          ;;
+        json)
+          if ! detect_json_tool; then
+            tui_message "JSON Editor" "jq or python3 is required for JSON editing."
+            return
+          fi
+          tui_set_view "json_files"
+          ;;
+        onion)
+          if [[ -f "$ROOT_DIR/tor/data/haven/hostname" ]]; then
+            tui_message "Onion Host" "$(cat "$ROOT_DIR/tor/data/haven/hostname")"
+          else
+            tui_message "Onion Host" "Onion host file not found."
+          fi
+          ;;
+        import)
+          prompt_import_flag
+          local value=""
+          value="$(read_env_var HAVEN_IMPORT_FLAG 2>/dev/null || true)"
+          tui_message "Import Flag" "HAVEN_IMPORT_FLAG=$value"
+          ;;
+        help)
+          show_help_screen
+          ;;
+        quit)
+          return 1
+          ;;
+      esac
+      ;;
+    logs)
+      case "$id" in
+        service)
+          tui_set_view "logs_service"
+          ;;
+        tail)
+          local new_tail
+          new_tail="$(tui_prompt "Tail lines: " "$TAIL_COUNT")"
+          if [[ "$new_tail" =~ ^[0-9]+$ ]]; then
+            TAIL_COUNT="$new_tail"
+            if [[ "$FOLLOW_LOGS" == "1" ]]; then
+              start_log_stream
+            else
+              refresh_log_snapshot
+            fi
+            TUI_NEED_RIGHT=1
+          else
+            tui_message "Logs" "Tail must be a number."
+          fi
+          ;;
+        follow)
+          if [[ "$FOLLOW_LOGS" == "1" ]]; then
+            FOLLOW_LOGS=0
+            stop_log_stream
+            refresh_log_snapshot
+          else
+            FOLLOW_LOGS=1
+            start_log_stream
+          fi
+          TUI_NEED_RIGHT=1
+          ;;
+        back)
+          tui_set_view "main"
+          ;;
+      esac
+      ;;
+    logs_service)
+      if [[ "$id" == "back" ]]; then
+        tui_set_view "logs"
+      else
+        LOG_SERVICE="$id"
+        if [[ "$FOLLOW_LOGS" == "1" ]]; then
+          start_log_stream
+        else
+          refresh_log_snapshot
+        fi
+        TUI_NEED_RIGHT=1
+        tui_set_view "logs"
+      fi
+      ;;
+    env_list)
+      case "$id" in
+        add)
+          local new_key
+          local new_value
+          new_key="$(tui_prompt "New key: " "")"
+          if [[ -z "$new_key" ]]; then
+            tui_message ".env" "Key is empty."
+            return
+          fi
+          if [[ ! "$new_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            tui_message ".env" "Invalid key format."
+            return
+          fi
+          new_value="$(tui_prompt "New value: " "")"
+          if ! validate_env_value "$new_key" "$new_value"; then
+            tui_message ".env" "$VALIDATION_ERROR"
+            return
+          fi
+          set_env_var "$new_key" "$VALIDATION_VALUE"
+          restart_after_env_change
+          ;;
+        back)
+          tui_set_view "main"
+          ;;
+        *)
+          if [[ "$id" == key:* ]]; then
+            CURRENT_ENV_KEY="${id#key:}"
+            tui_set_view "env_item"
+          fi
+          ;;
+      esac
+      ;;
+    env_item)
+      case "$id" in
+        edit)
+          local current=""
+          local new_value=""
+          current="$(read_env_var "$CURRENT_ENV_KEY" 2>/dev/null || true)"
+          new_value="$(tui_prompt "New value (blank to keep): " "$current")"
+          if [[ -z "$new_value" ]]; then
+            return
+          fi
+          if ! validate_env_value "$CURRENT_ENV_KEY" "$new_value"; then
+            tui_message ".env" "$VALIDATION_ERROR"
+            return
+          fi
+          set_env_var "$CURRENT_ENV_KEY" "$VALIDATION_VALUE"
+          restart_after_env_change
+          ;;
+        remove)
+          if tui_confirm "Remove $CURRENT_ENV_KEY?" "n"; then
+            remove_env_var "$CURRENT_ENV_KEY"
+            restart_after_env_change
+          fi
+          ;;
+        back)
+          tui_set_view "env_list"
+          ;;
+      esac
+      ;;
+    json_files)
+      if [[ "$id" == "back" ]]; then
+        tui_set_view "main"
+      else
+        CURRENT_JSON_FILE="$id"
+        if ! ensure_json_array_file "$CURRENT_JSON_FILE"; then
+          tui_message "JSON Editor" "File missing or invalid."
+          return
+        fi
+        tui_set_view "json_items"
+      fi
+      ;;
+    json_items)
+      case "$id" in
+        add)
+          local new_item
+          new_item="$(tui_prompt "Add item: " "")"
+          if [[ -z "$new_item" ]]; then
+            tui_message "JSON Editor" "Item is empty."
+            return
+          fi
+          if ! validate_json_item "$CURRENT_JSON_FILE" "$new_item"; then
+            tui_message "JSON Editor" "$VALIDATION_ERROR"
+            return
+          fi
+          local item_to_add="$VALIDATION_VALUE"
+          local path="$ROOT_DIR/$CURRENT_JSON_FILE"
+          run_capture json_list_items "$path"
+          local duplicate=0
+          local existing
+          while IFS= read -r existing; do
+            if [[ "$existing" == "$item_to_add" ]]; then
+              duplicate=1
+              break
+            fi
+          done <<<"$RUN_OUTPUT"
+          if [[ "$duplicate" == "1" ]]; then
+            tui_message "JSON Editor" "Item already exists."
+            return
+          fi
+          json_add_item "$path" "$item_to_add"
+          ;;
+        clear)
+          if tui_confirm "Clear entire list?" "n"; then
+            json_clear "$ROOT_DIR/$CURRENT_JSON_FILE"
+          fi
+          ;;
+        back)
+          tui_set_view "json_files"
+          ;;
+        item:*)
+          local index="${id#item:}"
+          local path="$ROOT_DIR/$CURRENT_JSON_FILE"
+          local output=""
+          output="$(json_list_items "$path" 2>/dev/null || true)"
+          local current_item=""
+          current_item="$(printf "%s" "$output" | sed -n "$((index + 1))p")"
+          if [[ -n "$current_item" ]]; then
+            if tui_confirm "Remove item?\n\n$current_item" "n"; then
+              json_remove_index "$path" "$index"
+            fi
+          fi
+          ;;
+      esac
+      ;;
+  esac
+  TUI_NEED_LEFT=1
+  TUI_NEED_RIGHT=1
+  return 0
+}
+
+tui_handle_key() {
+  local key="$1"
+  local count=${#MENU_IDS[@]}
+
+  case "$key" in
+    up)
+      if [[ "$TUI_SEL" -gt 0 ]]; then
+        TUI_SEL=$((TUI_SEL - 1))
+        TUI_NEED_LEFT=1
+      fi
+      ;;
+    down)
+      if [[ "$TUI_SEL" -lt $((count - 1)) ]]; then
+        TUI_SEL=$((TUI_SEL + 1))
+        TUI_NEED_LEFT=1
+      fi
+      ;;
+    enter)
+      tui_handle_enter || return 1
+      ;;
+    left|esc)
+      tui_handle_back || return 1
+      ;;
+    quit)
+      if [[ "$TUI_VIEW" == "main" ]]; then
+        return 1
+      fi
+      tui_handle_back
+      ;;
+  esac
+  return 0
+}
+
+tui_loop() {
+  local start_view="$1"
+  local running=1
+
+  tui_init
+  trap 'TUI_NEED_RESIZE=1' SIGWINCH
+
+  if [[ -n "$start_view" ]]; then
+    TUI_VIEW="$start_view"
+  else
+    TUI_VIEW="main"
+  fi
+  TUI_SEL=0
+  TUI_OFFSET=0
+  TUI_NEED_FRAME=1
+  TUI_NEED_LEFT=1
+  TUI_NEED_RIGHT=1
+
+  if [[ -z "$LOG_SERVICE" ]]; then
+    LOG_SERVICE="relay"
+  fi
+
+  tui_update_docker_status
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then
+    start_log_stream
+  else
+    refresh_log_snapshot
+  fi
+
+  while [[ "$running" -eq 1 ]]; do
+    if [[ "$TUI_NEED_RESIZE" -eq 1 ]]; then
+      TUI_NEED_RESIZE=0
+      tui_update_layout
+      TUI_NEED_FRAME=1
+      TUI_NEED_LEFT=1
+      TUI_NEED_RIGHT=1
+    fi
+
+    tui_update_docker_status
+    tui_ensure_log_stream
+    drain_log_stream
+
+    if [[ "$TUI_NEED_FRAME" -eq 1 ]]; then
+      tui_draw_frame 1
+      TUI_NEED_FRAME=0
+      TUI_NEED_LEFT=1
+      TUI_NEED_RIGHT=1
+    fi
+
+    if [[ "$TUI_NEED_RIGHT" -eq 1 ]]; then
+      tui_render_right_logs
+      TUI_NEED_RIGHT=0
+    fi
+
+    if [[ "$TUI_NEED_LEFT" -eq 1 ]]; then
+      tui_render_left_menu
+      TUI_NEED_LEFT=0
+    fi
+
+    local key=""
+    key="$(tui_read_key)" || continue
+    if ! tui_handle_key "$key"; then
+      running=0
+    fi
+  done
+}
+
+restart_after_env_change() {
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker not running; restart skipped."
+    return
+  fi
+
+  local mode=""
+  if docker ps --format '{{.Names}}' | grep -qx 'haven-tor'; then
+    mode="tor"
+  elif docker ps --format '{{.Names}}' | grep -qx 'haven-relay'; then
+    mode="plain"
+  else
+    warn "No running containers to restart."
+    return
+  fi
+
+  info "Restarting services ($mode) to apply .env changes..."
+  local prev_skip="$SKIP_IMPORT_PROMPT"
+  local prev_import="$IMPORT_MODE"
+  SKIP_IMPORT_PROMPT=1
+  IMPORT_MODE="auto"
+  restart_services "$mode"
+  IMPORT_MODE="$prev_import"
+  SKIP_IMPORT_PROMPT="$prev_skip"
+}
+
+menu_env_editor() {
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    if ! ensure_env_file; then
+      tui_message ".env" ".env missing."
+      return
+    fi
+    tui_set_view "env_list"
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    die "Env editor requires a TTY."
+  fi
+  if ! ensure_env_file; then
+    die ".env missing."
+  fi
+  tui_loop "env_list"
+}
+
+menu_logs() {
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    tui_set_view "logs"
+    return
+  fi
+  if [[ -t 0 ]]; then
+    tui_loop "logs"
+  else
+    LOG_SERVICE="all"
+    local mode
+    local compose_file
+    mode="$(resolve_mode "logs")"
+    compose_file="$(compose_file_for "$mode")"
+    require_compose_file "$compose_file"
+    stream_logs "$mode" "$compose_file" "$LOG_SERVICE"
+  fi
+}
+
+menu_json_editor() {
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    if ! detect_json_tool; then
+      tui_message "JSON Editor" "jq or python3 is required for JSON editing."
+      return
+    fi
+    tui_set_view "json_files"
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    die "JSON editor requires a TTY."
+  fi
+  if ! detect_json_tool; then
+    die "jq or python3 is required for JSON editing."
+  fi
+  tui_loop "json_files"
+}
+
+tui() {
+  if [[ ! -t 0 ]]; then
+    die "TUI requires a TTY. Use CLI commands instead."
+  fi
+  tui_loop "main"
+}
+
+parse_args() {
+  if [[ $# -eq 0 ]]; then
+    COMMAND="tui"
+    return
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      start|stop|restart|logs|status|tui|help|import|onion|json|env)
+        COMMAND="$1"
+        shift
+        ;;
+      -t|--tor)
+        MODE="tor"
+        shift
+        ;;
+      --plain)
+        MODE="plain"
+        shift
+        ;;
+      --import)
+        IMPORT_MODE="true"
+        shift
+        ;;
+      --no-import)
+        IMPORT_MODE="false"
+        shift
+        ;;
+      --prompt-import)
+        IMPORT_MODE="prompt"
+        shift
+        ;;
+      --tail)
+        [[ $# -lt 2 ]] && die "--tail requires a number"
+        TAIL_COUNT="$2"
+        shift 2
+        ;;
+      -s|--service)
+        [[ $# -lt 2 ]] && die "--service requires a name"
+        LOG_SERVICE="$2"
+        shift 2
+        ;;
+      --all)
+        LOG_SERVICE="all"
+        shift
+        ;;
+      --no-follow)
+        FOLLOW_LOGS=0
+        shift
+        ;;
+      --no-build)
+        BUILD_IMAGES=0
+        shift
+        ;;
+      --build)
+        BUILD_IMAGES=1
+        shift
+        ;;
+      -h|--help)
+        COMMAND="help"
+        shift
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+main() {
+  cd "$ROOT_DIR"
+  detect_compose
+  parse_args "$@"
+
+  case "$COMMAND" in
+    tui)
+      tui
+      ;;
+    start)
+      ensure_docker
+      start_services "$(resolve_mode "start")"
+      ;;
+    stop)
+      ensure_docker
+      stop_services "$(resolve_mode "stop")"
+      ;;
+    restart)
+      ensure_docker
+      restart_services "$(resolve_mode "restart")"
+      ;;
+    logs)
+      if [[ -z "$LOG_SERVICE" ]]; then
+        if [[ -t 0 ]]; then
+          menu_logs
+        else
+          LOG_SERVICE="all"
+        fi
+      fi
+
+      if [[ -n "$LOG_SERVICE" ]]; then
+        ensure_docker
+        local mode
+        local compose_file
+        mode="$(resolve_mode "logs")"
+        compose_file="$(compose_file_for "$mode")"
+        require_compose_file "$compose_file"
+        stream_logs "$mode" "$compose_file" "$LOG_SERVICE"
+      fi
+      ;;
+    status)
+      ensure_docker
+      show_status "$(resolve_mode "status")"
+      ;;
+    onion)
+      show_onion_host
+      ;;
+    import)
+      prompt_import_flag
+      ;;
+    env)
+      menu_env_editor
+      ;;
+    json)
+      menu_json_editor
+      ;;
+    help|"")
+      print_usage
+      ;;
+    *)
+      die "Unknown command: $COMMAND"
+      ;;
+  esac
+}
+
+main "$@"

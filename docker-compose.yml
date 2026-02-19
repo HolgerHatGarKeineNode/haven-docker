@@ -10,6 +10,8 @@ services:
       - "./blossom:/app/blossom"
       - "./relays_import.json:/app/relays_import.json"
       - "./relays_blastr.json:/app/relays_blastr.json"
+      - "./blacklisted_npubs.json:/app/blacklisted_npubs.json"
+      - "./whitelisted_npubs.json:/app/whitelisted_npubs.json"
     ports:
       - "3355:${RELAY_PORT:-3355}"
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
