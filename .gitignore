@@ -3,5 +3,7 @@
 .env.bak
 relays_import.json
 relays_blastr.json
+blacklisted_npubs.json
+whitelisted_npubs.json
 db.zip
 .DS_Store
