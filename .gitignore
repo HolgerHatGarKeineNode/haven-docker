@@ -7,3 +7,4 @@ blacklisted_npubs.json
 whitelisted_npubs.json
 db.zip
 .DS_Store
+/remotion
