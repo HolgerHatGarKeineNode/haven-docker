@@ -489,7 +489,11 @@ tui_prompt() {
   local prompt="$1"
   local default="$2"
   local input=""
+  local ch=""
   local prompt_row=$((TUI_LINES - 3))
+  local prompt_len=${#prompt}
+  local max_input=$((LEFT_CONTENT_W - prompt_len - 2))
+  (( max_input < 10 )) && max_input=10
 
   # Flush any pending input
   while IFS= read -rsn1 -t 0.01 _ </dev/tty; do :; done
@@ -504,14 +508,53 @@ tui_prompt() {
     tput cnorm
   } >/dev/tty
 
-  stty echo icanon
-  IFS= read -r input </dev/tty
-  stty -echo -icanon time 0 min 0
-  tput civis >/dev/tty
+  while true; do
+    IFS= read -rsn1 -t 0.1 ch </dev/tty || continue
 
-  if [[ -z "$input" ]]; then
-    input="$default"
-  fi
+    # ESC → cancel
+    if [[ "$ch" == $'\x1b' ]]; then
+      # Consume any trailing escape sequence chars
+      IFS= read -rsn2 -t 0.01 _ </dev/tty || true
+      input="$default"
+      break
+    fi
+
+    # Enter → confirm
+    if [[ -z "$ch" || "$ch" == $'\n' || "$ch" == $'\r' ]]; then
+      if [[ -z "$input" ]]; then
+        input="$default"
+      fi
+      break
+    fi
+
+    # Backspace (0x7f or 0x08)
+    if [[ "$ch" == $'\x7f' || "$ch" == $'\x08' ]]; then
+      if [[ -n "$input" ]]; then
+        input="${input%?}"
+        # Redraw input area
+        {
+          tput cup "$prompt_row" "$((LEFT_X + prompt_len + 1))"
+          printf "%-*s" "$max_input" "$input"
+          tput cup "$prompt_row" "$((LEFT_X + prompt_len + 1 + ${#input}))"
+        } >/dev/tty
+      fi
+      continue
+    fi
+
+    # Ctrl-C → cancel
+    if [[ "$ch" == $'\x03' ]]; then
+      input="$default"
+      break
+    fi
+
+    # Append printable character
+    if (( ${#input} < max_input )); then
+      input+="$ch"
+      printf "%s" "$ch" >/dev/tty
+    fi
+  done
+
+  tput civis >/dev/tty
   printf "%s" "$input"
 }
 
@@ -1996,8 +2039,8 @@ tui_build_menu() {
       TUI_LEFT_TITLE="⚡ Haven Dashboard"
       MENU_TITLE="Haven"
       MENU_SUBTITLE="$docker_icon Docker: $docker_status │ Mode: $mode"
-      MENU_IDS=(start_plain start_tor stop restart json env_upgrade onion import help quit)
-      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" "JSON Editor" "Upgrade .env" "Show Onion Host" "Set Import Flag" "Help" "Quit")
+      MENU_IDS=(start_plain start_tor stop restart env json env_upgrade onion import help quit)
+      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" ".env Editor" "JSON Editor" "Upgrade .env" "Show Onion Host" "Set Import Flag" "Help" "Quit")
       ;;
     logs)
       TUI_LEFT_TITLE="⚡ Haven ─ Logs"
