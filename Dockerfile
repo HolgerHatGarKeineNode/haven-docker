@@ -22,9 +22,6 @@ FROM alpine:latest
 
 ENV HAVEN_IMPORT_FLAG=false
 
-# Install libc6-compat for Go binary compatibility
-RUN apk add --no-cache libc6-compat
-
 # Add non-root user specification
 RUN adduser -D -g '' nonroot
 

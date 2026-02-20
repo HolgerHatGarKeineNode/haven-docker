@@ -8,6 +8,7 @@
 
 ```bash
 cp .env.example .env
+cp -r templates-example/* templates/
 cp relays_import.example.json relays_import.json
 cp relays_blastr.example.json relays_blastr.json
 cp blacklisted_npubs.example.json blacklisted_npubs.json
