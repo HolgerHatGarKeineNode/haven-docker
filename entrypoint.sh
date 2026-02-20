@@ -31,8 +31,9 @@ ensure_env_file() {
   if [ -f "$1" ]; then
     return 0
   fi
-  log "WARN: $1 missing. Copy .env.example to .env and fill values before start."
-  return 0
+  log "ERROR: $1 missing and required for startup."
+  log "Run: cp .env.example .env"
+  return 1
 }
 
 ensure_list_files() {
