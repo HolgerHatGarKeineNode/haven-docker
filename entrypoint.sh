@@ -37,10 +37,10 @@ ensure_env_file() {
 }
 
 ensure_list_files() {
-  ensure_json_artifacts relays_import
-  ensure_json_artifacts relays_blastr
-  ensure_json_artifacts blacklisted_npubs
-  ensure_json_artifacts whitelisted_npubs
+  ensure_json_artifacts relays_import.json
+  ensure_json_artifacts relays_blastr.json
+  ensure_json_artifacts blacklisted_npubs.json
+  ensure_json_artifacts whitelisted_npubs.json
   ensure_env_file .env
 }
 
