@@ -21,8 +21,8 @@ RUN if [ -z "$VERSION" ]; then \
 RUN --mount=type=cache,target=/gomod-cache --mount=type=cache,target=/go-cache \
     go build -a -tags netgo -ldflags '-w -s -extldflags "-static"' -o haven .
 
-# Final Alpine image (pinned minor tag)
-FROM alpine:3.20
+# Final Alpine image (keeps latest tag intentionally)
+FROM alpine:latest
 
 ENV HAVEN_IMPORT_FLAG=false
 
