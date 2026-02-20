@@ -7,6 +7,8 @@ DEFAULT_DOCKER_USER="holgerhatgarkeinenode"
 DEFAULT_IMAGE_NAME="haven-docker"
 DEFAULT_PLATFORM="linux/amd64"
 
+NONINTERACTIVE=false
+
 # ── Colors ────────────────────────────────────────────────────────────
 BOLD='\033[1m'
 CYAN='\033[0;36m'
@@ -23,6 +25,16 @@ prompt() {
     if [[ -n "$current_val" ]]; then
         return
     fi
+
+    if [[ "$NONINTERACTIVE" == "true" ]]; then
+        if [[ -n "$default" ]]; then
+            eval "$var_name=\"\$default\""
+            return
+        fi
+        printf "${RED}Error: ${prompt_text} is required in non-interactive mode.${NC}\n" >&2
+        exit 1
+    fi
+
     if [[ -n "$default" ]]; then
         printf "${CYAN}${prompt_text}${NC} [${YELLOW}${default}${NC}]: "
     else
@@ -39,6 +51,9 @@ prompt() {
 
 confirm() {
     local prompt_text="$1"
+    if [[ "$NONINTERACTIVE" == "true" ]]; then
+        return 0
+    fi
     printf "${YELLOW}${prompt_text}${NC} [y/N]: "
     read -r answer
     [[ "$answer" =~ ^[yY]$ ]]
@@ -68,18 +83,19 @@ ${BOLD}Commands:${NC}
   help        Show this help
 
 ${BOLD}Flags (optional – without flags you will be prompted interactively):${NC}
-  --version, -v   Git branch/tag (VERSION)              ${YELLOW}[required]${NC}
+  --version, -v   Git branch/tag (VERSION)                         ${YELLOW}[required for build/buildx]${NC}
   --repo          Repository URL                        ${YELLOW}[${DEFAULT_REPO_URL}]${NC}
   --user, -u      Docker Hub username                   ${YELLOW}[${DEFAULT_DOCKER_USER}]${NC}
   --image, -i     Image name                            ${YELLOW}[${DEFAULT_IMAGE_NAME}]${NC}
   --tag, -t       Image tag                             ${YELLOW}[= VERSION]${NC}
   --platform, -p  Platform (linux/amd64, linux/arm64)   ${YELLOW}[${DEFAULT_PLATFORM}]${NC}
   --latest        Also tag as 'latest'
+  --yes, -y       Skip confirmation prompts
 
 ${BOLD}Examples:${NC}
   ./build.sh build -v v1.2.0
   ./build.sh build -v v1.2.0 -p linux/arm64 --latest
-  ./build.sh push  -v v1.2.0 --latest
+  ./build.sh push  --user holgerhatgarkeinenode --image haven-docker --tag v1.2.0 --yes
   ./build.sh buildx -v v1.2.0 -p linux/amd64,linux/arm64 --latest
   ./build.sh build   ${CYAN}# interactive mode${NC}
 EOF
@@ -113,6 +129,7 @@ parse_args() {
             --tag|-t)      IMAGE_TAG="$2";   shift 2 ;;
             --platform|-p) PLATFORM="$2";    shift 2 ;;
             --latest)      TAG_LATEST=true;  shift ;;
+            --yes|-y)      NONINTERACTIVE=true;  shift ;;
             --help|-h)     usage; exit 0 ;;
             *) die "Unknown parameter: $1" ;;
         esac
@@ -131,6 +148,17 @@ collect_params() {
     # IMAGE_TAG defaults to VERSION
     if [[ -z "$IMAGE_TAG" ]]; then
         prompt IMAGE_TAG "Image tag" "$VERSION"
+    fi
+}
+
+collect_push_params() {
+    header "Haven Docker Build Script"
+
+    prompt DOCKER_USER "Docker Hub username" "$DEFAULT_DOCKER_USER"
+    prompt IMAGE_NAME  "Image name"          "$DEFAULT_IMAGE_NAME"
+
+    if [[ -z "$IMAGE_TAG" ]]; then
+        prompt IMAGE_TAG "Image tag" "latest"
     fi
 }
 
@@ -165,7 +193,7 @@ setup_image_names() {
 show_summary() {
     header "Summary"
     printf "  Action:     ${GREEN}${COMMAND}${NC}\n"
-    printf "  VERSION:    ${GREEN}${VERSION}${NC}\n"
+    [[ "$COMMAND" != "push" ]] && printf "  VERSION:    ${GREEN}${VERSION}${NC}\n"
     [[ "$COMMAND" != "push" ]] && printf "  REPO_URL:   ${GREEN}${REPO_URL}${NC}\n"
     printf "  Image:      ${GREEN}${FULL_IMAGE}${NC}\n"
     [[ "$COMMAND" != "push" ]] && printf "  Platform:   ${GREEN}${PLATFORM}${NC}\n"
@@ -206,7 +234,7 @@ cmd_build() {
 }
 
 cmd_push() {
-    collect_params
+    collect_push_params
     setup_image_names
     show_summary
 
