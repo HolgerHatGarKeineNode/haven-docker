@@ -114,6 +114,7 @@ ICO_JSON="{}"
 ICO_ENV="≡"
 ICO_ONION="◎"
 ICO_IMPORT="↓"
+ICO_UPGRADE="↑"
 ICO_HELP="?"
 ICO_QUIT="×"
 ICO_BACK="←"
@@ -227,6 +228,7 @@ Commands:
   onion               Show Tor onion hostname (if available)
   import              Set HAVEN_IMPORT_FLAG (interactive)
   env                 Edit .env (TUI)
+  env-upgrade         Add missing vars from .env.example
   json                Open JSON list editor
   help                Show this help
 
@@ -1270,6 +1272,110 @@ remove_env_var() {
   mv "$tmp_file" "$env_file"
 }
 
+list_missing_env_vars() {
+  local env_file="$ROOT_DIR/.env"
+  local example_file="$ROOT_DIR/.env.example"
+  [[ -f "$env_file" && -f "$example_file" ]] || return 0
+  awk '
+    function extract_key(line,    tmp, ep, kp) {
+      tmp = line
+      sub(/^[ \t]*/, "", tmp)
+      sub(/^export[ \t]+/, "", tmp)
+      ep = index(tmp, "=")
+      if (ep == 0) return ""
+      kp = substr(tmp, 1, ep - 1)
+      if (kp ~ /^[A-Za-z_][A-Za-z0-9_]*$/) return kp
+      return ""
+    }
+    NR == FNR {
+      key = extract_key($0)
+      if (key != "") existing[key] = 1
+      next
+    }
+    {
+      key = extract_key($0)
+      if (key != "" && !(key in existing)) print key
+    }
+  ' "$env_file" "$example_file"
+}
+
+upgrade_env_file() {
+  local env_file="$ROOT_DIR/.env"
+  local example_file="$ROOT_DIR/.env.example"
+  local tmp_file="$env_file.tmp"
+
+  [[ -f "$example_file" ]] || return 1
+
+  if [[ ! -f "$env_file" ]]; then
+    cp "$example_file" "$env_file"
+    return 0
+  fi
+
+  cp "$env_file" "$env_file.bak"
+
+  awk '
+    function extract_key(line,    tmp, ep, kp) {
+      tmp = line
+      sub(/^[ \t]*/, "", tmp)
+      sub(/^export[ \t]+/, "", tmp)
+      ep = index(tmp, "=")
+      if (ep == 0) return ""
+      kp = substr(tmp, 1, ep - 1)
+      if (kp ~ /^[A-Za-z_][A-Za-z0-9_]*$/) return kp
+      return ""
+    }
+
+    NR == FNR {
+      key = extract_key($0)
+      if (key != "") existing[key] = 1
+      env_lines[++env_count] = $0
+      next
+    }
+
+    {
+      key = extract_key($0)
+      if (key != "") {
+        if (key in existing) {
+          last_anchor = key
+          has_gap = 0
+        } else {
+          n_missing++
+          insert_after[n_missing] = last_anchor
+          if (has_gap) {
+            insert_block[n_missing] = "\n" $0 "\n"
+          } else {
+            insert_block[n_missing] = $0 "\n"
+          }
+          has_gap = 0
+        }
+      } else {
+        has_gap = 1
+      }
+    }
+
+    END {
+      for (j = 1; j <= n_missing; j++) {
+        if (insert_after[j] == "") {
+          printf "%s", insert_block[j]
+        }
+      }
+      for (i = 1; i <= env_count; i++) {
+        print env_lines[i]
+        key = extract_key(env_lines[i])
+        if (key != "") {
+          for (j = 1; j <= n_missing; j++) {
+            if (insert_after[j] == key) {
+              printf "%s", insert_block[j]
+            }
+          }
+        }
+      }
+    }
+  ' "$env_file" "$example_file" > "$tmp_file"
+
+  mv "$tmp_file" "$env_file"
+}
+
 ensure_json_array_file() {
   local file="$1"
   local path="$ROOT_DIR/$file"
@@ -1845,6 +1951,7 @@ tui_menu_icon() {
     env)          printf "%s " "$ICO_ENV" ;;
     onion)        printf "%s " "$ICO_ONION" ;;
     import)       printf "%s " "$ICO_IMPORT" ;;
+    env_upgrade)  printf "%s " "$ICO_UPGRADE" ;;
     help)         printf "%s " "$ICO_HELP" ;;
     quit)         printf "%s " "$ICO_QUIT" ;;
     back)         printf "%s " "$ICO_BACK" ;;
@@ -1895,8 +2002,8 @@ tui_build_menu() {
       TUI_LEFT_TITLE="⚡ Haven Dashboard"
       MENU_TITLE="Haven"
       MENU_SUBTITLE="$docker_icon Docker: $docker_status │ Mode: $mode"
-      MENU_IDS=(start_plain start_tor stop restart json onion import help quit)
-      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" "JSON Editor" "Show Onion Host" "Set Import Flag" "Help" "Quit")
+      MENU_IDS=(start_plain start_tor stop restart json env_upgrade onion import help quit)
+      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" "JSON Editor" "Upgrade .env" "Show Onion Host" "Set Import Flag" "Help" "Quit")
       ;;
     logs)
       TUI_LEFT_TITLE="⚡ Haven ─ Logs"
@@ -2205,6 +2312,40 @@ $(cat "$onion_torrc")"
           local value=""
           value="$(read_env_var HAVEN_IMPORT_FLAG 2>/dev/null || true)"
           tui_message "Import Flag" "HAVEN_IMPORT_FLAG=$value"
+          ;;
+        env_upgrade)
+          if [[ ! -f "$ROOT_DIR/.env.example" ]]; then
+            tui_message "Upgrade .env" ".env.example not found."
+            return
+          fi
+          if [[ ! -f "$ROOT_DIR/.env" ]]; then
+            if tui_confirm "No .env found. Create from .env.example?" "y"; then
+              cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
+              tui_message "Upgrade .env" ".env created from .env.example.\n\nPlease edit your .env and then\nrestart services."
+            fi
+            return
+          fi
+          local upgrade_missing=""
+          upgrade_missing="$(list_missing_env_vars)"
+          local upgrade_count=0
+          if [[ -n "$upgrade_missing" ]]; then
+            upgrade_count="$(printf "%s\n" "$upgrade_missing" | wc -l)"
+            upgrade_count="${upgrade_count// /}"
+          fi
+          if [[ "$upgrade_count" -eq 0 ]]; then
+            tui_message "Upgrade .env" "No missing variables found.\nYour .env is up to date."
+            return
+          fi
+          local upgrade_preview=""
+          upgrade_preview="$(printf "%s\n" "$upgrade_missing" | head -n 10)"
+          if [[ "$upgrade_count" -gt 10 ]]; then
+            upgrade_preview="$upgrade_preview\n... and $((upgrade_count - 10)) more"
+          fi
+          tui_message "Missing Variables" "$upgrade_count variable(s) found:\n\n$upgrade_preview"
+          if tui_confirm "Add to .env?" "y"; then
+            upgrade_env_file
+            tui_message "Upgrade .env" "$upgrade_count variable(s) added.\n\nPlease review and edit your\n.env file, then restart\nservices."
+          fi
           ;;
         help)
           show_help_screen
@@ -2598,7 +2739,7 @@ parse_args() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      start|stop|restart|logs|status|tui|help|import|onion|json|env)
+      start|stop|restart|logs|status|tui|help|import|onion|json|env|env-upgrade)
         COMMAND="$1"
         shift
         ;;
@@ -2711,6 +2852,33 @@ main() {
       ;;
     env)
       menu_env_editor
+      ;;
+    env-upgrade)
+      if [[ ! -f "$ROOT_DIR/.env.example" ]]; then
+        die ".env.example not found."
+      fi
+      if [[ ! -f "$ROOT_DIR/.env" ]]; then
+        cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
+        success ".env created from .env.example."
+        info "Please edit your .env and then restart services."
+        exit 0
+      fi
+      local missing_vars=""
+      missing_vars="$(list_missing_env_vars)"
+      local missing_count=0
+      if [[ -n "$missing_vars" ]]; then
+        missing_count="$(printf "%s\n" "$missing_vars" | wc -l)"
+        missing_count="${missing_count// /}"
+      fi
+      if [[ "$missing_count" -eq 0 ]]; then
+        success "No missing variables. Your .env is up to date."
+        exit 0
+      fi
+      info "$missing_count new variable(s) found:"
+      printf "%s\n" "$missing_vars"
+      upgrade_env_file
+      success "$missing_count variable(s) added to .env."
+      info "Please review and edit your .env file, then restart services."
       ;;
     json)
       menu_json_editor

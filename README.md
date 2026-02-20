@@ -54,5 +54,6 @@ The TUI guides you through the remaining setup. If any files are still missing, 
 ./haven logs              # Stream logs
 ./haven onion             # Show Tor .onion address
 ./haven json              # Edit JSON lists in TUI
+./haven env-upgrade       # Add missing vars from .env.example
 ./haven help              # Full usage info
 ```
