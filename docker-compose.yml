@@ -19,7 +19,6 @@ services:
     stop_grace_period: 30s
     security_opt:
       - no-new-privileges:true
-    read_only: true
     tmpfs:
       - /tmp
       - /var/run
