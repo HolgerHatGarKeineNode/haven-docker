@@ -180,6 +180,16 @@ MENU_SUBTITLE=""
 TUI_DOCKER_OK=0
 TUI_LAST_DOCKER_CHECK=0
 TUI_LAST_LOG_RESTART=0
+TUI_NEED_MENU=1
+_TRUNC=""
+_ICON=""
+_CRUMB=""
+_KEY=""
+_SANITIZED=""
+_HLINE_LEFT=""
+_HLINE_RIGHT=""
+_HLINE_SEP=""
+_BORDER_V=""
 
 DOCKER_COMPOSE=()
 COMPOSE_FILE_PLAIN="$ROOT_DIR/docker-compose.yml"
@@ -296,6 +306,15 @@ tui_update_layout() {
   fi
 
   LOG_MAX_LINES=$RIGHT_CONTENT_HEIGHT
+
+  # Pre-compute horizontal line strings and border for frame drawing
+  printf -v _HLINE_LEFT '%*s' "$((LEFT_W - 1))" ''
+  _HLINE_LEFT="${_HLINE_LEFT// /$BOX_H}"
+  printf -v _HLINE_RIGHT '%*s' "$((TUI_COLS - LEFT_W - 2))" ''
+  _HLINE_RIGHT="${_HLINE_RIGHT// /$BOX_H}"
+  printf -v _HLINE_SEP '%*s' "$LEFT_CONTENT_W" ''
+  _HLINE_SEP="${_HLINE_SEP// /$BOX_H}"
+  printf -v _BORDER_V '%b%s%b' "$TUI_FG_SEPARATOR" "$BOX_V" "$CLR_RESET"
 }
 
 tui_init() {
@@ -321,38 +340,37 @@ tui_cleanup() {
 }
 
 tui_read_key() {
-  local key=""
-  if ! IFS= read -rsn1 -t 0.05 key; then
+  _KEY=""
+  if ! IFS= read -rsn1 -t 0.05 _KEY; then
     return 1
   fi
 
-  if [[ "$key" == $'\x03' ]]; then
-    printf "quit"
+  if [[ "$_KEY" == $'\x03' ]]; then
+    _KEY="quit"
     return 0
   fi
 
-  if [[ "$key" == $'\x1b' ]]; then
+  if [[ "$_KEY" == $'\x1b' ]]; then
     local seq=""
     IFS= read -rsn2 -t 0.01 seq || seq=""
     case "$seq" in
-      "[A") printf "up" ;;
-      "[B") printf "down" ;;
-      "[C") printf "right" ;;
-      "[D") printf "left" ;;
-      *) printf "esc" ;;
+      "[A") _KEY="up" ;;
+      "[B") _KEY="down" ;;
+      "[C") _KEY="right" ;;
+      "[D") _KEY="left" ;;
+      *) _KEY="esc" ;;
     esac
     return 0
   fi
 
-  if [[ -z "$key" ]]; then
-    printf "enter"
+  if [[ -z "$_KEY" ]]; then
+    _KEY="enter"
     return 0
   fi
 
-  case "$key" in
-    $'\n'|$'\r') printf "enter" ;;
-    q|Q) printf "quit" ;;
-    *) printf "%s" "$key" ;;
+  case "$_KEY" in
+    $'\n'|$'\r') _KEY="enter" ;;
+    q|Q) _KEY="quit" ;;
   esac
 }
 
@@ -369,63 +387,40 @@ tui_draw_frame() {
   fi
 
   # Row 0: top border ┌───┬───┐
-  tput cup 0 0
-  printf "%b" "$TUI_FG_SEPARATOR"
-  printf "%s" "$BOX_TL"
-  local i
-  for ((i=1; i<LEFT_W; i++)); do printf "%s" "$BOX_H"; done
-  printf "%s" "$BOX_TT"
-  for ((i=LEFT_W+1; i<TUI_COLS-1; i++)); do printf "%s" "$BOX_H"; done
-  printf "%s" "$BOX_TR"
-  printf "%b" "$CLR_RESET"
+  printf '\033[1;1H'
+  printf "%b%s%s%s%s%s%b" "$TUI_FG_SEPARATOR" \
+    "$BOX_TL" "$_HLINE_LEFT" "$BOX_TT" "$_HLINE_RIGHT" "$BOX_TR" "$CLR_RESET"
 
   # Row 1: colored title bar
-  tput cup 1 0
-  printf "%b" "$TUI_FG_SEPARATOR"
-  printf "%s" "$BOX_V"
-  printf "%b" "$CLR_RESET"
-  printf "%b" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}"
-  printf " %-*s" "$((LEFT_W - 1))" "$(tui_truncate "$TUI_LEFT_TITLE" $((LEFT_W - 2)))"
-  printf "%b" "$CLR_RESET"
-  printf "%b" "$TUI_FG_SEPARATOR"
-  printf "%s" "$BOX_V"
-  printf "%b" "$CLR_RESET"
-  printf "%b" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}"
-  printf " %-*s" "$((TUI_COLS - LEFT_W - 2))" "$(tui_truncate "$TUI_RIGHT_TITLE" $((TUI_COLS - LEFT_W - 3)))"
-  printf "%b" "$CLR_RESET"
-  printf "%b" "$TUI_FG_SEPARATOR"
-  printf "%s" "$BOX_V"
-  printf "%b" "$CLR_RESET"
+  printf '\033[2;1H'
+  tui_truncate "$TUI_LEFT_TITLE" $((LEFT_W - 2))
+  printf "%s%b %-*s%b%s%b" \
+    "$_BORDER_V" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
+    "$((LEFT_W - 1))" "$_TRUNC" "$CLR_RESET" \
+    "$_BORDER_V" "$CLR_RESET"
+  tui_truncate "$TUI_RIGHT_TITLE" $((TUI_COLS - LEFT_W - 3))
+  printf "%b %-*s%b%s" \
+    "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
+    "$((TUI_COLS - LEFT_W - 2))" "$_TRUNC" "$CLR_RESET" \
+    "$_BORDER_V"
 
   # Row 2: sub-separator ├───┼───┤
-  tput cup 2 0
-  printf "%b" "$TUI_FG_SEPARATOR"
-  printf "%s" "$BOX_LT"
-  for ((i=1; i<LEFT_W; i++)); do printf "%s" "$BOX_H"; done
-  printf "%s" "$BOX_CROSS"
-  for ((i=LEFT_W+1; i<TUI_COLS-1; i++)); do printf "%s" "$BOX_H"; done
-  printf "%s" "$BOX_RT"
-  printf "%b" "$CLR_RESET"
+  printf '\033[3;1H'
+  printf "%b%s%s%s%s%s%b" "$TUI_FG_SEPARATOR" \
+    "$BOX_LT" "$_HLINE_LEFT" "$BOX_CROSS" "$_HLINE_RIGHT" "$BOX_RT" "$CLR_RESET"
 
   # Content rows: left border, center divider, right border
   for ((row=3; row<bottom_row; row++)); do
-    tput cup "$row" 0
-    printf "%b%s%b" "$TUI_FG_SEPARATOR" "$BOX_V" "$CLR_RESET"
-    tput cup "$row" "$LEFT_W"
-    printf "%b%s%b" "$TUI_FG_SEPARATOR" "$BOX_V" "$CLR_RESET"
-    tput cup "$row" $((TUI_COLS - 1))
-    printf "%b%s%b" "$TUI_FG_SEPARATOR" "$BOX_V" "$CLR_RESET"
+    printf '\033[%d;1H%s\033[%d;%dH%s\033[%d;%dH%s' \
+      "$((row+1))" "$_BORDER_V" \
+      "$((row+1))" "$((LEFT_W+1))" "$_BORDER_V" \
+      "$((row+1))" "$TUI_COLS" "$_BORDER_V"
   done
 
   # Bottom border └───┴───┘
-  tput cup "$bottom_row" 0
-  printf "%b" "$TUI_FG_SEPARATOR"
-  printf "%s" "$BOX_BL"
-  for ((i=1; i<LEFT_W; i++)); do printf "%s" "$BOX_H"; done
-  printf "%s" "$BOX_BT"
-  for ((i=LEFT_W+1; i<TUI_COLS-1; i++)); do printf "%s" "$BOX_H"; done
-  printf "%s" "$BOX_BR"
-  printf "%b" "$CLR_RESET"
+  printf '\033[%d;1H' "$((bottom_row+1))"
+  printf "%b%s%s%s%s%s%b" "$TUI_FG_SEPARATOR" \
+    "$BOX_BL" "$_HLINE_LEFT" "$BOX_BT" "$_HLINE_RIGHT" "$BOX_BR" "$CLR_RESET"
 
   # Status bar
   tui_draw_status_bar
@@ -452,16 +447,12 @@ tui_draw_status_bar() {
 }
 
 tui_truncate() {
-  local text="$1"
-  local width="$2"
-  if [[ ${#text} -le "$width" ]]; then
-    printf "%s" "$text"
+  if (( ${#1} <= $2 )); then
+    _TRUNC="$1"
   else
-    local cutoff=$((width - 3))
-    if [[ "$cutoff" -lt 0 ]]; then
-      cutoff=0
-    fi
-    printf "%s..." "${text:0:$cutoff}"
+    local cutoff=$(($2 - 3))
+    (( cutoff < 0 )) && cutoff=0
+    _TRUNC="${1:0:$cutoff}..."
   fi
 }
 
@@ -491,7 +482,7 @@ tui_print_right() {
 
 tui_wait_key() {
   local _=""
-  while ! IFS= read -rsn1 _; do :; done
+  while ! IFS= read -rsn1 -t 0.1 _; do :; done
 }
 
 tui_prompt() {
@@ -555,9 +546,8 @@ tui_confirm() {
         "${TUI_BOLD}${TUI_FG_SELECTED}${TUI_BG_CONFIRM_NO}" "$no_label" "$CLR_RESET"
     fi
 
-    local key=""
-    key="$(tui_read_key)" || continue
-    case "$key" in
+    tui_read_key || continue
+    case "$_KEY" in
       left|up) selection=0 ;;
       right|down) selection=1 ;;
       enter)
@@ -583,10 +573,7 @@ tui_message() {
   row=$((row + 1))
 
   # Thin separator
-  local sep_line=""
-  local si
-  for ((si=0; si<LEFT_CONTENT_W; si++)); do sep_line+="$BOX_H"; done
-  tui_print_left_styled "$row" "$TUI_FG_SEPARATOR" "$sep_line"
+  tui_print_left_styled "$row" "$TUI_FG_SEPARATOR" "$_HLINE_SEP"
   row=$((row + 1))
 
   # Body text
@@ -1647,11 +1634,19 @@ stream_logs() {
 }
 
 log_sanitize_line() {
-  local line="$1"
-  line="${line//$'\r'/}"
-  line="${line//$'\t'/  }"
-  line="$(printf "%s" "$line" | sed -E 's/\x1B\\[[0-9;]*[[:alpha:]]//g')"
-  printf "%s" "$line"
+  _SANITIZED="$1"
+  _SANITIZED="${_SANITIZED//$'\r'/}"
+  _SANITIZED="${_SANITIZED//$'\t'/  }"
+  # Strip ANSI escape sequences using pure bash
+  while [[ "$_SANITIZED" == *$'\x1b\x5b'* ]]; do
+    local _before="${_SANITIZED%%$'\x1b\x5b'*}"
+    local _after="${_SANITIZED#*$'\x1b\x5b'}"
+    while [[ "${_after:0:1}" == [0-9\;] ]]; do
+      _after="${_after:1}"
+    done
+    [[ "${_after:0:1}" == [a-zA-Z] ]] && _after="${_after:1}"
+    _SANITIZED="${_before}${_after}"
+  done
 }
 
 log_append() {
@@ -1739,7 +1734,8 @@ refresh_log_snapshot() {
 
   local line
   while IFS= read -r line; do
-    log_append "$(log_sanitize_line "$line")"
+    log_sanitize_line "$line"
+    log_append "$_SANITIZED"
   done <<<"$RUN_OUTPUT"
 }
 
@@ -1750,7 +1746,8 @@ drain_log_stream() {
   local updated=0
   local line
   while IFS= read -r -t 0.01 line <&$LOG_FD; do
-    log_append "$(log_sanitize_line "$line")"
+    log_sanitize_line "$line"
+    log_append "$_SANITIZED"
     updated=1
   done
   if [[ "$updated" -eq 1 ]]; then
@@ -1781,7 +1778,7 @@ tui_ensure_log_stream() {
 
   if [[ -z "$LOG_PID" ]]; then
     local now
-    now="$(date +%s)"
+    printf -v now '%(%s)T' -1
     if [[ -z "$TUI_LAST_LOG_RESTART" || $((now - TUI_LAST_LOG_RESTART)) -ge 1 ]]; then
       start_log_stream
       TUI_LAST_LOG_RESTART="$now"
@@ -1792,7 +1789,7 @@ tui_ensure_log_stream() {
 
   if ! kill -0 "$LOG_PID" >/dev/null 2>&1; then
     local now
-    now="$(date +%s)"
+    printf -v now '%(%s)T' -1
     if [[ -z "$TUI_LAST_LOG_RESTART" || $((now - TUI_LAST_LOG_RESTART)) -ge 1 ]]; then
       stop_log_stream
       start_log_stream
@@ -1812,25 +1809,22 @@ tui_render_right_logs() {
   TUI_RIGHT_TITLE="☰ Logs: ${LOG_SERVICE:-all}${spinner} │ Tail: ${TAIL_COUNT}"
 
   # Redraw title bar row with updated right title
-  tput cup 1 $((LEFT_W + 1))
-  printf "%b" "${TUI_FG_SEPARATOR}${BOX_V}${CLR_RESET}"
-  printf "%b" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}"
-  printf " %-*s" "$((TUI_COLS - LEFT_W - 2))" "$(tui_truncate "$TUI_RIGHT_TITLE" $((TUI_COLS - LEFT_W - 3)))"
-  printf "%b" "$CLR_RESET"
-  tput cup 1 $((TUI_COLS - 1))
-  printf "%b%s%b" "$TUI_FG_SEPARATOR" "$BOX_V" "$CLR_RESET"
+  printf '\033[2;%dH' "$((LEFT_W + 2))"
+  tui_truncate "$TUI_RIGHT_TITLE" $((TUI_COLS - LEFT_W - 3))
+  printf "%s%b %-*s%b%s" \
+    "$_BORDER_V" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
+    "$((TUI_COLS - LEFT_W - 2))" "$_TRUNC" "$CLR_RESET" "$_BORDER_V"
 
   local count=${#LOG_LINES[@]}
   local start=$((count - RIGHT_CONTENT_HEIGHT))
   if [[ "$start" -lt 0 ]]; then
     start=0
   fi
-  local row
-  local idx
+  local row idx line line_color
   for ((row=0; row<RIGHT_CONTENT_HEIGHT; row++)); do
     idx=$((start + row))
-    local line=""
-    local line_color=""
+    line=""
+    line_color=""
     if [[ "$idx" -lt "$count" ]]; then
       line="${LOG_LINES[$idx]}"
       # Colorize based on content
@@ -1845,12 +1839,12 @@ tui_render_right_logs() {
       line="Waiting for logs..."
       line_color="${TUI_DIM}${TUI_ITALIC}"
     fi
-    line="$(tui_truncate "$line" "$RIGHT_CONTENT_W")"
-    tput cup $((RIGHT_CONTENT_ROW + row)) "$RIGHT_X"
+    tui_truncate "$line" "$RIGHT_CONTENT_W"
+    printf '\033[%d;%dH' "$((RIGHT_CONTENT_ROW + row + 1))" "$((RIGHT_X + 1))"
     if [[ -n "$line_color" ]]; then
-      printf "%b%-*s%b" "$line_color" "$RIGHT_CONTENT_W" "$line" "$CLR_RESET"
+      printf "%b%-*s%b" "$line_color" "$RIGHT_CONTENT_W" "$_TRUNC" "$CLR_RESET"
     else
-      printf "%-*s" "$RIGHT_CONTENT_W" "$line"
+      printf "%-*s" "$RIGHT_CONTENT_W" "$_TRUNC"
     fi
   done
 }
@@ -1913,8 +1907,8 @@ HELP
 
 tui_update_docker_status() {
   local now
-  now="$(date +%s)"
-  if [[ -z "$TUI_LAST_DOCKER_CHECK" || $((now - TUI_LAST_DOCKER_CHECK)) -ge 2 ]]; then
+  printf -v now '%(%s)T' -1
+  if [[ -z "$TUI_LAST_DOCKER_CHECK" || $((now - TUI_LAST_DOCKER_CHECK)) -ge 5 ]]; then
     local prev="$TUI_DOCKER_OK"
     local next=0
     if docker info >/dev/null 2>&1; then
@@ -1924,6 +1918,7 @@ tui_update_docker_status() {
     fi
     if [[ "$next" -ne "$prev" ]]; then
       TUI_NEED_LEFT=1
+      TUI_NEED_MENU=1
     fi
     TUI_DOCKER_OK="$next"
     TUI_LAST_DOCKER_CHECK="$now"
@@ -1934,53 +1929,52 @@ tui_set_view() {
   TUI_VIEW="$1"
   TUI_SEL=0
   TUI_OFFSET=0
+  TUI_NEED_MENU=1
   TUI_NEED_LEFT=1
   TUI_NEED_RIGHT=1
 }
 
 tui_menu_icon() {
-  local id="$1"
-  case "$id" in
-    start_plain)  printf "%s " "$ICO_DOCKER" ;;
-    start_tor)    printf "%s " "$ICO_TOR" ;;
-    stop)         printf "%s " "$ICO_STOP" ;;
-    restart)      printf "%s " "$ICO_RESTART" ;;
-    logs)         printf "%s " "$ICO_LOGS" ;;
-    status)       printf "%s " "$ICO_STATUS" ;;
-    json)         printf "%s " "$ICO_JSON" ;;
-    env)          printf "%s " "$ICO_ENV" ;;
-    onion)        printf "%s " "$ICO_ONION" ;;
-    import)       printf "%s " "$ICO_IMPORT" ;;
-    env_upgrade)  printf "%s " "$ICO_UPGRADE" ;;
-    help)         printf "%s " "$ICO_HELP" ;;
-    quit)         printf "%s " "$ICO_QUIT" ;;
-    back)         printf "%s " "$ICO_BACK" ;;
-    add)          printf "%s " "$ICO_ADD" ;;
-    clear)        printf "%s " "$ICO_CLEAR" ;;
-    edit)         printf "%s " "$ICO_EDIT" ;;
-    remove)       printf "%s " "$ICO_REMOVE" ;;
-    service)      printf "%s " "$ICO_LOGS" ;;
-    tail)         printf "# " ;;
-    follow)       printf "%s " "$ICO_RESTART" ;;
-    all)          printf "%s " "$ICO_LOGS" ;;
-    key:*)        printf "%s " "$ICO_ENV" ;;
-    item:*)       printf "  " ;;
-    *)            printf "  " ;;
+  case "$1" in
+    start_plain)  _ICON="$ICO_DOCKER " ;;
+    start_tor)    _ICON="$ICO_TOR " ;;
+    stop)         _ICON="$ICO_STOP " ;;
+    restart)      _ICON="$ICO_RESTART " ;;
+    logs)         _ICON="$ICO_LOGS " ;;
+    status)       _ICON="$ICO_STATUS " ;;
+    json)         _ICON="$ICO_JSON " ;;
+    env)          _ICON="$ICO_ENV " ;;
+    onion)        _ICON="$ICO_ONION " ;;
+    import)       _ICON="$ICO_IMPORT " ;;
+    env_upgrade)  _ICON="$ICO_UPGRADE " ;;
+    help)         _ICON="$ICO_HELP " ;;
+    quit)         _ICON="$ICO_QUIT " ;;
+    back)         _ICON="$ICO_BACK " ;;
+    add)          _ICON="$ICO_ADD " ;;
+    clear)        _ICON="$ICO_CLEAR " ;;
+    edit)         _ICON="$ICO_EDIT " ;;
+    remove)       _ICON="$ICO_REMOVE " ;;
+    service)      _ICON="$ICO_LOGS " ;;
+    tail)         _ICON="# " ;;
+    follow)       _ICON="$ICO_RESTART " ;;
+    all)          _ICON="$ICO_LOGS " ;;
+    key:*)        _ICON="$ICO_ENV " ;;
+    item:*)       _ICON="  " ;;
+    *)            _ICON="  " ;;
   esac
 }
 
 tui_breadcrumb() {
-  local crumb="Haven"
   case "$TUI_VIEW" in
-    main)          crumb="Haven" ;;
-    logs)          crumb="Haven / Logs" ;;
-    logs_service)  crumb="Haven / Logs / Service" ;;
-    env_list)      crumb="Haven / .env" ;;
-    env_item)      crumb="Haven / .env / $CURRENT_ENV_KEY" ;;
-    json_files)    crumb="Haven / JSON" ;;
-    json_items)    crumb="Haven / JSON / $(json_label_for "$CURRENT_JSON_FILE")" ;;
+    main)          _CRUMB="Haven" ;;
+    logs)          _CRUMB="Haven / Logs" ;;
+    logs_service)  _CRUMB="Haven / Logs / Service" ;;
+    env_list)      _CRUMB="Haven / .env" ;;
+    env_item)      _CRUMB="Haven / .env / $CURRENT_ENV_KEY" ;;
+    json_files)    _CRUMB="Haven / JSON" ;;
+    json_items)    _CRUMB="Haven / JSON / $(json_label_for "$CURRENT_JSON_FILE")" ;;
+    *)             _CRUMB="Haven" ;;
   esac
-  printf "%s" "$crumb"
 }
 
 tui_build_menu() {
@@ -2104,34 +2098,37 @@ tui_render_left_menu() {
   local row="$LEFT_CONTENT_ROW"
   local visible_rows="$LEFT_CONTENT_HEIGHT"
 
-  tui_build_menu
+  # Only rebuild menu data when needed (not on simple navigation)
+  if [[ "$TUI_NEED_MENU" -eq 1 ]]; then
+    tui_build_menu
+    TUI_NEED_MENU=0
+  fi
 
   # Breadcrumb row (dim)
-  local crumb
-  crumb="$(tui_breadcrumb)"
-  tui_print_left_styled "$row" "$TUI_DIM" "$(tui_truncate "$crumb" "$LEFT_CONTENT_W")"
+  tui_breadcrumb
+  tui_truncate "$_CRUMB" "$LEFT_CONTENT_W"
+  tui_print_left_styled "$row" "$TUI_DIM" "$_TRUNC"
   row=$((row + 1))
   visible_rows=$((visible_rows - 1))
 
   # Bold accent title
   if [[ -n "$MENU_TITLE" ]]; then
-    tui_print_left_styled "$row" "${TUI_BOLD}${TUI_FG_ACCENT}" "$(tui_truncate "$MENU_TITLE" "$LEFT_CONTENT_W")"
+    tui_truncate "$MENU_TITLE" "$LEFT_CONTENT_W"
+    tui_print_left_styled "$row" "${TUI_BOLD}${TUI_FG_ACCENT}" "$_TRUNC"
     row=$((row + 1))
     visible_rows=$((visible_rows - 1))
   fi
 
   # Dim subtitle
   if [[ -n "$MENU_SUBTITLE" ]]; then
-    tui_print_left_styled "$row" "${TUI_DIM}${TUI_FG_SUBTITLE}" "$(tui_truncate "$MENU_SUBTITLE" "$LEFT_CONTENT_W")"
+    tui_truncate "$MENU_SUBTITLE" "$LEFT_CONTENT_W"
+    tui_print_left_styled "$row" "${TUI_DIM}${TUI_FG_SUBTITLE}" "$_TRUNC"
     row=$((row + 1))
     visible_rows=$((visible_rows - 1))
   fi
 
   # Thin separator
-  local sep_line=""
-  local si
-  for ((si=0; si<LEFT_CONTENT_W; si++)); do sep_line+="$BOX_H"; done
-  tui_print_left_styled "$row" "$TUI_FG_SEPARATOR" "$sep_line"
+  tui_print_left_styled "$row" "$TUI_FG_SEPARATOR" "$_HLINE_SEP"
   row=$((row + 1))
   visible_rows=$((visible_rows - 1))
 
@@ -2155,41 +2152,35 @@ tui_render_left_menu() {
     TUI_OFFSET=$((TUI_SEL - visible_rows + 1))
   fi
 
-  local i
+  local i idx label menu_id icon_len max_label_w
   for ((i=0; i<visible_rows; i++)); do
-    local idx=$((TUI_OFFSET + i))
-    local label=""
-    local menu_id=""
+    idx=$((TUI_OFFSET + i))
+    label=""
+    menu_id=""
     if [[ "$idx" -lt "$count" ]]; then
       label="${MENU_LABELS[$idx]}"
       menu_id="${MENU_IDS[$idx]}"
     fi
 
-    local icon=""
-    icon="$(tui_menu_icon "$menu_id")"
-    local icon_len=${#icon}
-    local max_label_w=$((LEFT_CONTENT_W - icon_len))
-    local display
-    display="$(tui_truncate "$label" "$max_label_w")"
+    tui_menu_icon "$menu_id"
+    icon_len=${#_ICON}
+    max_label_w=$((LEFT_CONTENT_W - icon_len))
+    tui_truncate "$label" "$max_label_w"
 
-    tput cup $((row + i)) "$LEFT_X"
+    printf '\033[%d;%dH' "$((row + i + 1))" "$((LEFT_X + 1))"
     if [[ -z "$label" ]]; then
       printf "%-*s" "$LEFT_CONTENT_W" ""
     elif [[ "$idx" -eq "$TUI_SEL" ]]; then
-      # Selected: deep blue bg, bright white, bold, arrow prefix
-      local sel_text="${ICO_SELECTED}${display}"
       printf "%b%-*s%b" \
         "${TUI_BOLD}${TUI_FG_SELECTED}${TUI_BG_SELECTED}" \
-        "$LEFT_CONTENT_W" "$sel_text" "$CLR_RESET"
+        "$LEFT_CONTENT_W" "${ICO_SELECTED}${_TRUNC}" "$CLR_RESET"
     elif [[ "$menu_id" == "back" || "$menu_id" == "quit" ]]; then
-      # Dim for back/quit
       printf "%b%-*s%b" \
-        "${TUI_FG_MENU_DIM}" "$LEFT_CONTENT_W" "${icon}${display}" "$CLR_RESET"
+        "${TUI_FG_MENU_DIM}" "$LEFT_CONTENT_W" "${_ICON}${_TRUNC}" "$CLR_RESET"
     else
-      # Normal: icon in accent, label in menu color
       printf "%b%s%b%-*s%b" \
-        "${TUI_FG_ACCENT}" "$icon" \
-        "${TUI_FG_MENU}" "$((LEFT_CONTENT_W - icon_len))" "$display" "$CLR_RESET"
+        "${TUI_FG_ACCENT}" "$_ICON" \
+        "${TUI_FG_MENU}" "$((LEFT_CONTENT_W - icon_len))" "$_TRUNC" "$CLR_RESET"
     fi
   done
 }
@@ -2224,6 +2215,7 @@ tui_run_action() {
   fi
   if [[ "$TUI_ACTIVE" == "1" ]]; then
     TUI_NEED_FRAME=1
+    TUI_NEED_MENU=1
     TUI_NEED_LEFT=1
     TUI_NEED_RIGHT=1
     tui_refresh_logs_view
@@ -2532,6 +2524,7 @@ $(cat "$onion_torrc")"
       esac
       ;;
   esac
+  TUI_NEED_MENU=1
   TUI_NEED_LEFT=1
   TUI_NEED_RIGHT=1
   return 0
@@ -2606,6 +2599,7 @@ tui_loop() {
       TUI_NEED_RESIZE=0
       tui_update_layout
       TUI_NEED_FRAME=1
+      TUI_NEED_MENU=1
       TUI_NEED_LEFT=1
       TUI_NEED_RIGHT=1
     fi
@@ -2636,9 +2630,8 @@ tui_loop() {
       TUI_NEED_LEFT=0
     fi
 
-    local key=""
-    key="$(tui_read_key)" || continue
-    if ! tui_handle_key "$key"; then
+    tui_read_key || continue
+    if ! tui_handle_key "$_KEY"; then
       running=0
     fi
   done
