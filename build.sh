@@ -70,8 +70,7 @@ die() {
 
 # ── Usage ─────────────────────────────────────────────────────────────
 usage() {
-    cat <<EOF
-${BOLD}Haven Docker Build Script${NC}
+    printf '%b\n' "${BOLD}Haven Docker Build Script${NC}
 
 ${BOLD}Usage:${NC}
   ./build.sh <command> [flags]
@@ -97,8 +96,7 @@ ${BOLD}Examples:${NC}
   ./build.sh build -v v1.2.0 -p linux/arm64 --latest
   ./build.sh push  --user holgerhatgarkeinenode --image haven-docker --tag v1.2.0 --yes
   ./build.sh buildx -v v1.2.0 -p linux/amd64,linux/arm64 --latest
-  ./build.sh build   ${CYAN}# interactive mode${NC}
-EOF
+  ./build.sh build   ${CYAN}# interactive mode${NC}"
 }
 
 # ── Parse Args ────────────────────────────────────────────────────────
