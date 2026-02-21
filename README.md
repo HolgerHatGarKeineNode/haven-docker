@@ -46,7 +46,7 @@ All relay names, descriptions, icons, rate limiters, WOT, backup, and import set
 ./haven
 ```
 
-The TUI guides you through the remaining setup. If any files are still missing, the start flow will suggest copying them from the examples.
+The TUI guides you through the remaining setup.
 
 ## CLI
 
