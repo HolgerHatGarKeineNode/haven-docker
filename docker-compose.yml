@@ -16,3 +16,18 @@ services:
       - "3355:${RELAY_PORT:-3355}"
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/run
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
