@@ -12,7 +12,7 @@ RUN go env -w GOCACHE=/go-cache
 RUN go env -w GOMODCACHE=/gomod-cache
 
 # Clone the repository and build app
-ARG REPO_URL=https://github.com/bitvora/haven.git
+ARG REPO_URL=https://github.com/barrydeen/haven.git
 ARG VERSION
 RUN if [ -z "$VERSION" ]; then \
       echo "ERROR: VERSION is required (tag or commit SHA)." && exit 1; \

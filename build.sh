@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────
-DEFAULT_REPO_URL="https://github.com/bitvora/haven.git"
+DEFAULT_REPO_URL="https://github.com/barrydeen/haven.git"
 DEFAULT_DOCKER_USER="holgerhatgarkeinenode"
 DEFAULT_IMAGE_NAME="haven-docker"
 DEFAULT_PLATFORM="linux/amd64"
