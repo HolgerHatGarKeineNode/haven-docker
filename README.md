@@ -1,6 +1,6 @@
 # Haven Docker
 
-Dockerized wrapper for [Haven](https://github.com/bitvora/haven) — a **High Availability Vault for Events on Nostr**. Haven is a sovereign personal relay that bundles four specialized relays (Private, Chat, Inbox, Outbox) plus a Blossom media server into one self-hosted package, with web-of-trust filtering, note importing, cloud backups, and blastr broadcasting built in.
+Dockerized wrapper for [Haven](https://github.com/barrydeen/haven) — a **High Availability Vault for Events on Nostr**. Haven is a sovereign personal relay that bundles four specialized relays (Private, Chat, Inbox, Outbox) plus a Blossom media server into one self-hosted package, with web-of-trust filtering, note importing, cloud backups, and blastr broadcasting built in.
 
 This repository packages Haven as a Docker Compose setup with a TUI for configuration and management.
 
@@ -64,4 +64,4 @@ The TUI guides you through the remaining setup.
 
 ## Acknowledgements
 
-Haven is built and maintained by [bitvora](https://github.com/bitvora) and its [contributors](https://github.com/bitvora/haven/graphs/contributors). Thanks to everyone who makes this project possible.
+Haven is built and maintained by [barrydeen](https://github.com/barrydeen) and its [contributors](https://github.com/barrydeen/haven/graphs/contributors). Thanks to everyone who makes this project possible.
