@@ -7,6 +7,12 @@ DEFAULT_DOCKER_USER="holgerhatgarkeinenode"
 DEFAULT_IMAGE_NAME="haven-docker"
 DEFAULT_PLATFORM="linux/amd64"
 
+# Name of the dedicated buildx builder
+BUILDER_NAME="haven-builder"
+# Retry transient build failures (e.g. flaky DNS over Starlink)
+BUILD_RETRIES=3
+RETRY_DELAY=5
+
 NONINTERACTIVE=false
 
 # ── Colors ────────────────────────────────────────────────────────────
@@ -88,14 +94,14 @@ ${BOLD}Flags (optional – without flags you will be prompted interactively):${N
   --image, -i     Image name                            ${YELLOW}[${DEFAULT_IMAGE_NAME}]${NC}
   --tag, -t       Image tag                             ${YELLOW}[= VERSION]${NC}
   --platform, -p  Platform (linux/amd64, linux/arm64)   ${YELLOW}[${DEFAULT_PLATFORM}]${NC}
-  --latest        Also tag as 'latest'
+  --no-latest     Do NOT also tag as 'latest'                       ${YELLOW}[latest is tagged by default]${NC}
   --yes, -y       Skip confirmation prompts
 
 ${BOLD}Examples:${NC}
   ./build.sh build -v v1.2.0
-  ./build.sh build -v v1.2.0 -p linux/arm64 --latest
+  ./build.sh build -v v1.2.0 -p linux/arm64 --no-latest
   ./build.sh push  --user holgerhatgarkeinenode --image haven-docker --tag v1.2.0 --yes
-  ./build.sh buildx -v v1.2.0 -p linux/amd64,linux/arm64 --latest
+  ./build.sh buildx -v v1.2.0 -p linux/amd64,linux/arm64
   ./build.sh build   ${CYAN}# interactive mode${NC}"
 }
 
@@ -107,7 +113,7 @@ DOCKER_USER=""
 IMAGE_NAME=""
 IMAGE_TAG=""
 PLATFORM=""
-TAG_LATEST=false
+TAG_LATEST=true
 
 parse_args() {
     if [[ $# -eq 0 ]]; then
@@ -127,6 +133,7 @@ parse_args() {
             --tag|-t)      IMAGE_TAG="$2";   shift 2 ;;
             --platform|-p) PLATFORM="$2";    shift 2 ;;
             --latest)      TAG_LATEST=true;  shift ;;
+            --no-latest)   TAG_LATEST=false; shift ;;
             --yes|-y)      NONINTERACTIVE=true;  shift ;;
             --help|-h)     usage; exit 0 ;;
             *) die "Unknown parameter: $1" ;;
@@ -179,6 +186,27 @@ collect_platform() {
         3) [[ "$COMMAND" == "buildx" ]] && PLATFORM="linux/amd64,linux/arm64" || die "Multi-arch only available with 'buildx'" ;;
         *) die "Invalid selection." ;;
     esac
+}
+
+# ── Ensure buildx builder ─────────────────────────────────────────────
+# Create (or recreate) the buildx builder with host networking so buildkit
+# resolves DNS via the host resolver (systemd-resolved) instead of querying
+# the upstream nameserver directly. This avoids UDP DNS timeouts on
+# high-latency links such as Starlink.
+ensure_builder() {
+    if docker buildx inspect "$BUILDER_NAME" &>/dev/null; then
+        # Recreate only if the existing builder lacks host networking
+        if ! docker buildx inspect "$BUILDER_NAME" 2>/dev/null | grep -q "network=host"; then
+            printf "${YELLOW}Recreating builder '%s' with host networking...${NC}\n" "$BUILDER_NAME"
+            docker buildx rm "$BUILDER_NAME" &>/dev/null || true
+            docker buildx create --name "$BUILDER_NAME" --use --driver-opt network=host >/dev/null
+        else
+            docker buildx use "$BUILDER_NAME"
+        fi
+    else
+        docker buildx create --name "$BUILDER_NAME" --use --driver-opt network=host >/dev/null
+    fi
+    docker buildx inspect --bootstrap "$BUILDER_NAME" >/dev/null
 }
 
 # ── Derive image names ────────────────────────────────────────────────
@@ -268,7 +296,7 @@ cmd_buildx() {
 
     docker login
 
-    docker buildx create --name haven-builder --use 2>/dev/null || docker buildx use haven-builder
+    ensure_builder
 
     local tag_args="-t ${FULL_IMAGE}"
     if $TAG_LATEST; then
@@ -277,13 +305,23 @@ cmd_buildx() {
 
     printf "${GREEN}Starting Buildx build + push for ${PLATFORM}...${NC}\n\n"
 
-    docker buildx build \
-        --platform "$PLATFORM" \
-        --build-arg VERSION="$VERSION" \
-        --build-arg REPO_URL="$REPO_URL" \
-        $tag_args \
-        --push \
-        .
+    local attempt=1
+    until docker buildx build \
+            --platform "$PLATFORM" \
+            --build-arg VERSION="$VERSION" \
+            --build-arg REPO_URL="$REPO_URL" \
+            $tag_args \
+            --push \
+            .
+    do
+        if (( attempt >= BUILD_RETRIES )); then
+            die "Buildx build failed after ${BUILD_RETRIES} attempts."
+        fi
+        printf "${YELLOW}Attempt %d/%d failed (often transient DNS/network on Starlink). Retrying in %ds...${NC}\n" \
+            "$attempt" "$BUILD_RETRIES" "$RETRY_DELAY" >&2
+        attempt=$((attempt + 1))
+        sleep "$RETRY_DELAY"
+    done
 
     printf "\n${GREEN}Buildx build + push successful!${NC}\n"
     printf "  ${FULL_IMAGE}\n"
