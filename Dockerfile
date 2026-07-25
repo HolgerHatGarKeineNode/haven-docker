@@ -34,6 +34,12 @@ WORKDIR /app
 # Copy Go application
 COPY --from=builder /app/haven .
 
+# Copy the web dashboard templates + static assets. HAVEN serves its landing
+# page from ./templates/index.html and ./templates/static at runtime
+# (http.Dir("templates/static")), so without these the web UI 404s. Baking them
+# in makes the image self-contained; a host bind-mount can still override them.
+COPY --from=builder /app/templates ./templates
+
 # Ensure the main executable has the correct permissions
 RUN chmod +x /app/haven
 
