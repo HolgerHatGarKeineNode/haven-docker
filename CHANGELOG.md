@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.2.2-1
+
+Hotfix packaging of upstream Haven `v1.2.2` (image tag only; binary unchanged).
+
+### Fixed
+
+- Bake HAVEN web dashboard templates into the image so the UI works without a host bind-mount (e.g. Kubernetes, bare `docker run`)
+
+### Changed
+
+- `docker-compose.yml` / `docker-compose.tor.yml`: templates volume is optional (commented out); image defaults win
+- Bumped Docker image tag to `v1.2.2-1`
+- README: templates copy is no longer required for quick start; documented optional customization
+- `./haven` no longer prompts to copy templates on start
+
 ## v1.2.2
 
 ### Changed

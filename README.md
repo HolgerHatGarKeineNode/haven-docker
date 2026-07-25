@@ -12,12 +12,13 @@ This repository packages Haven as a Docker Compose setup with a TUI for configur
 
 ```bash
 cp .env.example .env
-cp -r templates-example/* templates/
 cp relays_import.example.json relays_import.json
 cp relays_blastr.example.json relays_blastr.json
 cp blacklisted_npubs.example.json blacklisted_npubs.json
 cp whitelisted_npubs.example.json whitelisted_npubs.json
 ```
+
+The web dashboard templates are **baked into the image** — no host `templates/` copy is required for a default install.
 
 3. Edit `.env` — at minimum set these to your own values:
 
@@ -47,6 +48,21 @@ All relay names, descriptions, icons, rate limiters, WOT, backup, and import set
 ```
 
 The TUI guides you through the remaining setup.
+
+### Optional: customize the web dashboard
+
+To override the baked-in templates, copy the examples and re-enable the volume in `docker-compose.yml` (and `docker-compose.tor.yml` if you use Tor):
+
+```bash
+cp -r templates-example/* templates/
+```
+
+```yaml
+volumes:
+  - "./templates:/app/templates"   # uncomment this line
+```
+
+A host bind-mount **replaces** the image copy entirely — an empty `./templates` directory will break the UI.
 
 ## CLI
 

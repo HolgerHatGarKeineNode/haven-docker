@@ -1203,36 +1203,6 @@ ensure_example_jsons() {
   done
 }
 
-ensure_templates_dir() {
-  local src="$ROOT_DIR/templates-example"
-  local dst="$ROOT_DIR/templates"
-  local needs_copy=0
-
-  [[ -d "$src" ]] || return 0
-
-  if [[ ! -d "$dst" ]]; then
-    needs_copy=1
-  else
-    if [[ -z "$(find "$dst" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-      needs_copy=1
-    fi
-  fi
-
-  if [[ "$needs_copy" == "1" ]]; then
-    if [[ -t 0 && -t 1 ]]; then
-      if ask_yes_no "Templates missing. Copy templates-example -> templates now? [Y/n] " "y"; then
-        mkdir -p "$dst"
-        cp -R "$src"/. "$dst"/
-        success "Templates copied."
-      else
-        warn "Templates not copied. Start may fail."
-      fi
-    else
-      warn "Templates missing. Run: cp -R templates-example/. templates/"
-    fi
-  fi
-}
-
 detect_json_tool() {
   if command -v jq >/dev/null 2>&1; then
     JSON_TOOL="jq"
@@ -1598,7 +1568,6 @@ show_onion_host() {
 }
 
 prepare_start() {
-  ensure_templates_dir
   ensure_example_jsons
   apply_import_flag
 }

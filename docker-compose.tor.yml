@@ -1,12 +1,13 @@
 services:
   relay:
     container_name: haven-relay
-    image: holgerhatgarkeinenode/haven-docker:v1.2.2
+    image: holgerhatgarkeinenode/haven-docker:v1.2.2-1
     env_file:
       - .env
     volumes:
       - "./db:/app/db"
-      - "./templates:/app/templates"
+      # Optional: override baked-in dashboard templates (uncomment to customize)
+      # - "./templates:/app/templates"
       - "./blossom:/app/blossom"
       - "./relays_import.json:/app/relays_import.json"
       - "./relays_blastr.json:/app/relays_blastr.json"
