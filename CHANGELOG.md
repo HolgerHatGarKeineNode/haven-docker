@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+Tooling and docs only; the image is unchanged.
+
+### Fixed
+
+- Relay failed to start on hosts where the login user is not uid 1000: both compose files run the container as `${DOCKER_UID:-1000}:${DOCKER_GID:-1000}`, but neither variable was defined or documented anywhere, so the container could not write to the bind-mounted `./db` ([#9](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/9))
+- `./haven start` no longer copies an example JSON into a same-named directory that a bare `docker compose up` left behind as root
+
+### Added
+
+- `./haven start` writes the host user's `id -u` / `id -g` into `.env` as `DOCKER_UID` / `DOCKER_GID`, leaving operator-set values alone
+- `./haven start` creates `db/` and `blossom/` before Compose can create them as root, and aborts with the exact `chown` command when the container user could not write to them
+- `.env.example`: documented `DOCKER_UID` / `DOCKER_GID` (commented out so the TUI can fill them in)
+- README: file-ownership section covering the direct `docker compose up` path, recommending `chown` over `chmod -R 777`
+
 ## v1.2.2-1
 
 Hotfix packaging of upstream Haven `v1.2.2` (image tag only; binary unchanged).

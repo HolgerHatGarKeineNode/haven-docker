@@ -1189,6 +1189,11 @@ ensure_example_jsons() {
       local target_name
       example_name="$(basename "$example")"
       target_name="$(basename "$target")"
+      # A previous bare `docker compose up` creates missing bind-mount sources as
+      # root-owned directories. Copying into one would silently nest the example.
+      if [[ -d "$target" ]]; then
+        die "$target_name is a directory (created by Docker because the file was missing). Remove it and start again: sudo rm -rf $target"
+      fi
       if [[ -t 0 && -t 1 ]]; then
         if ask_yes_no "Missing $target_name. Copy from $example_name now? [Y/n] " "y"; then
           cp "$example" "$target"
@@ -1567,7 +1572,94 @@ show_onion_host() {
   fi
 }
 
+path_owner_uid() {
+  # -L follows symlinks: Docker bind-mounts the target, so the target's owner is
+  # what matters. GNU coreutils first, BSD/macOS second; empty means "unknown".
+  stat -L -c %u "$1" 2>/dev/null || stat -L -f %u "$1" 2>/dev/null || printf ''
+}
+
+env_value_or_empty() {
+  local raw=""
+  if ! raw="$(read_env_var "$1")"; then
+    printf ''
+    return 0
+  fi
+  local value
+  value="$(strip_quotes "$raw")"
+  # Trim surrounding whitespace — `KEY= 1000` is valid .env, but the raw value
+  # would break both the comparison and the chown hint we print.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+# docker-compose.yml runs the container as ${DOCKER_UID:-1000}:${DOCKER_GID:-1000}.
+# On hosts where the login user is not uid 1000 that default cannot write into the
+# bind-mounted ./db, so pin both to the host user unless the operator set them.
+ensure_docker_uid() {
+  local env_file="$ROOT_DIR/.env"
+  local host_uid host_gid changed=0
+  [[ -f "$env_file" ]] || return 0
+  host_uid="$(id -u)"
+  host_gid="$(id -g)"
+
+  if [[ -z "$(env_value_or_empty DOCKER_UID)" ]]; then
+    set_env_var DOCKER_UID "$host_uid"
+    changed=1
+  fi
+  if [[ -z "$(env_value_or_empty DOCKER_GID)" ]]; then
+    set_env_var DOCKER_GID "$host_gid"
+    changed=1
+  fi
+
+  if [[ "$changed" == "1" ]]; then
+    info "Set DOCKER_UID/DOCKER_GID in .env to ${host_uid}:${host_gid} (host user)."
+  fi
+  return 0
+}
+
+# Compose silently creates missing bind-mount sources as root-owned. Create them
+# ourselves beforehand and refuse to start when the container user could not write.
+ensure_data_dirs() {
+  local container_uid container_gid dir path owner check_owner=1
+  container_uid="$(env_value_or_empty DOCKER_UID)"
+  container_gid="$(env_value_or_empty DOCKER_GID)"
+  # Mirror compose's own ${DOCKER_UID:-1000} fallback for the unset case.
+  [[ -n "$container_uid" ]] || container_uid="1000"
+  [[ -n "$container_gid" ]] || container_gid="1000"
+  # Compose also accepts a user *name*; we cannot resolve that to a host uid, so
+  # create the directories but say out loud that the check was skipped.
+  if ! is_int "$container_uid" || ! is_int "$container_gid"; then
+    warn "DOCKER_UID/DOCKER_GID are not numeric (${container_uid}:${container_gid}) — skipping the ownership check for db/ and blossom/."
+    check_owner=0
+  fi
+
+  for dir in db blossom; do
+    path="$ROOT_DIR/$dir"
+    if [[ -L "$path" && ! -e "$path" ]]; then
+      die "$dir is a broken symlink. Point $path at an existing directory or remove it."
+    fi
+    if [[ -e "$path" && ! -d "$path" ]]; then
+      die "$dir exists but is not a directory. Remove $path and start again."
+    fi
+    if [[ ! -d "$path" ]]; then
+      mkdir -p "$path" || die "Cannot create $path"
+      success "Created $dir/"
+    fi
+
+    [[ "$check_owner" == "1" ]] || continue
+    owner="$(path_owner_uid "$path")"
+    # 10# forces base 10: bash arithmetic would read a leading zero as octal,
+    # while Docker and chown read the same string as decimal.
+    if is_int "$owner" && [[ "10#$owner" -ne "10#$container_uid" ]]; then
+      die "$dir/ is owned by uid $owner but the container runs as uid $container_uid — Haven cannot write to it. Fix with: sudo chown -R ${container_uid}:${container_gid} $path"
+    fi
+  done
+}
+
 prepare_start() {
+  ensure_docker_uid
+  ensure_data_dirs
   ensure_example_jsons
   apply_import_flag
 }
