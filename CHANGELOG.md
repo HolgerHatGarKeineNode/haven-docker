@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## v1.2.2-2
 
-Tooling and docs only; the image is unchanged.
+Tooling and docs only. `Dockerfile`, `entrypoint.sh` and `build.sh` are unchanged
+since `v1.2.2-1`, so the `v1.2.2-2` image was not rebuilt — it is the `v1.2.2-1`
+manifest mirrored under the new tag (same digest
+`sha256:31bbbcf91eee3bf4e31f87298707f182dc8a36a67688f29afd5284a1e72a5b32`,
+`linux/amd64` + `linux/arm64`). Pulling either tag gives you the same bits.
 
 ### Fixed
 
@@ -15,6 +19,10 @@ Tooling and docs only; the image is unchanged.
 - `./haven start` creates `db/` and `blossom/` before Compose can create them as root, and aborts with the exact `chown` command when the container user could not write to them
 - `.env.example`: documented `DOCKER_UID` / `DOCKER_GID` (commented out so the TUI can fill them in)
 - README: file-ownership section covering the direct `docker compose up` path, recommending `chown` over `chmod -R 777`
+
+### Changed
+
+- Bumped Docker image tag to `v1.2.2-2` in `docker-compose.yml` and `docker-compose.tor.yml`
 
 ## v1.2.2-1
 
