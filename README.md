@@ -49,6 +49,31 @@ All relay names, descriptions, icons, rate limiters, WOT, backup, and import set
 
 The TUI guides you through the remaining setup.
 
+### File ownership (`db/` permission errors)
+
+The container writes to the bind-mounted `./db` and `./blossom` directories and
+runs as `${DOCKER_UID}:${DOCKER_GID}` (default `1000:1000`). If those directories
+belong to a different uid, Haven fails to start with a permission error.
+
+`./haven start` handles this for you: it creates the directories, writes your own
+`id -u` / `id -g` into `.env` as `DOCKER_UID` / `DOCKER_GID`, and aborts with a
+`chown` hint if the ownership still does not match.
+
+**If you run `docker compose up` directly**, set both yourself before the first
+start — otherwise Compose creates the directories as `root` and the container
+cannot write to them:
+
+```bash
+printf 'DOCKER_UID=%s\nDOCKER_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+```
+
+Do **not** work around this with `chmod -R 777 db/` — that makes the relay
+database world-writable. Fix the ownership instead:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" db blossom
+```
+
 ### Optional: customize the web dashboard
 
 To override the baked-in templates, copy the examples and re-enable the volume in `docker-compose.yml` (and `docker-compose.tor.yml` if you use Tor):
