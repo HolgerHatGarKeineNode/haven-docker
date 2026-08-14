@@ -1654,6 +1654,14 @@ ensure_data_dirs() {
     if is_int "$owner" && [[ "10#$owner" -ne "10#$container_uid" ]]; then
       die "$dir/ is owned by uid $owner but the container runs as uid $container_uid — Haven cannot write to it. Fix with: sudo chown -R ${container_uid}:${container_gid} $path"
     fi
+
+    # Ownership and mode bits are independent, so an earlier `chmod -R 777`
+    # workaround survives the chown fix silently: the container starts, and every
+    # account on the host can rewrite the relay database. Warn, never abort —
+    # the relay works, it is only exposed.
+    if [[ -n "$(find -H "$path" -perm -o+w -print 2>/dev/null | head -n 1 || true)" ]]; then
+      warn "$dir/ is world-writable — every account on this host can modify the relay database. Reset with: chmod -R u=rwX,go= $path"
+    fi
   done
 }
 
