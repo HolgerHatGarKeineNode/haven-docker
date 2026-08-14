@@ -74,6 +74,62 @@ die() {
     exit 1
 }
 
+env_keys() {
+    # Reads the given file, or stdin when called without one.
+    awk '
+        {
+            line = $0
+            sub(/^[ \t]*/, "", line)
+            sub(/^export[ \t]+/, "", line)
+            ep = index(line, "=")
+            if (ep == 0) next
+            key = substr(line, 1, ep - 1)
+            if (key ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print key
+        }
+    ' "$@" | LC_ALL=C sort -u
+}
+
+# Our .env.example is a hand-maintained copy of upstream's plus the Docker-only
+# variables, and it drifted once without anyone noticing (issue #11): Haven falls
+# back to a built-in default for an undefined variable, so nothing fails — the
+# setting is simply invisible. `./haven start` reports this to the operator, but
+# by then the release has shipped. The image carries upstream's own file, so say
+# it here, while the tag is still in the maintainer's hands.
+check_env_example_drift() {
+    local image="$1"
+    local script_dir upstream missing
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    header "Env Drift Check"
+
+    if [[ ! -f "$script_dir/.env.example" ]]; then
+        printf "${YELLOW}Skipped: no .env.example next to build.sh.${NC}\n"
+        return 0
+    fi
+
+    # Pulls if the image is not local — the buildx path pushes without loading.
+    if ! upstream="$(docker run --rm --entrypoint cat "$image" \
+        /app/.env.example.upstream 2>/dev/null)" || [[ -z "$upstream" ]]; then
+        printf "${YELLOW}Skipped: cannot read /app/.env.example.upstream from ${image}.${NC}\n"
+        printf "${YELLOW}Expected for a foreign --platform without emulation, or an image built before that file existed.${NC}\n"
+        return 0
+    fi
+
+    missing="$(LC_ALL=C comm -23 \
+        <(printf '%s\n' "$upstream" | env_keys) \
+        <(env_keys "$script_dir/.env.example") | paste -sd ' ' -)"
+
+    if [[ -z "$missing" ]]; then
+        printf "${GREEN}.env.example covers every variable upstream ${VERSION} documents.${NC}\n"
+        return 0
+    fi
+
+    printf "${RED}.env.example does not document variables that upstream ${VERSION} ships:${NC}\n"
+    printf "  ${YELLOW}%s${NC}\n\n" "$missing"
+    printf "Add them to .env.example before releasing. Haven runs on its built-in\n"
+    printf "defaults for these, so nothing breaks — the settings are just invisible.\n"
+}
+
 # ── Usage ─────────────────────────────────────────────────────────────
 usage() {
     printf '%b\n' "${BOLD}Haven Docker Build Script${NC}
@@ -256,6 +312,8 @@ cmd_build() {
         printf "${GREEN}Tagged: ${LATEST_IMAGE}${NC}\n"
     fi
 
+    check_env_example_drift "$FULL_IMAGE"
+
     printf "\n${BOLD}Done.${NC}\n"
 }
 
@@ -326,6 +384,10 @@ cmd_buildx() {
     printf "\n${GREEN}Buildx build + push successful!${NC}\n"
     printf "  ${FULL_IMAGE}\n"
     $TAG_LATEST && printf "  ${LATEST_IMAGE}\n"
+
+    # Buildx pushes without loading into the local daemon, so this pulls the tag
+    # back for the host platform. Worth one pull per release.
+    check_env_example_drift "$FULL_IMAGE"
 
     printf "\n${BOLD}Done.${NC}\n"
 }
