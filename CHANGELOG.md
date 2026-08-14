@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Docs only.
+
+### Added
+
+- README: how to undo an earlier `chmod -R 777` workaround — `chown` does not reset mode bits, so the relay database stays world-writable until the bits are reset explicitly ([#9](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/9))
+- README: spelled out why ownership alone fixes the start failure — Compose creates a missing bind-mount source as `root:root` mode `0755`, which already grants the owner read and write
+
 ## v1.2.2-2
 
 Tooling and docs only. `Dockerfile`, `entrypoint.sh` and `build.sh` are unchanged

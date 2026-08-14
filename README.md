@@ -74,6 +74,23 @@ database world-writable. Fix the ownership instead:
 sudo chown -R "$(id -u):$(id -g)" db blossom
 ```
 
+Ownership is all it takes: Compose creates a missing bind-mount source as
+`root:root` with mode `0755`, so as soon as the directory is yours, the owner
+bits already grant read and write. No `chmod` is involved in the fix.
+
+**If you already ran `chmod -R 777`**, `chown` does not undo it — ownership and
+mode bits are independent, and the database stays world-writable until you reset
+the bits yourself:
+
+```bash
+chmod -R u=rwX,go= db blossom
+```
+
+Capital `X` sets the execute bit on directories only, so database files do not
+end up executable. Nobody but your own user needs access here — the container
+runs as `${DOCKER_UID}:${DOCKER_GID}`, which is you. Use `750`/`640` instead if
+you want the group to read as well.
+
 ### Optional: customize the web dashboard
 
 To override the baked-in templates, copy the examples and re-enable the volume in `docker-compose.yml` (and `docker-compose.tor.yml` if you use Tor):
