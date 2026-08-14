@@ -40,6 +40,13 @@ COPY --from=builder /app/haven .
 # in makes the image self-contained; a host bind-mount can still override them.
 COPY --from=builder /app/templates ./templates
 
+# Keep upstream's own .env.example in the image. Ours is a hand-maintained copy
+# of it plus the Docker-only variables, and it drifted once without anyone
+# noticing: Haven falls back to a built-in default for an undefined variable, so
+# nothing fails — the setting is simply invisible. Shipping the original lets
+# `./haven start` diff against it offline, pinned to the exact version built here.
+COPY --from=builder /app/.env.example ./.env.example.upstream
+
 # Ensure the main executable has the correct permissions
 RUN chmod +x /app/haven
 

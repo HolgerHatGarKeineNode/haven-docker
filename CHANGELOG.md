@@ -2,7 +2,10 @@
 
 ## Unreleased
 
-No image change — `./haven`, `.env.example` and docs only.
+**Needs an image rebuild.** The `Dockerfile` gained a `COPY`, so the drift check
+below stays inert until an image built from it is published; on older images it
+skips silently. Everything else in this section works against the existing
+`v1.2.2-2` image.
 
 ### Fixed
 
@@ -10,6 +13,7 @@ No image change — `./haven`, `.env.example` and docs only.
 
 ### Added
 
+- `Dockerfile` keeps upstream's own `.env.example` in the image as `/app/.env.example.upstream`, and `./haven start` diffs your `.env` against it after the start: it names every variable the packaged relay supports but your `.env` leaves unset (Haven then uses its built-in default), and flags separately any that this repo's `.env.example` does not document at all — the exact gap behind [#11](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/11). The check is offline and pinned to the built version; on an image without the file it skips silently
 - `./haven start` warns when `db/` or `blossom/` are world-writable, so an earlier `chmod -R 777` workaround does not survive the ownership fix unnoticed; it warns and continues rather than aborting, since the relay does run — it is only exposed ([#9](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/9))
 - README: how to undo an earlier `chmod -R 777` workaround — `chown` does not reset mode bits, so the relay database stays world-writable until the bits are reset explicitly ([#9](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/9))
 - README: spelled out why ownership alone fixes the start failure — Compose creates a missing bind-mount source as `root:root` mode `0755`, which already grants the owner read and write

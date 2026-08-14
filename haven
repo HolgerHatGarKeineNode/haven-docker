@@ -1304,6 +1304,58 @@ list_missing_env_vars() {
   ' "$env_file" "$example_file"
 }
 
+env_keys_from_file() {
+  # Reads the given file, or stdin when called without one.
+  awk '
+    {
+      line = $0
+      sub(/^[ \t]*/, "", line)
+      sub(/^export[ \t]+/, "", line)
+      ep = index(line, "=")
+      if (ep == 0) next
+      key = substr(line, 1, ep - 1)
+      if (key ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print key
+    }
+  ' "$@" | LC_ALL=C sort -u
+}
+
+# Our .env.example is a hand-maintained copy of upstream's plus the Docker-only
+# variables, and it drifted once without anyone noticing (#11): Haven falls back
+# to a built-in default for an undefined variable, so nothing fails — the setting
+# is just invisible, in the docs and in the env editor, which lists what is in
+# .env. The image carries upstream's own file, so diff against that: no network,
+# and pinned to the exact version that was built.
+report_upstream_env_drift() {
+  local compose_file="$1"
+  local upstream_keys our_keys env_keys undocumented unset_here
+
+  [[ -f "$ROOT_DIR/.env" ]] || return 0
+
+  upstream_keys="$(dc "$compose_file" run --rm --no-deps -T --entrypoint cat \
+    relay /app/.env.example.upstream 2>/dev/null | env_keys_from_file || true)"
+  # Images built before this file was added do not carry it, and a diagnostic
+  # must never fail a start: no file, no check.
+  [[ -n "$upstream_keys" ]] || return 0
+
+  our_keys="$(env_keys_from_file "$ROOT_DIR/.env.example" 2>/dev/null || true)"
+  env_keys="$(env_keys_from_file "$ROOT_DIR/.env")"
+
+  undocumented="$(LC_ALL=C comm -23 <(printf '%s\n' "$upstream_keys") \
+    <(printf '%s\n' "$our_keys") | paste -sd ' ' -)"
+  unset_here="$(LC_ALL=C comm -12 <(printf '%s\n' "$upstream_keys") \
+    <(printf '%s\n' "$our_keys") \
+    | LC_ALL=C comm -23 - <(printf '%s\n' "$env_keys") | paste -sd ' ' -)"
+
+  if [[ -n "$unset_here" ]]; then
+    warn "Not set in your .env: $unset_here — Haven uses its built-in defaults. Add them with: ./haven env-upgrade"
+  fi
+  if [[ -n "$undocumented" ]]; then
+    warn "The packaged Haven supports variables this repo does not document: $undocumented"
+    warn "Set them in .env by hand, and please report the gap: https://github.com/HolgerHatGarKeineNode/haven-docker/issues"
+  fi
+  return 0
+}
+
 upgrade_env_file() {
   local env_file="$ROOT_DIR/.env"
   local example_file="$ROOT_DIR/.env.example"
@@ -1689,6 +1741,9 @@ start_services() {
   info "Starting services ($mode)..."
   dc "$compose_file" "${args[@]}"
   dc "$compose_file" ps
+
+  # After the start, so the image is guaranteed to be pulled.
+  report_upstream_env_drift "$compose_file"
 
   if [[ "$mode" == "tor" ]]; then
     show_onion_host

@@ -120,6 +120,11 @@ A host bind-mount **replaces** the image copy entirely — an empty `./templates
 ./haven help              # Full usage info
 ```
 
+After starting, `./haven start` compares your `.env` against the `.env.example`
+that upstream Haven ships inside the image and names any variable the relay
+supports but your `.env` leaves unset — it then runs on its built-in default.
+`./haven env-upgrade` adds the ones this repo documents.
+
 ## Acknowledgements
 
 Haven is built and maintained by [barrydeen](https://github.com/barrydeen) and its [contributors](https://github.com/barrydeen/haven/graphs/contributors). Thanks to everyone who makes this project possible.
