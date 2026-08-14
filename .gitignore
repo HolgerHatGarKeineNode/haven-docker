@@ -10,4 +10,4 @@ db.zip
 .DS_Store
 /remotion
 .codegraph/
-plans/
+plans/.claude/settings.local.json
