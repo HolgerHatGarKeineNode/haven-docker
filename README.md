@@ -127,16 +127,17 @@ same binary — filling in `relays_import.json` and the `## Import Settings` in
 `.env` configures it, but does not trigger it:
 
 ```bash
-./haven import      # answer "y" — sets HAVEN_IMPORT_FLAG=true in .env
-./haven restart     # the container now runs `haven import` instead of the relay
-./haven logs        # wait for "✅ owner note import complete!"
-./haven import      # answer "n" — sets the flag back to false
-./haven restart     # back to serving
+./haven import      # runs the import once, in the foreground
 ```
 
-**Set the flag back to `false` once the import is done.** The import exits when
-it finishes, and `restart: unless-stopped` then starts the container again — it
-would import in a loop and never serve the relay.
+It stops the relay first and starts it again afterwards — badger and lmdb both
+take an exclusive lock on `db/`, so the import and the relay cannot both write.
+Expect it to take a while; the last line is `✅ owner note import complete!`.
+
+`HAVEN_IMPORT_FLAG=true` in `.env` is the older way to do this: it makes the
+container run the import *instead of* the relay. Avoid it. The import exits when
+it finishes and `restart: unless-stopped` starts the container right back into
+it, so the relay never comes up. `./haven start` warns if it finds the flag set.
 
 What it fetches, from the relays in `relays_import.json`:
 

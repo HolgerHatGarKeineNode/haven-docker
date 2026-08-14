@@ -236,7 +236,7 @@ Commands:
   logs                Stream logs
   status              Show status
   onion               Show Tor onion hostname (if available)
-  import              Set HAVEN_IMPORT_FLAG (interactive)
+  import              Import old notes once (stops the relay while it runs)
   env                 Edit .env (TUI)
   env-upgrade         Add missing vars from .env.example
   json                Open JSON list editor
@@ -245,7 +245,7 @@ Commands:
 Options:
   -t, --tor            Use docker-compose.tor.yml
   --plain              Force docker-compose.yml
-  --import             Set HAVEN_IMPORT_FLAG=true
+  --import             Set HAVEN_IMPORT_FLAG=true (in-container import on start)
   --no-import          Set HAVEN_IMPORT_FLAG=false
   --prompt-import      Ask for HAVEN_IMPORT_FLAG
   --tail N             Tail last N log lines (default: 100)
@@ -688,6 +688,10 @@ tui_require_docker() {
 
 has_tor_container() {
   docker ps -a --format '{{.Names}}' | grep -qx 'haven-tor'
+}
+
+relay_container_running() {
+  docker ps --format '{{.Names}}' | grep -qx 'haven-relay'
 }
 
 resolve_mode() {
@@ -1717,11 +1721,63 @@ ensure_data_dirs() {
   done
 }
 
+# HAVEN_IMPORT_FLAG makes entrypoint.sh run `haven import` *instead of* the relay.
+# The import exits when it is done and `restart: unless-stopped` starts the
+# container right back into it, so the flag left on means an import loop and no
+# relay. `./haven import` runs the same import once, without the flag.
+warn_import_flag() {
+  local flag
+  flag="$(env_value_or_empty HAVEN_IMPORT_FLAG)"
+  [[ "${flag,,}" == "true" ]] || return 0
+  warn "HAVEN_IMPORT_FLAG=true — this container runs the note import instead of the relay, and restarts into it again every time it finishes."
+  warn "Set it to false and use './haven import' for a one-shot import."
+}
+
 prepare_start() {
   ensure_docker_uid
   ensure_data_dirs
   ensure_example_jsons
   apply_import_flag
+  warn_import_flag
+}
+
+# The note import is a separate one-shot run of the same binary, not something
+# the relay does while serving. Run it with `compose run`, which ignores the
+# service's restart policy — the flag-based path cannot, which is why leaving the
+# flag on loops. The relay has to be down for it: badger and lmdb both take an
+# exclusive lock on db/, so two writers cannot share it.
+run_import_once() {
+  local mode="$1"
+  local compose_file status=0 was_running=0
+
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+
+  ensure_docker_uid
+  ensure_data_dirs
+  ensure_example_jsons
+  warn_import_flag
+
+  if relay_container_running; then
+    was_running=1
+    info "Stopping the relay — the database allows a single writer."
+    dc "$compose_file" stop relay >/dev/null 2>&1 || true
+  fi
+
+  info "Importing notes ($mode). This runs once and exits; it can take a while."
+  dc "$compose_file" run --rm --no-deps -e HAVEN_IMPORT_FLAG=true relay || status=$?
+
+  if [[ "$was_running" == "1" ]]; then
+    info "Starting the relay again..."
+    dc "$compose_file" start relay >/dev/null 2>&1 || dc "$compose_file" up -d
+  fi
+
+  if [[ "$status" -ne 0 ]]; then
+    warn "Import exited with status $status."
+    return "$status"
+  fi
+  success "Import finished."
+  return 0
 }
 
 start_services() {
@@ -2164,7 +2220,7 @@ tui_build_menu() {
       MENU_TITLE="Haven"
       MENU_SUBTITLE="$docker_icon Docker: $docker_status │ Mode: $mode"
       MENU_IDS=(start_plain start_tor stop restart env json env_upgrade onion import help quit)
-      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" ".env Editor" "JSON Editor" "Upgrade .env" "Show Onion Host" "Set Import Flag" "Help" "Quit")
+      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" ".env Editor" "JSON Editor" "Upgrade .env" "Show Onion Host" "Import notes" "Help" "Quit")
       ;;
     logs)
       TUI_LEFT_TITLE="⚡ Haven ─ Logs"
@@ -2467,10 +2523,20 @@ $(cat "$onion_torrc")"
           tui_message "Onion Host" "$onion_text"
           ;;
         import)
-          prompt_import_flag
-          local value=""
-          value="$(read_env_var HAVEN_IMPORT_FLAG 2>/dev/null || true)"
-          tui_message "Import Flag" "HAVEN_IMPORT_FLAG=$value"
+          tui_require_docker || return
+          if tui_confirm "Import notes now? The relay stops for it." "y"; then
+            # The import streams for minutes; suspend the TUI so it is visible.
+            tui_cleanup
+            printf "\n"
+            run_import_once "$(resolve_mode "import")" || true
+            printf "\nPress Enter to return to the TUI... "
+            read -r _ || true
+            tui_init
+            TUI_NEED_FRAME=1
+            TUI_NEED_MENU=1
+            TUI_NEED_LEFT=1
+            TUI_NEED_RIGHT=1
+          fi
           ;;
         env_upgrade)
           if [[ ! -f "$ROOT_DIR/.env.example" ]]; then
@@ -3008,7 +3074,8 @@ main() {
       show_onion_host
       ;;
     import)
-      prompt_import_flag
+      ensure_docker
+      run_import_once "$(resolve_mode "import")" || exit 1
       ;;
     env)
       menu_env_editor

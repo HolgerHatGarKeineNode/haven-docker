@@ -11,12 +11,17 @@ skips silently. Everything else in this section works against the existing
 
 - `.env.example` was missing `BLASTR_TIMEOUT_SECONDS`, the only variable that had drifted from upstream `.env.example` at the packaged version (`v1.2.2`); the relay was unaffected — Haven defaults it to `5` when unset — but it was neither documented nor editable in the TUI. Existing installs pick it up with `./haven env-upgrade` ([#11](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/11))
 
+### Changed
+
+- `./haven import` now runs the import once and returns, instead of only flipping `HAVEN_IMPORT_FLAG` for the next start. It stops the relay for the run (badger and lmdb take an exclusive lock on `db/`), starts it again afterwards, and uses `compose run`, which ignores the service's restart policy — the flag-based path could not, which is why leaving the flag on re-imports in a loop and never serves ([#12](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/12))
+- `./haven start` warns when it finds `HAVEN_IMPORT_FLAG=true` in `.env`, naming that loop
+
 ### Added
 
 - `Dockerfile` keeps upstream's own `.env.example` in the image as `/app/.env.example.upstream`, and `./haven start` diffs your `.env` against it after the start: it names every variable the packaged relay supports but your `.env` leaves unset (Haven then uses its built-in default), and flags separately any that this repo's `.env.example` does not document at all — the exact gap behind [#11](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/11). The check is offline and pinned to the built version; on an image without the file it skips silently
 - `build.sh` runs the same diff after `build` and `buildx` and names any variable the freshly built image documents but `.env.example` does not — the maintainer-side half of the check, before a tag ships. It reports and never fails the build
 - `./haven start` warns when `db/` or `blossom/` are world-writable, so an earlier `chmod -R 777` workaround does not survive the ownership fix unnoticed; it warns and continues rather than aborting, since the relay does run — it is only exposed ([#9](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/9))
-- README: an "Importing old notes" section — the import is a separate one-shot run that `.env` alone does not trigger, the `HAVEN_IMPORT_FLAG` must be reset afterwards or the container re-imports in a loop under `restart: unless-stopped`, and `relays_import.json` must not be emptied when it is done ([#12](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/12))
+- README: an "Importing old notes" section — the import is a separate one-shot run that `.env` alone does not trigger, and `relays_import.json` must not be emptied when it is done ([#12](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/12))
 - README: how to undo an earlier `chmod -R 777` workaround — `chown` does not reset mode bits, so the relay database stays world-writable until the bits are reset explicitly ([#9](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/9))
 - README: spelled out why ownership alone fixes the start failure — Compose creates a missing bind-mount source as `root:root` mode `0755`, which already grants the owner read and write
 
