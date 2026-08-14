@@ -1,11 +1,16 @@
 # Changelog
 
-## Unreleased
+## v1.2.2-3
 
-**Needs an image rebuild.** The `Dockerfile` gained a `COPY`, so the drift check
-below stays inert until an image built from it is published; on older images it
-skips silently. Everything else in this section works against the existing
-`v1.2.2-2` image.
+Upstream Haven is unchanged (`v1.2.2`), but the image was rebuilt: it now carries
+upstream's own `.env.example`, which is what the drift check below compares
+against. Multi-arch `linux/amd64` + `linux/arm64`, index digest
+`sha256:c6c298f335b2cde3df905e8bc832c8d3fa8517b5dde8c5e3a325fb419dbdb69b`;
+`latest` points at the same digest.
+
+### Removed
+
+- `--import`, `--no-import` and `--prompt-import`, and the prompt that asked on every interactive start whether to import on the next one. They all set `HAVEN_IMPORT_FLAG`, which hands the import to the long-running service and therefore loops. `./haven import` replaces them; `HAVEN_IMPORT_FLAG` itself still works for anyone driving `docker compose` directly. **Breaking:** `./haven start --import` now fails with `Unknown argument`
 
 ### Fixed
 
@@ -15,6 +20,7 @@ skips silently. Everything else in this section works against the existing
 
 - `./haven import` now runs the import once and returns, instead of only flipping `HAVEN_IMPORT_FLAG` for the next start. It stops the relay for the run (badger and lmdb take an exclusive lock on `db/`), starts it again afterwards, and uses `compose run`, which ignores the service's restart policy — the flag-based path could not, which is why leaving the flag on re-imports in a loop and never serves ([#12](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/12))
 - `./haven start` warns when it finds `HAVEN_IMPORT_FLAG=true` in `.env`, naming that loop
+- Bumped Docker image tag to `v1.2.2-3` in `docker-compose.yml` and `docker-compose.tor.yml`
 
 ### Added
 

@@ -127,8 +127,6 @@ ICO_REMOVE="−"
 SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
 MODE="auto"
-IMPORT_MODE="auto"
-SKIP_IMPORT_PROMPT=0
 TAIL_COUNT=100
 LOG_SERVICE=""
 FOLLOW_LOGS=1
@@ -245,9 +243,6 @@ Commands:
 Options:
   -t, --tor            Use docker-compose.tor.yml
   --plain              Force docker-compose.yml
-  --import             Set HAVEN_IMPORT_FLAG=true (in-container import on start)
-  --no-import          Set HAVEN_IMPORT_FLAG=false
-  --prompt-import      Ask for HAVEN_IMPORT_FLAG
   --tail N             Tail last N log lines (default: 100)
   -s, --service NAME   Logs: follow a specific service
   --all                Logs: follow all services
@@ -259,7 +254,7 @@ Options:
 Examples:
   $SCRIPT_NAME
   $SCRIPT_NAME start
-  $SCRIPT_NAME start --tor --prompt-import
+  $SCRIPT_NAME import
   $SCRIPT_NAME logs --service relay --tail 200
   $SCRIPT_NAME json
   $SCRIPT_NAME env
@@ -1139,50 +1134,6 @@ ask_yes_no() {
   done
 }
 
-prompt_import_flag() {
-  local current=""
-  local default_answer="n"
-  local prompt="Import old notes on next start? [y/N] "
-
-  if current="$(read_env_var HAVEN_IMPORT_FLAG 2>/dev/null)"; then
-    current="${current,,}"
-  fi
-
-  if [[ "$current" == "true" ]]; then
-    default_answer="y"
-    prompt="Import old notes on next start? [Y/n] "
-  fi
-
-  if ask_yes_no "$prompt" "$default_answer"; then
-    set_env_var HAVEN_IMPORT_FLAG true
-    success "HAVEN_IMPORT_FLAG set to true"
-  else
-    set_env_var HAVEN_IMPORT_FLAG false
-    success "HAVEN_IMPORT_FLAG set to false"
-  fi
-}
-
-apply_import_flag() {
-  case "$IMPORT_MODE" in
-    true)
-      set_env_var HAVEN_IMPORT_FLAG true
-      success "HAVEN_IMPORT_FLAG set to true"
-      ;;
-    false)
-      set_env_var HAVEN_IMPORT_FLAG false
-      success "HAVEN_IMPORT_FLAG set to false"
-      ;;
-    prompt)
-      prompt_import_flag
-      ;;
-    auto)
-      if [[ "$SKIP_IMPORT_PROMPT" == "0" && -t 0 && -t 1 ]]; then
-        prompt_import_flag
-      fi
-      ;;
-  esac
-}
-
 ensure_example_jsons() {
   local example
   for example in "$ROOT_DIR"/*.example.json; do
@@ -1737,7 +1688,6 @@ prepare_start() {
   ensure_docker_uid
   ensure_data_dirs
   ensure_example_jsons
-  apply_import_flag
   warn_import_flag
 }
 
@@ -2887,13 +2837,7 @@ restart_after_env_change() {
   fi
 
   info "Restarting services ($mode) to apply .env changes..."
-  local prev_skip="$SKIP_IMPORT_PROMPT"
-  local prev_import="$IMPORT_MODE"
-  SKIP_IMPORT_PROMPT=1
-  IMPORT_MODE="auto"
   restart_services "$mode"
-  IMPORT_MODE="$prev_import"
-  SKIP_IMPORT_PROMPT="$prev_skip"
 }
 
 menu_env_editor() {
@@ -2975,18 +2919,6 @@ parse_args() {
         ;;
       --plain)
         MODE="plain"
-        shift
-        ;;
-      --import)
-        IMPORT_MODE="true"
-        shift
-        ;;
-      --no-import)
-        IMPORT_MODE="false"
-        shift
-        ;;
-      --prompt-import)
-        IMPORT_MODE="prompt"
         shift
         ;;
       --tail)
