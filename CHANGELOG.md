@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-No image change — `./haven` and docs only.
+No image change — `./haven`, `.env.example` and docs only.
+
+### Fixed
+
+- `.env.example` was missing `BLASTR_TIMEOUT_SECONDS`, the only variable that had drifted from upstream `.env.example` at the packaged version (`v1.2.2`); the relay was unaffected — Haven defaults it to `5` when unset — but it was neither documented nor editable in the TUI. Existing installs pick it up with `./haven env-upgrade` ([#11](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/11))
 
 ### Added
 
