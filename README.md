@@ -120,6 +120,35 @@ A host bind-mount **replaces** the image copy entirely — an empty `./templates
 ./haven help              # Full usage info
 ```
 
+### Importing old notes
+
+The relay never imports on its own. Importing is a separate, one-shot run of the
+same binary — filling in `relays_import.json` and the `## Import Settings` in
+`.env` configures it, but does not trigger it:
+
+```bash
+./haven import      # answer "y" — sets HAVEN_IMPORT_FLAG=true in .env
+./haven restart     # the container now runs `haven import` instead of the relay
+./haven logs        # wait for "✅ owner note import complete!"
+./haven import      # answer "n" — sets the flag back to false
+./haven restart     # back to serving
+```
+
+**Set the flag back to `false` once the import is done.** The import exits when
+it finishes, and `restart: unless-stopped` then starts the container again — it
+would import in a loop and never serve the relay.
+
+What it fetches, from the relays in `relays_import.json`:
+
+- your own notes, in 10-day windows from `IMPORT_START_DATE` up to now, into the outbox relay
+- notes tagging you, into the inbox relay — gift-wrapped ones into the chat relay
+
+Do **not** empty `relays_import.json` when the import is done. The running relay
+reads it at every boot and needs it for three more things: the connectivity check
+at startup, building the web of trust (follow lists are fetched from exactly
+these relays), and the live inbox subscription. With an empty list the web of
+trust shrinks to your whitelist and the inbox stops receiving anything.
+
 After starting, `./haven start` compares your `.env` against the `.env.example`
 that upstream Haven ships inside the image and names any variable the relay
 supports but your `.env` leaves unset — it then runs on its built-in default.
