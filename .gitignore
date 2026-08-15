@@ -12,3 +12,4 @@ db.zip
 .codegraph/
 plans/
 .claude/settings.local.json
+.omo/
