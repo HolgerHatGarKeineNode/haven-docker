@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.2.2-4
+
+Upstream Haven is unchanged (`v1.2.2`); the image is rebuilt because `/app/haven`
+inside it is now a guard script in front of the relay binary. Multi-arch
+`linux/amd64` + `linux/arm64`, index digest
+`sha256:d6be7789b779fb254f2bbbb4e6c2754ebc8dc8b13d89a3590432e22858fd5548`;
+`latest` points at the same digest.
+
+### Added
+
+- The image intercepts `docker exec haven-relay ./haven <cmd>` while the relay is running, and prints where the command actually belongs instead of letting badger panic. Two different programs are called `haven` — this repo's CLI on the host and upstream's binary in the container — and reaching the second one through `docker exec` opens `db/` behind the relay's back, which ends in `panic: Cannot acquire directory lock on "db/private"`. The panic named neither program, so it read like a broken import rather than the wrong `haven` ([#12](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/12))
+- README: `./haven import` is explicitly a host command, run from the repository checkout — with the `docker exec` variant named as the thing that does not work, and why
+
+### Changed
+
+- `Dockerfile` installs the relay binary as `/app/haven-bin` and `haven-guard.sh` as `/app/haven`. The guard scans `/proc` for a second `haven-bin` and execs the real binary when it finds none, so the relay under `entrypoint.sh` and the one-shot import container from `./haven import` both pass through untouched; `help`, `-h` and `--help` never touch the database and always pass
+- `./haven import` verifies the relay container is actually gone after stopping it, instead of assuming the stop took. A stop that silently failed sent the import into exactly the badger lock panic above
+- Bumped Docker image tag to `v1.2.2-4` in `docker-compose.yml` and `docker-compose.tor.yml`
+
 ## v1.2.2-3
 
 Upstream Haven is unchanged (`v1.2.2`), but the image was rebuilt: it now carries

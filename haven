@@ -1712,6 +1712,15 @@ run_import_once() {
     was_running=1
     info "Stopping the relay — the database allows a single writer."
     dc "$compose_file" stop relay >/dev/null 2>&1 || true
+
+    # Verify rather than assume. If the stop did not take, the import opens db/
+    # against a live relay and dies in badger with a lock panic that reads like
+    # a bug in the import (issue #12) — abort with the actual cause instead.
+    if relay_container_running; then
+      warn "The relay container is still running; the import cannot open db/ while it holds the lock."
+      warn "Stop it manually ('./haven stop' or 'docker stop haven-relay') and run the import again."
+      return 1
+    fi
   fi
 
   info "Importing notes ($mode). This runs once and exits; it can take a while."

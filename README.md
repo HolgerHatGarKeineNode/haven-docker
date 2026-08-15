@@ -127,12 +127,21 @@ same binary — filling in `relays_import.json` and the `## Import Settings` in
 `.env` configures it, but does not trigger it:
 
 ```bash
+cd /path/to/haven-docker
 ./haven import      # runs the import once, in the foreground
 ```
 
 It stops the relay first and starts it again afterwards — badger and lmdb both
 take an exclusive lock on `db/`, so the import and the relay cannot both write.
 Expect it to take a while; the last line is `✅ owner note import complete!`.
+
+**Run it on the host, from this repository — not inside the container.** Two
+different programs are called `haven`: the `./haven` here is this repo's CLI, a
+shell script that drives Docker Compose, while `/app/haven` inside the image is
+upstream's relay binary. `docker exec haven-relay ./haven import` reaches the
+second one and opens `db/` while the running relay still holds the lock, which
+ends in `Cannot acquire directory lock on "db/private"`. Since `v1.2.2-4` the
+image intercepts that call and points back here instead of panicking.
 
 `HAVEN_IMPORT_FLAG=true` in `.env` is the older way to do this: it makes the
 container run the import *instead of* the relay. Avoid it. The import exits when

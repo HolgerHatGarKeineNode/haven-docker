@@ -31,8 +31,10 @@ RUN adduser -D -g '' nonroot
 
 WORKDIR /app
 
-# Copy Go application
-COPY --from=builder /app/haven .
+# Copy Go application. It lands as haven-bin, not haven: /app/haven is a guard
+# script (below) that intercepts a `docker exec haven-relay ./haven ...` into the
+# running relay, where the database lock is already taken.
+COPY --from=builder /app/haven ./haven-bin
 
 # Copy the web dashboard templates + static assets. HAVEN serves its landing
 # page from ./templates/index.html and ./templates/static at runtime
@@ -47,8 +49,13 @@ COPY --from=builder /app/templates ./templates
 # `./haven start` diff against it offline, pinned to the exact version built here.
 COPY --from=builder /app/.env.example ./.env.example.upstream
 
+# The name `haven` inside the image belongs to the guard, which execs haven-bin
+# once it is satisfied that nothing else holds db/. Everything that used to call
+# /app/haven — entrypoint.sh included — keeps working unchanged.
+COPY haven-guard.sh /app/haven
+
 # Ensure the main executable has the correct permissions
-RUN chmod +x /app/haven
+RUN chmod +x /app/haven-bin /app/haven
 
 # Copy the entrypoint script
 COPY entrypoint.sh /entrypoint.sh
