@@ -8,7 +8,20 @@ This repository packages Haven as a Docker Compose setup with a TUI for configur
 
 1. Ensure **Docker** and **Docker Compose** are installed and running.
 
-2. Copy the example files and edit them for your relay:
+2. Get this repository onto the host. The Compose files, the example configs and
+   the `./haven` CLI all live here, and every command below is run from inside
+   the checkout:
+
+```bash
+git clone https://github.com/HolgerHatGarKeineNode/haven-docker.git
+cd haven-docker
+```
+
+A clone is not strictly required — `docker-compose.yml` plus the config files is
+a complete setup, see [Without the CLI](#without-the-cli-plain-docker-compose) —
+but the examples, the CLI and `git pull` for new image versions come with it.
+
+3. Copy the example files and edit them for your relay:
 
 ```bash
 cp .env.example .env
@@ -20,7 +33,7 @@ cp whitelisted_npubs.example.json whitelisted_npubs.json
 
 The web dashboard templates are **baked into the image** — no host `templates/` copy is required for a default install.
 
-3. Edit `.env` — at minimum set these to your own values:
+4. Edit `.env` — at minimum set these to your own values:
 
 | Variable | Description |
 |---|---|
@@ -34,20 +47,22 @@ The web dashboard templates are **baked into the image** — no host `templates/
 
 All relay names, descriptions, icons, rate limiters, WOT, backup, and import settings can also be configured in `.env`. See `.env.example` for the full list with comments.
 
-4. Edit the JSON lists to fit your needs:
+5. Edit the JSON lists to fit your needs:
 
 - `relays_import.json` — relays to import notes from
 - `relays_blastr.json` — relays for blastr to broadcast to
 - `blacklisted_npubs.json` — npubs to block
 - `whitelisted_npubs.json` — npubs to allow (if whitelist mode)
 
-5. Start the relay:
+6. Start the relay:
 
 ```bash
 ./haven
 ```
 
-The TUI guides you through the remaining setup.
+The TUI guides you through the remaining setup. Prefer plain Compose? `docker
+compose up -d` works just as well — see
+[Without the CLI](#without-the-cli-plain-docker-compose).
 
 ### File ownership (`db/` permission errors)
 
@@ -120,6 +135,48 @@ A host bind-mount **replaces** the image copy entirely — an empty `./templates
 ./haven help              # Full usage info
 ```
 
+### Without the CLI: plain `docker compose`
+
+`./haven` is convenience, not a requirement. It is a bash script on the host that
+drives `docker compose` and edits `.env` for you; the image knows nothing about
+it. `docker-compose.yml`, `.env` and the four JSON files are a complete setup,
+and `docker compose up -d` is a supported way to run it.
+
+| CLI | Plain Compose |
+|---|---|
+| `./haven start` | `docker compose up -d` |
+| `./haven stop` | `docker compose down` |
+| `./haven restart` | `docker compose restart` |
+| `./haven logs` | `docker compose logs -f` |
+| `./haven start --tor` | `docker compose -f docker-compose.tor.yml up -d` |
+| `./haven import` | the three commands below |
+
+```bash
+docker compose stop relay
+docker compose run --rm --no-deps -e HAVEN_IMPORT_FLAG=true relay
+docker compose start relay
+```
+
+`run` ignores the service's restart policy — that is the whole point. Stopping
+the relay first is not optional: badger and lmdb take an exclusive lock on `db/`,
+and the import is a second writer.
+
+Four things the CLI does for you and you take on yourself here:
+
+- **`DOCKER_UID` / `DOCKER_GID`** — `./haven start` writes your own `id -u` /
+  `id -g` into `.env`; Compose alone falls back to `1000:1000`. See
+  [File ownership](#file-ownership-db-permission-errors).
+- **All config files exist before the first start** — Compose creates a *missing*
+  bind-mount source as a root-owned **directory**, so a forgotten
+  `relays_import.json` comes back as a folder and the relay fails on it.
+- **Updates** — the image tag in `docker-compose.yml` is pinned. `docker compose
+  pull` will not move it: change the tag yourself (or `git pull` for the current
+  one), then `docker compose up -d`.
+- **`.env` drift** — `./haven start` compares your `.env` against the one
+  upstream ships inside the image and names every variable you leave unset (each
+  falls back to a built-in default). Without it, diff against `.env.example`
+  after an update.
+
 ### Importing old notes
 
 The relay never imports on its own. Importing is a separate, one-shot run of the
@@ -133,7 +190,9 @@ cd /path/to/haven-docker
 
 It stops the relay first and starts it again afterwards — badger and lmdb both
 take an exclusive lock on `db/`, so the import and the relay cannot both write.
-Expect it to take a while; the last line is `✅ owner note import complete!`.
+Expect it to take a while. Your own notes end at `✅ owner note import
+complete!`; the run then fetches the notes tagging you and finishes on
+`✅ tagged import complete`.
 
 **Run it on the host, from this repository — not inside the container.** Two
 different programs are called `haven`: the `./haven` here is this repo's CLI, a
@@ -143,10 +202,19 @@ second one and opens `db/` while the running relay still holds the lock, which
 ends in `Cannot acquire directory lock on "db/private"`. Since `v1.2.2-4` the
 image intercepts that call and points back here instead of panicking.
 
-`HAVEN_IMPORT_FLAG=true` in `.env` is the older way to do this: it makes the
-container run the import *instead of* the relay. Avoid it. The import exits when
-it finishes and `restart: unless-stopped` starts the container right back into
-it, so the relay never comes up. `./haven start` warns if it finds the flag set.
+Driving Compose yourself instead of using the CLI? The same import in three
+commands: [Without the CLI](#without-the-cli-plain-docker-compose).
+
+`HAVEN_IMPORT_FLAG` is what decides it — `entrypoint.sh` reads it and runs
+`haven import` instead of the relay. Where it is set makes the difference:
+
+- **passed to a one-shot run** (`docker compose run -e HAVEN_IMPORT_FLAG=true`)
+  is the correct path, and exactly what `./haven import` does under the hood.
+  `run` ignores the restart policy, so the container is gone once the import ends.
+- **written into `.env`** is the trap. The import exits when it finishes and
+  `restart: unless-stopped` starts the container right back into it, so it
+  imports in a loop and the relay never comes up. `./haven start` warns if it
+  finds the flag set there.
 
 What it fetches, from the relays in `relays_import.json`:
 
