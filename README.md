@@ -164,8 +164,25 @@ and the import is a second writer.
 Four things the CLI does for you and you take on yourself here:
 
 - **`DOCKER_UID` / `DOCKER_GID`** — `./haven start` writes your own `id -u` /
-  `id -g` into `.env`; Compose alone falls back to `1000:1000`. See
-  [File ownership](#file-ownership-db-permission-errors).
+  `id -g` into `.env`; Compose alone falls back to the `1000:1000` in
+  `user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"`. Check whether that is you:
+
+  ```bash
+  id -u; id -g                    # who you are on the host
+  docker exec haven-relay id      # who the container writes as
+  ls -ln db | head -3             # who owns the database files (numeric)
+  ```
+
+  Same numbers, nothing to do. Different ones, set them once and recreate the
+  container — `user:` is part of its definition, so `restart` keeps the old uid:
+
+  ```bash
+  printf 'DOCKER_UID=%s\nDOCKER_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+  sudo chown -R "$(id -u):$(id -g)" db blossom
+  docker compose up -d
+  ```
+
+  More on this in [File ownership](#file-ownership-db-permission-errors).
 - **All config files exist before the first start** — Compose creates a *missing*
   bind-mount source as a root-owned **directory**, so a forgotten
   `relays_import.json` comes back as a folder and the relay fails on it.
