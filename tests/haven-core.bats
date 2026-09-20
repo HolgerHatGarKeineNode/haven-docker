@@ -123,7 +123,7 @@ teardown() {
 # NOTE: pins the current codepoint-counting behavior for wide characters.
 # Phase P3 of docs/plans/2026-09-20T1356-tui-stabilitaet-qol.md switches
 # tui_truncate to display width — update this test together with that change.
-@test "tui_truncate: CJK string truncates with ellipsis (P3: revisit for display width)" {
+@test "tui_truncate: CJK string truncates with ellipsis" {
   # Locale-robust: under a UTF-8 locale 3 codepoints survive, under C the
   # first multibyte char — either way the tail is cut and the ellipsis added.
   run bash -c 'source haven; set +e; tui_truncate "こんにちは世界" 6; printf "[%s]" "$_TRUNC"'
