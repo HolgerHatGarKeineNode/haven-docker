@@ -38,6 +38,19 @@ tmux_new() {
 capture() { tmux -L "$SOCK" capture-pane -p -t "$1"; }
 pane_dead() { tmux -L "$SOCK" list-panes -t "$1" -F '#{pane_dead}' 2>/dev/null | head -1; }
 
+# wait_for <session> <pattern> [timeout_s] — poll the capture until the
+# pattern shows up; fixed sleeps are too fragile on slow CI runners.
+wait_for() {
+  local s="$1" pat="$2" t="${3:-10}" el=0 out=""
+  while (( $(awk "BEGIN{print $el < $t}") )); do
+    out="$(capture "$s")"
+    [[ "$out" == *"$pat"* ]] && return 0
+    sleep 0.3
+    el=$(awk "BEGIN{print $el+0.3}")
+  done
+  return 1
+}
+
 # --- 1: too-small terminal -------------------------------------------------
 tmux_new t1 60 15 "stty -g > $WORK/stty-before; ./haven tui; echo \$? > $WORK/rc; stty -g > $WORK/stty-after; sleep 30"
 sleep 2
@@ -61,13 +74,19 @@ tmux -L "$SOCK" kill-session -t t1 >/dev/null 2>&1 || true
 
 # --- 2: resize while a prompt is open --------------------------------------
 tmux_new t2 120 40 "./haven tui"
-sleep 2
+if ! wait_for t2 "Dashboard"; then
+  bad "TUI did not reach the main view (startup)"
+  tmux -L "$SOCK" kill-session -t t2 >/dev/null 2>&1 || true
+else
 tmux -L "$SOCK" send-keys -t t2 Down Down Down Down   # select ".env Editor"
 sleep 0.3
 tmux -L "$SOCK" send-keys -t t2 Enter                 # open env_list
-sleep 0.5
+wait_for t2 ".env" || true
+sleep 0.3
 tmux -L "$SOCK" send-keys -t t2 Enter                 # "Add variable" opens tui_prompt ("New key: ")
-sleep 0.5
+if ! wait_for t2 "New key"; then
+  bad "prompt never opened before resize ($(capture t2 | tr '\n' '|' | head -c 160))"
+else
 tmux -L "$SOCK" resize-window -t t2 -x 80 -y 24
 sleep 1.2
 after="$(capture t2)"
@@ -80,6 +99,7 @@ elif [[ -z "$line_no" ]]; then
 else
   bad "prompt outside the new geometry (row $line_no > 22)"
 fi
+fi
 tmux -L "$SOCK" send-keys -t t2 Escape
 sleep 0.2
 tmux -L "$SOCK" send-keys -t t2 Escape
@@ -87,10 +107,13 @@ sleep 0.2
 tmux -L "$SOCK" send-keys -t t2 Escape
 sleep 0.5
 tmux -L "$SOCK" kill-session -t t2 >/dev/null 2>&1 || true
+fi
 
 # --- 3: bracketed paste in the main view ------------------------------------
 tmux_new t3 100 30 "TERM=xterm-256color ./haven tui"
-sleep 2
+if ! wait_for t3 "Haven"; then
+  bad "TUI did not start for the paste check"
+else
 alive_before="$(pane_dead t3)"
 tmux -L "$SOCK" send-keys -t t3 -l $'\033[200~pasted-garbage\033[201~'
 sleep 0.8
@@ -105,6 +128,7 @@ if [[ "$alive_after" != "1" && "$alive_before" != "1" ]]; then
   ok "TUI process still alive after bracketed paste"
 else
   bad "TUI process died on paste (dead before=$alive_before after=$alive_after)"
+fi
 fi
 tmux -L "$SOCK" kill-session -t t3 >/dev/null 2>&1 || true
 
