@@ -44,17 +44,9 @@ nav_setup() {
   [[ "$output" == "sel=4,0" ]]
 }
 
-@test "tui_handle_key: pgup/pgdn move by the visible page" {
-  run bash -c 'source '"$REPO_ROOT"'/haven; set +e
-    MENU_IDS=(one two three four five six seven eight nine ten); TUI_SEL=0; TUI_VISIBLE_ROWS=4; TUI_NEED_LEFT=0
-    tui_handle_key pgdn; a=$TUI_SEL
-    tui_handle_key pgup; b=$TUI_SEL
-    tui_handle_key pgup; c=$TUI_SEL
-    tui_handle_key pgdn; tui_handle_key pgdn; tui_handle_key pgdn; tui_handle_key pgdn; d=$TUI_SEL
-    echo "sel=$a,$b,$c,$d"'
-  [ "$status" -eq 0 ]
-  [[ "$output" == "sel=3,0,0,9" ]]
-}
+# NOTE: PgUp/PgDn paged the menu until P4; the P5 DoD assigns them to the
+# log panel's scrollback. Their new behavior is covered in
+# tests/haven-panel.bats (page-key scroll, no-op in status mode).
 
 @test "tui_handle_key: digit shortcuts select the nth entry directly" {
   run bash -c 'source '"$REPO_ROOT"'/haven; set +e

@@ -1,14 +1,36 @@
 #!/usr/bin/env bash
 # Mock docker for the unit tests in tests/haven-engine.bats and the e2e
-# rig: a healthy daemon, an empty container list, and a logs stream that
-# emits a counter line every 200 ms and spawns a marked child process so
-# orphan checks can find it (marker sleep 21777).
+# rig: a healthy daemon, a relay container that is "up", a tor container
+# that exited, a fixed image digest, and a logs stream that emits a
+# counter line every 200 ms and spawns a marked child process so orphan
+# checks can find it (marker sleep 21777).
 case "${1:-}" in
   info)
     exit 0
     ;;
   ps)
-    exit 0
+    all=0
+    fmt="{{.Names}}"
+    for a in "${@:2}"; do
+      [[ "$a" == "-a" ]] && all=1
+      [[ "$a" == "{{.Names}}|"* ]] && fmt="$a"
+    done
+    if (( all )); then
+      if [[ "$fmt" == "{{.Names}}|{{.Status}}" ]]; then
+        printf 'haven-relay|Up 2 hours (healthy)\nhaven-tor|Exited (0) 4 minutes ago\n'
+      else
+        printf 'haven-relay\nhaven-tor\n'
+      fi
+    else
+      if [[ "$fmt" == "{{.Names}}|{{.Status}}" ]]; then
+        printf 'haven-relay|Up 2 hours (healthy)\n'
+      else
+        printf 'haven-relay\n'
+      fi
+    fi
+    ;;
+  inspect)
+    printf 'sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890\n'
     ;;
   compose)
     shift || true

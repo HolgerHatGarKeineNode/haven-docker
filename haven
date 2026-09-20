@@ -171,7 +171,6 @@ TUI_NEED_RIGHT=1
 TUI_NEED_RESIZE=0
 TUI_TOO_SMALL=0
 TUI_PASTE_ENABLED=0
-TUI_VISIBLE_ROWS=10
 # Minimum terminal geometry the frame can render into without garbling.
 TUI_MIN_COLS=66
 TUI_MIN_LINES=20
@@ -184,7 +183,14 @@ LOG_FIFO=""
 LOG_FD=""
 LOG_PID=""
 LOG_LINES=()
-LOG_MAX_LINES=0
+# Scrollback: the ring buffer keeps up to 1000 lines; the panel shows a
+# window from the end (LOG_SCROLL=0 means live tail).
+LOG_BUFFER_MAX=1000
+LOG_SCROLL=0
+LOG_FILTER=""
+TUI_RIGHT_MODE="logs"
+TUI_STATUS_TS=0
+TUI_STATUS_CACHE=()
 MENU_IDS=()
 MENU_LABELS=()
 MENU_TITLE=""
@@ -318,7 +324,6 @@ tui_update_layout() {
     RIGHT_CONTENT_HEIGHT=6
   fi
 
-  LOG_MAX_LINES=$RIGHT_CONTENT_HEIGHT
 
   # Pre-compute horizontal line strings and border for frame drawing
   printf -v _HLINE_LEFT '%*s' "$((LEFT_W - 1))" ''
@@ -467,6 +472,7 @@ tui_read_key() {
   case "$_KEY" in
     $'\n'|$'\r') _KEY="enter" ;;
     q|Q) _KEY="quit" ;;
+    $'\t') _KEY="tab" ;;
   esac
 }
 
@@ -891,7 +897,7 @@ tui_confirm() {
   local row=$((LEFT_CONTENT_ROW + 2))
 
   tui_draw_frame 1
-  tui_render_right_logs
+  tui_render_right_panel
   tui_print_left_styled "$LEFT_CONTENT_ROW" "${TUI_BOLD}${TUI_FG_ACCENT}" "$prompt"
 
   # May run inside a $() subshell with reset traps — re-arm SIGWINCH locally.
@@ -940,7 +946,7 @@ tui_message() {
   tui_update_layout
 
   tui_draw_frame 1
-  tui_render_right_logs
+  tui_render_right_panel
 
   # Bold accent title
   tui_print_left_styled "$row" "${TUI_BOLD}${TUI_FG_ACCENT}" "$title"
@@ -2176,8 +2182,39 @@ log_sanitize_line() {
 log_append() {
   local line="$1"
   LOG_LINES+=("$line")
-  if (( ${#LOG_LINES[@]} > LOG_MAX_LINES )); then
-    LOG_LINES=("${LOG_LINES[@]: -$LOG_MAX_LINES}")
+  if (( ${#LOG_LINES[@]} > LOG_BUFFER_MAX )); then
+    LOG_LINES=("${LOG_LINES[@]: -$LOG_BUFFER_MAX}")
+  fi
+}
+
+# Window onto the (possibly filtered) log buffer for the current render.
+# Sets _VIEW_LINES (array), _VIEW_IS_LIVE (1 when following the tail),
+# _VIEW_MATCHES (number of lines matching the filter). Scrolling with
+# LOG_SCROLL > 0 pins the window LOG_SCROLL lines above the live end.
+tui_log_view_lines() {
+  local count=${#LOG_LINES[@]}
+  if [[ -n "$LOG_FILTER" ]]; then
+    local -a filtered=()
+    local line
+    local low_filter="${LOG_FILTER,,}"
+    for line in "${LOG_LINES[@]}"; do
+      [[ "${line,,}" == *"$low_filter"* ]] && filtered+=("$line")
+    done
+    _VIEW_LINES=("${filtered[@]+"${filtered[@]}"}")
+  else
+    _VIEW_LINES=("${LOG_LINES[@]}")
+  fi
+  _VIEW_MATCHES=${#_VIEW_LINES[@]}
+
+  local height="$1"
+  local total=${#_VIEW_LINES[@]}
+  if (( LOG_SCROLL <= 0 || total <= height )); then
+    _VIEW_START=$((total > height ? total - height : 0))
+    _VIEW_IS_LIVE=1
+  else
+    _VIEW_START=$((total - height - LOG_SCROLL))
+    (( _VIEW_START < 0 )) && _VIEW_START=0
+    _VIEW_IS_LIVE=0
   fi
 }
 
@@ -2345,6 +2382,95 @@ tui_ensure_log_stream() {
   fi
 }
 
+tui_render_right_panel() {
+  # Mode switch: logs (default) or the status view. Tab toggles.
+  if [[ "$TUI_RIGHT_MODE" == "status" ]]; then
+    tui_render_right_status
+    return
+  fi
+  tui_render_right_logs
+}
+
+tui_render_right_status() {
+  local spinner=""
+  if [[ "$FOLLOW_LOGS" == "1" && -n "$LOG_PID" ]]; then
+    local frame_idx=$((_SPINNER_TICK % ${#SPINNER_FRAMES[@]}))
+    spinner=" ${SPINNER_FRAMES[$frame_idx]}"
+  fi
+  TUI_RIGHT_TITLE="◉ Status${spinner}"
+
+  printf '\033[2;%dH' "$((LEFT_W + 2))"
+  tui_truncate "$TUI_RIGHT_TITLE" $((TUI_COLS - LEFT_W - 3))
+  tui_pad_to "$_TRUNC" "$((TUI_COLS - LEFT_W - 2))"
+  printf "%s%b %s%b%s" \
+    "$_BORDER_V" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
+    "$_PADDED" "$CLR_RESET" "$_BORDER_V"
+
+  # Docker queries are throttled and cached (like tui_update_docker_status):
+  # du over db/ and blossom/ can take a moment on large installs, and the
+  # render path must never block on the daemon.
+  local now
+  printf -v now '%(%s)T' -1
+  if [[ -z "$TUI_STATUS_TS" || $((now - TUI_STATUS_TS)) -ge 5 ]]; then
+    tui_collect_status
+    TUI_STATUS_TS="$now"
+  fi
+
+  local row=0 idx line
+  for ((row=0; row<RIGHT_CONTENT_HEIGHT; row++)); do
+    line=""
+    if (( row < ${#TUI_STATUS_CACHE[@]} )); then
+      line="${TUI_STATUS_CACHE[$row]}"
+    fi
+    tui_truncate "$line" "$RIGHT_CONTENT_W"
+    printf '\033[%d;%dH' "$((RIGHT_CONTENT_ROW + row + 1))" "$((RIGHT_X + 1))"
+    tui_pad_to "$_TRUNC" "$RIGHT_CONTENT_W"
+    printf "%s" "$_PADDED"
+  done
+}
+
+tui_collect_status() {
+  TUI_STATUS_CACHE=()
+  if ! docker info >/dev/null 2>&1; then
+    TUI_STATUS_CACHE=("Docker: offline" "" "Tab switches back to the log view.")
+    return
+  fi
+
+  local name status state uptime digest
+  while IFS='|' read -r name status; do
+    [[ -n "$name" ]] || continue
+    state="exited"
+    uptime="-"
+    if [[ "$status" == Up* ]]; then
+      state="running"
+      uptime="${status#Up }"
+      uptime="${uptime%%(*}"
+      uptime="up ${uptime}"
+    fi
+    TUI_STATUS_CACHE+=("$name: $state ${uptime}")
+  done < <(docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null | grep -E '^haven-' || true)
+  if (( ${#TUI_STATUS_CACHE[@]} == 0 )); then
+    TUI_STATUS_CACHE+=("no haven containers")
+  fi
+
+  digest="$(docker inspect --format '{{.Image}}' haven-relay 2>/dev/null || true)"
+  if [[ "$digest" == sha256:* ]]; then
+    TUI_STATUS_CACHE+=("image: ${digest:0:22}…")
+  else
+    TUI_STATUS_CACHE+=("image: -")
+  fi
+
+  local dsize
+  for d in db blossom; do
+    if [[ -d "$ROOT_DIR/$d" ]]; then
+      dsize="$(du -sh "$ROOT_DIR/$d" 2>/dev/null | awk '{print $1}')"
+      TUI_STATUS_CACHE+=("$d/: ${dsize:--}")
+    else
+      TUI_STATUS_CACHE+=("$d/: (missing)")
+    fi
+  done
+}
+
 tui_render_right_logs() {
   # Update right title bar with spinner
   local spinner=""
@@ -2353,6 +2479,12 @@ tui_render_right_logs() {
     spinner=" ${SPINNER_FRAMES[$frame_idx]}"
   fi
   TUI_RIGHT_TITLE="☰ Logs: ${LOG_SERVICE:-all}${spinner} │ Tail: ${TAIL_COUNT}"
+  if [[ -n "$LOG_FILTER" ]]; then
+    TUI_RIGHT_TITLE="☰ Logs${spinner} │ filter '$LOG_FILTER'"
+  fi
+  if (( LOG_SCROLL > 0 )); then
+    TUI_RIGHT_TITLE="${TUI_RIGHT_TITLE} │ paused (PgDn: resume)"
+  fi
 
   # Redraw title bar row with updated right title
   printf '\033[2;%dH' "$((LEFT_W + 2))"
@@ -2362,18 +2494,31 @@ tui_render_right_logs() {
     "$_BORDER_V" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
     "$_PADDED" "$CLR_RESET" "$_BORDER_V"
 
-  local count=${#LOG_LINES[@]}
-  local start=$((count - RIGHT_CONTENT_HEIGHT))
-  if [[ "$start" -lt 0 ]]; then
-    start=0
+  tui_log_view_lines "$RIGHT_CONTENT_HEIGHT"
+  local -a view_lines=("${_VIEW_LINES[@]+"${_VIEW_LINES[@]}"}")
+  local total=${#view_lines[@]}
+  local start=$_VIEW_START
+  local count=$((total - start > RIGHT_CONTENT_HEIGHT ? RIGHT_CONTENT_HEIGHT : total - start))
+  local end=$((start + count))
+
+  # Filter hit count goes on the first content row so it stays visible
+  local hitline=""
+  if [[ -n "$LOG_FILTER" ]]; then
+    hitline="${_VIEW_MATCHES} match(es) for '$LOG_FILTER' (/ resets)"
   fi
+
   local row idx line line_color
   for ((row=0; row<RIGHT_CONTENT_HEIGHT; row++)); do
     idx=$((start + row))
     line=""
     line_color=""
-    if [[ "$idx" -lt "$count" ]]; then
-      line="${LOG_LINES[$idx]}"
+    if [[ -n "$hitline" && "$row" -eq 0 ]]; then
+      line="$hitline"
+      line_color="${TUI_DIM}${TUI_ITALIC}"
+      hitline=""
+      idx=$((idx - 1))
+    elif [[ "$idx" -lt "$end" ]]; then
+      line="${view_lines[$idx]}"
       # Colorize based on content
       if [[ "$line" == *[Ee][Rr][Rr][Oo][Rr]* || "$line" == *ERRO* || "$line" == *panic* ]]; then
         line_color="$TUI_FG_LOG_ERROR"
@@ -2382,7 +2527,7 @@ tui_render_right_logs() {
       else
         line_color="$TUI_FG_LOG_INFO"
       fi
-    elif [[ "$count" -eq 0 && "$row" -eq 0 ]]; then
+    elif [[ "$total" -eq 0 && "$row" -eq 0 ]]; then
       line="Waiting for logs..."
       line_color="${TUI_DIM}${TUI_ITALIC}"
     fi
@@ -2672,7 +2817,6 @@ tui_build_menu() {
 tui_render_left_menu() {
   local row="$LEFT_CONTENT_ROW"
   local visible_rows="$LEFT_CONTENT_HEIGHT"
-  TUI_VISIBLE_ROWS="$visible_rows"
 
   # Only rebuild menu data when needed (not on simple navigation)
   if [[ "$TUI_NEED_MENU" -eq 1 ]]; then
@@ -3146,15 +3290,42 @@ tui_handle_key() {
       TUI_SEL=$((count - 1))
       TUI_NEED_LEFT=1
       ;;
-    pgup)
-      TUI_SEL=$((TUI_SEL - TUI_VISIBLE_ROWS + 1))
-      (( TUI_SEL < 0 )) && TUI_SEL=0
-      TUI_NEED_LEFT=1
+    pgup|pgdn)
+      # Since P5 the page keys belong to the log panel's scrollback (the
+      # plan's P5 DoD assigns them there); menus page via g/G, Home/End,
+      # j/k and the digit shortcuts.
+      if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then
+        local page=$((RIGHT_CONTENT_HEIGHT > 1 ? RIGHT_CONTENT_HEIGHT - 1 : 1))
+        if [[ "$key" == "pgup" ]]; then
+          local total=${#LOG_LINES[@]}
+          local max_scroll=$((total > RIGHT_CONTENT_HEIGHT ? total - RIGHT_CONTENT_HEIGHT : 0))
+          LOG_SCROLL=$((LOG_SCROLL + page))
+          (( LOG_SCROLL > max_scroll )) && LOG_SCROLL=$max_scroll
+        else
+          LOG_SCROLL=$((LOG_SCROLL - page))
+          (( LOG_SCROLL < 0 )) && LOG_SCROLL=0
+        fi
+        TUI_NEED_RIGHT=1
+      fi
       ;;
-    pgdn)
-      TUI_SEL=$((TUI_SEL + TUI_VISIBLE_ROWS - 1))
-      (( TUI_SEL > count - 1 )) && TUI_SEL=$((count - 1))
-      TUI_NEED_LEFT=1
+    /)
+      # Live substring filter for the log panel. No default on purpose:
+      # an empty Enter must clear the filter instead of re-applying it.
+      if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then
+        local new_filter
+        new_filter="$(tui_prompt "Filter (empty clears): " "")"
+        LOG_FILTER="$new_filter"
+        LOG_SCROLL=0
+        TUI_NEED_RIGHT=1
+      fi
+      ;;
+    tab)
+      if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then
+        TUI_RIGHT_MODE="status"
+      else
+        TUI_RIGHT_MODE="logs"
+      fi
+      TUI_NEED_RIGHT=1
       ;;
     [1-9])
       if (( key >= 1 && key <= count )); then
@@ -3264,7 +3435,7 @@ tui_loop() {
     fi
 
     if [[ "$TUI_NEED_RIGHT" -eq 1 ]]; then
-      tui_render_right_logs
+      tui_render_right_panel
       TUI_NEED_RIGHT=0
     fi
 

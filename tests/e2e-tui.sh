@@ -271,10 +271,11 @@ else
   tmux -L "$SOCK" send-keys -t t8 g;    sleep 0.4; nav_case "Start (Docker)" "g"
   tmux -L "$SOCK" send-keys -t t8 End;  sleep 0.4; nav_case "Quit" "End"
   tmux -L "$SOCK" send-keys -t t8 Home; sleep 0.4; nav_case "Start (Docker)" "Home"
-  tmux -L "$SOCK" send-keys -t t8 PgDn; sleep 0.4; nav_case "Quit" "PgDn"
-  tmux -L "$SOCK" send-keys -t t8 PgUp; sleep 0.4; nav_case "Start (Docker)" "PgUp"
 fi
 tmux -L "$SOCK" kill-session -t t8 >/dev/null 2>&1 || true
+
+# NOTE: PgUp/PgDn paged the menu until P4; P5 assigns them to the log
+# scrollback — that behavior is proven in the t12 checks below.
 
 # --- 9+10: prompt editor — paste, Ctrl-U, Ctrl-W (P4) -------------------------
 # 160 cols so the 30-char paste fits the prompt's input budget.
@@ -408,6 +409,98 @@ if grep -q "^RELAY_PORT=" "$ROOT_DIR/.env" 2>/dev/null; then
 else
   ok ".env untouched by the cancelled add"
 fi
+
+# --- 12: panel QoL — scrollback, filter, status view (P5) ---------------------
+tmux_new t12 120 34 "PATH=$ROOT_DIR/tests/mock:\$PATH ./haven tui"
+if ! wait_for t12 "COUNTER="; then
+  bad "mock stream did not reach the panel for the P5 checks"
+else
+  # let the buffer fill past the visible height (34 rows -> ~28 visible)
+  wait_for t12 "COUNTER=40"
+  last_live="$(capture t12 | grep -o 'COUNTER=[0-9]*' | tail -1)"
+  tmux -L "$SOCK" send-keys -t t12 PgUp
+  sleep 0.6
+  out="$(capture t12)"
+  if [[ "$out" == *"paused"* ]]; then
+    ok "PgUp pauses the panel and shows the pause banner"
+  else
+    bad "PgUp did not show the pause banner"
+  fi
+  older="$(printf '%s\n' "$out" | grep -o 'COUNTER=[0-9]*' | tail -1)"
+  if [[ "$older" != "$last_live" ]]; then
+    ok "scrollback shows older lines ($older vs live $last_live)"
+  else
+    bad "scrollback still shows the live tail ($older)"
+  fi
+  tmux -L "$SOCK" send-keys -t t12 PgDn
+  sleep 0.6
+  if capture t12 | grep -q "paused"; then
+    bad "PgDn did not resume the live view"
+  else
+    ok "PgDn resumes the live view"
+  fi
+
+  # live filter via slash
+  tmux -L "$SOCK" send-keys -t t12 /
+  sleep 0.4
+  tmux -L "$SOCK" send-keys -t t12 -l "COUNTER=2"
+  sleep 0.4
+  tmux -L "$SOCK" send-keys -t t12 Enter
+  sleep 0.6
+  out="$(capture t12)"
+  if [[ "$out" == *"match(es) for 'COUNTER=2'"* ]]; then
+    ok "slash search shows the live match count"
+  else
+    bad "slash search missing the match count ($(printf '%s' "$out" | tr '\n' '|' | head -c 120))"
+  fi
+  if printf '%s' "$out" | grep -q "COUNTER=3"; then
+    bad "filter does not hide non-matching lines"
+  else
+    ok "filter hides non-matching lines"
+  fi
+  tmux -L "$SOCK" send-keys -t t12 /
+  sleep 0.4
+  tmux -L "$SOCK" send-keys -t t12 Enter
+  sleep 0.5
+  if capture t12 | grep -q "match(es)"; then
+    bad "empty filter did not clear the search"
+  else
+    ok "empty filter input clears the search"
+  fi
+
+  # status panel via Tab
+  tmux -L "$SOCK" send-keys -t t12 Tab
+  sleep 1.0
+  out="$(capture t12)"
+  if [[ "$out" == *"Status"* && "$out" == *"running"* ]]; then
+    ok "Tab switches to the status view (title + running container)"
+  else
+    bad "status view missing (title/running)"
+  fi
+  if [[ "$out" == *"haven-relay: running up 2 hours"* && "$out" == *"haven-tor: exited"* ]]; then
+    ok "status lists container states and uptime"
+  else
+    bad "container states missing in the status view"
+  fi
+  if [[ "$out" == *"image: sha256:abcdef123456789…"* ]]; then
+    ok "status shows the short image digest"
+  else
+    bad "image digest missing in the status view"
+  fi
+  if [[ "$out" == *"db/:"* && "$out" == *"blossom/:"* ]]; then
+    ok "status shows du -sh for db/ and blossom/"
+  else
+    bad "directory sizes missing in the status view"
+  fi
+  tmux -L "$SOCK" send-keys -t t12 Tab
+  sleep 0.6
+  if capture t12 | grep -q "COUNTER="; then
+    ok "Tab switches back to the log view"
+  else
+    bad "Tab back did not restore the log view"
+  fi
+fi
+tmux -L "$SOCK" kill-session -t t12 >/dev/null 2>&1 || true
 
 say ""
 say "e2e-tui: $PASS passed, $FAIL failed"
