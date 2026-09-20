@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Mock docker for the unit tests in tests/haven-engine.bats and the e2e
+# rig: a healthy daemon, an empty container list, and a logs stream that
+# emits a counter line every 200 ms and spawns a marked child process so
+# orphan checks can find it (marker sleep 21777).
+case "${1:-}" in
+  info)
+    exit 0
+    ;;
+  ps)
+    exit 0
+    ;;
+  compose)
+    shift || true
+    if [[ "${1:-}" == "version" ]]; then
+      exit 0
+    fi
+    # logs path (arguments ignored): marker child + counter stream
+    ( sleep 21777 ) &
+    n=0
+    while :; do
+      printf 'MOCKLOG COUNTER=%d\n' "$n"
+      n=$((n + 1))
+      sleep 0.2
+    done
+    ;;
+  *)
+    exit 0
+    ;;
+esac

@@ -399,7 +399,9 @@ tui_consume_bracketed_payload() {
 
 tui_read_key() {
   _KEY=""
-  if ! IFS= read -rsn1 -t 0.05 _KEY; then
+  # 150 ms poll: keys register within one tick (< 300 ms e2e-measured),
+  # and the idle loop burns ~3x less CPU than the old 50 ms polling.
+  if ! IFS= read -rsn1 -t 0.15 _KEY; then
     return 1
   fi
 
@@ -487,14 +489,16 @@ tui_draw_frame() {
   # Row 1: colored title bar
   printf '\033[2;1H'
   tui_truncate "$TUI_LEFT_TITLE" $((LEFT_W - 2))
-  printf "%s%b %-*s%b%s%b" \
+  tui_pad_to "$_TRUNC" "$((LEFT_W - 1))"
+  printf "%s%b %s%b%s%b" \
     "$_BORDER_V" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
-    "$((LEFT_W - 1))" "$_TRUNC" "$CLR_RESET" \
+    "$_PADDED" "$CLR_RESET" \
     "$_BORDER_V" "$CLR_RESET"
   tui_truncate "$TUI_RIGHT_TITLE" $((TUI_COLS - LEFT_W - 3))
-  printf "%b %-*s%b%s" \
+  tui_pad_to "$_TRUNC" "$((TUI_COLS - LEFT_W - 2))"
+  printf "%b %s%b%s" \
     "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
-    "$((TUI_COLS - LEFT_W - 2))" "$_TRUNC" "$CLR_RESET" \
+    "$_PADDED" "$CLR_RESET" \
     "$_BORDER_V"
 
   # Row 2: sub-separator ├───┼───┤
@@ -539,13 +543,79 @@ tui_draw_status_bar() {
     "$CLR_RESET"
 }
 
+# Display width of a string: printable-ASCII fast path, otherwise count
+# codepoints with the common double-width blocks (CJK, Hangul, fullwidth
+# forms, most emoji) as 2 columns. Combining marks count 1 — acceptable for
+# menu labels and log lines.
+tui_str_width() {
+  local s="$1"
+  local ascii_re='^[ -~]*$'
+  if [[ "$s" =~ $ascii_re ]]; then
+    _WIDTH=${#s}
+    return 0
+  fi
+  local i cp w=0 n=${#s}
+  for ((i=0; i<n; i++)); do
+    printf -v cp '%d' "'${s:i:1}"
+    if (( (cp>=0x1100 && cp<=0x115F) || (cp>=0x2E80 && cp<=0xA4CF) ||
+          (cp>=0xAC00 && cp<=0xD7A3) || (cp>=0xF900 && cp<=0xFAFF) ||
+          (cp>=0xFE30 && cp<=0xFE6F) || (cp>=0xFF00 && cp<=0xFF60) ||
+          (cp>=0xFFE0 && cp<=0xFFE6) || (cp>=0x1F300 && cp<=0x1F64F) ||
+          (cp>=0x1F900 && cp<=0x1F9FF) || (cp>=0x20000 && cp<=0x3FFFD) )); then
+      w=$((w + 2))
+    else
+      w=$((w + 1))
+    fi
+  done
+  _WIDTH=$w
+}
+
+# Truncate to a display width (not a codepoint count) so wide glyphs no
+# longer push the frame borders out of alignment; the ellipsis is included.
 tui_truncate() {
-  if (( ${#1} <= $2 )); then
-    _TRUNC="$1"
-  else
-    local cutoff=$(($2 - 3))
-    (( cutoff < 0 )) && cutoff=0
-    _TRUNC="${1:0:$cutoff}..."
+  local s="$1"
+  local limit="$2"
+  tui_str_width "$s"
+  if (( _WIDTH <= limit )); then
+    _TRUNC="$s"
+    return 0
+  fi
+  local out="" w=0 i cw n=${#s}
+  local budget=$((limit - 3))
+  if (( budget < 0 )); then
+    budget=0
+  fi
+  for ((i=0; i<n; i++)); do
+    tui_str_width "${s:i:1}"
+    cw=$_WIDTH
+    if (( w + cw > budget )); then
+      break
+    fi
+    out+="${s:i:1}"
+    w=$((w + cw))
+    if (( w >= budget )); then
+      break
+    fi
+  done
+  _TRUNC="${out}..."
+}
+
+# Pad to a display width (printf %-*s pads by codepoints and would leave
+# CJK rows short, breaking column alignment against the frame).
+tui_pad_to() {
+  local s="$1"
+  local width="$2"
+  tui_str_width "$s"
+  if (( _WIDTH > width )); then
+    tui_truncate "$s" "$width"
+    s="$_TRUNC"
+    tui_str_width "$s"
+  fi
+  local pad=$((width - _WIDTH))
+  _PADDED="$s"
+  if (( pad > 0 )); then
+    printf -v _SPACES '%*s' "$pad" ''
+    _PADDED+="${_SPACES}"
   fi
 }
 
@@ -553,16 +623,18 @@ tui_print_left() {
   local row="$1"
   shift
   local text="$*"
+  tui_pad_to "$text" "$LEFT_CONTENT_W"
   tput cup "$row" "$LEFT_X"
-  printf "%-*s" "$LEFT_CONTENT_W" "$text"
+  printf "%s" "$_PADDED"
 }
 
 tui_print_left_styled() {
   local row="$1"
   local style="$2"
   local text="$3"
+  tui_pad_to "$text" "$LEFT_CONTENT_W"
   tput cup "$row" "$LEFT_X"
-  printf "%b%-*s%b" "$style" "$LEFT_CONTENT_W" "$text" "$CLR_RESET"
+  printf "%b%s%b" "$style" "$_PADDED" "$CLR_RESET"
 }
 
 tui_print_right() {
@@ -1984,10 +2056,17 @@ log_append() {
 
 stop_log_stream() {
   if [[ -n "$LOG_PID" ]]; then
+    # Kill the whole process group when the producer runs as its own leader
+    # (setsid): docker compose spawns children that a bare kill would leave
+    # behind. Fall back to the pid itself when setsid was unavailable.
+    if [[ "${LOG_PID_SETSID:-0}" == "1" ]]; then
+      kill -- "-$LOG_PID" >/dev/null 2>&1 || true
+    fi
     kill "$LOG_PID" >/dev/null 2>&1 || true
     wait "$LOG_PID" >/dev/null 2>&1 || true
   fi
   LOG_PID=""
+  LOG_PID_SETSID=0
   if [[ -n "${LOG_FD:-}" ]]; then
     exec {LOG_FD}<&- || true
   fi
@@ -1996,6 +2075,10 @@ stop_log_stream() {
     rm -f "$LOG_FIFO"
   fi
   LOG_FIFO=""
+  if [[ -n "${LOG_FIFO_DIR:-}" ]]; then
+    rmdir "$LOG_FIFO_DIR" 2>/dev/null || true
+  fi
+  LOG_FIFO_DIR=""
 }
 
 start_log_stream() {
@@ -2024,10 +2107,21 @@ start_log_stream() {
     args+=("$LOG_SERVICE")
   fi
 
-  LOG_FIFO="$(mktemp -u)"
+  # Private directory via mktemp -d: mktemp -u + mkfifo is a TOCTOU race in
+  # a shared /tmp — someone registering the name in between wins the fifo.
+  LOG_FIFO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/haven-log.XXXXXX")"
+  LOG_FIFO="$LOG_FIFO_DIR/log.fifo"
   mkfifo "$LOG_FIFO"
   set +e
-  dc "$compose_file" "${args[@]}" >"$LOG_FIFO" 2>&1 &
+  LOG_PID_SETSID=0
+  if command -v setsid >/dev/null 2>&1; then
+    # setsid execs a binary — spell out the compose command instead of the
+    # dc() helper function, which is invisible outside the shell.
+    setsid "${DOCKER_COMPOSE[@]}" -f "$compose_file" "${args[@]}" >"$LOG_FIFO" 2>&1 &
+    LOG_PID_SETSID=1
+  else
+    dc "$compose_file" "${args[@]}" >"$LOG_FIFO" 2>&1 &
+  fi
   LOG_PID=$!
   set -e
   exec {LOG_FD}<"$LOG_FIFO"
@@ -2136,9 +2230,10 @@ tui_render_right_logs() {
   # Redraw title bar row with updated right title
   printf '\033[2;%dH' "$((LEFT_W + 2))"
   tui_truncate "$TUI_RIGHT_TITLE" $((TUI_COLS - LEFT_W - 3))
-  printf "%s%b %-*s%b%s" \
+  tui_pad_to "$_TRUNC" "$((TUI_COLS - LEFT_W - 2))"
+  printf "%s%b %s%b%s" \
     "$_BORDER_V" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
-    "$((TUI_COLS - LEFT_W - 2))" "$_TRUNC" "$CLR_RESET" "$_BORDER_V"
+    "$_PADDED" "$CLR_RESET" "$_BORDER_V"
 
   local count=${#LOG_LINES[@]}
   local start=$((count - RIGHT_CONTENT_HEIGHT))
@@ -2167,9 +2262,11 @@ tui_render_right_logs() {
     tui_truncate "$line" "$RIGHT_CONTENT_W"
     printf '\033[%d;%dH' "$((RIGHT_CONTENT_ROW + row + 1))" "$((RIGHT_X + 1))"
     if [[ -n "$line_color" ]]; then
-      printf "%b%-*s%b" "$line_color" "$RIGHT_CONTENT_W" "$_TRUNC" "$CLR_RESET"
+      tui_pad_to "$_TRUNC" "$RIGHT_CONTENT_W"
+      printf "%b%s%b" "$line_color" "$_PADDED" "$CLR_RESET"
     else
-      printf "%-*s" "$RIGHT_CONTENT_W" "$_TRUNC"
+      tui_pad_to "$_TRUNC" "$RIGHT_CONTENT_W"
+      printf "%s" "$_PADDED"
     fi
   done
 }
@@ -2496,16 +2593,20 @@ tui_render_left_menu() {
     if [[ -z "$label" ]]; then
       printf "%-*s" "$LEFT_CONTENT_W" ""
     elif [[ "$idx" -eq "$TUI_SEL" ]]; then
-      printf "%b%-*s%b" \
+      tui_pad_to "${ICO_SELECTED}${_TRUNC}" "$LEFT_CONTENT_W"
+      printf "%b%s%b" \
         "${TUI_BOLD}${TUI_FG_SELECTED}${TUI_BG_SELECTED}" \
-        "$LEFT_CONTENT_W" "${ICO_SELECTED}${_TRUNC}" "$CLR_RESET"
+        "$_PADDED" "$CLR_RESET"
     elif [[ "$menu_id" == "back" || "$menu_id" == "quit" ]]; then
-      printf "%b%-*s%b" \
-        "${TUI_FG_MENU_DIM}" "$LEFT_CONTENT_W" "${_ICON}${_TRUNC}" "$CLR_RESET"
+      tui_pad_to "$_TRUNC" "$((LEFT_CONTENT_W - icon_len))"
+      printf "%b%s%b%s%b" \
+        "${TUI_FG_MENU_DIM}" "$_ICON" \
+        "$TUI_FG_MENU_DIM" "$_PADDED" "$CLR_RESET"
     else
-      printf "%b%s%b%-*s%b" \
+      tui_pad_to "$_TRUNC" "$((LEFT_CONTENT_W - icon_len))"
+      printf "%b%s%b%s%b" \
         "${TUI_FG_ACCENT}" "$_ICON" \
-        "${TUI_FG_MENU}" "$((LEFT_CONTENT_W - icon_len))" "$_TRUNC" "$CLR_RESET"
+        "${TUI_FG_MENU}" "$_PADDED" "$CLR_RESET"
     fi
   done
 }
@@ -2967,6 +3068,8 @@ tui_loop() {
 
     _SPINNER_TICK=$((_SPINNER_TICK + 1))
     if (( _SPINNER_TICK % 4 == 0 && FOLLOW_LOGS == 1 )); then
+      # With the 150 ms poll this fires every ~600 ms; draining pulls all
+      # buffered lines per tick, so follow-logs stay visibly flowing.
       TUI_NEED_RIGHT=1
     fi
 

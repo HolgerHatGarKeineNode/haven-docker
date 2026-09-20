@@ -156,6 +156,99 @@ if [[ "$out" == *"boom-visible"* && "$out" == *"ERROR"* ]]; then
 else
   bad "die() message swallowed (got: $(printf '%s' "$out" | tr -d '\n' | head -c 120))"
 fi
+tmux -L "$SOCK" kill-session -t t4 >/dev/null 2>&1 || true
+
+# --- helpers for the P3 engine checks ---------------------------------------
+
+tui_pid() { # pid of the ./haven process inside session $1
+  local shell_pid
+  shell_pid="$(tmux -L "$SOCK" list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [[ -n "$shell_pid" ]] && pgrep -P "$shell_pid" 2>/dev/null | head -1
+}
+
+cpu_ticks() { # utime+stime of pid $1 from /proc
+  local stat
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  awk '{print $14+$15}' <<<"${stat#*) }"
+}
+
+# --- 5: idle CPU — 150 ms poll vs the 50 ms baseline -------------------------
+measure_idle_cpu() { # <session> — echoes ticks over a 5 s idle window
+  local pid t0 t1
+  sleep 1.5
+  pid="$(tui_pid "$1")"
+  [[ -n "$pid" ]] || { echo ""; return 1; }
+  t0="$(cpu_ticks "$pid")"
+  sleep 5
+  t1="$(cpu_ticks "$pid")"
+  echo "$((t1 - t0))"
+}
+
+mkdir -p "$WORK/old"
+git -C "$ROOT_DIR" show 753dab5:haven > "$WORK/old/haven" 2>/dev/null
+chmod +x "$WORK/old/haven"
+tmux_new t5a 100 30 "PATH=$ROOT_DIR/tests/mock:\$PATH $WORK/old/haven tui"
+wait_for t5a "Haven" || true
+ticks_old="$(measure_idle_cpu t5a)"
+tmux -L "$SOCK" kill-session -t t5a >/dev/null 2>&1 || true
+
+tmux_new t5b 100 30 "PATH=$ROOT_DIR/tests/mock:\$PATH ./haven tui"
+wait_for t5b "Haven" || true
+ticks_new="$(measure_idle_cpu t5b)"
+tmux -L "$SOCK" kill-session -t t5b >/dev/null 2>&1 || true
+
+if [[ -n "${ticks_old:-}" && -n "${ticks_new:-}" ]]; then
+  if (( ticks_new * 2 <= ticks_old )); then
+    ok "idle CPU at 150 ms poll is at least half of the 50 ms baseline (${ticks_new} vs ${ticks_old} ticks/5s)"
+  else
+    bad "idle CPU not reduced enough: ${ticks_new} vs ${ticks_old} ticks/5s"
+  fi
+else
+  bad "CPU measurement failed (old=${ticks_old:-none} new=${ticks_new:-none})"
+fi
+
+# --- 6: key latency below 300 ms ---------------------------------------------
+tmux_new t6 100 30 "PATH=$ROOT_DIR/tests/mock:\$PATH ./haven tui"
+wait_for t6 "Dashboard" || bad "TUI did not start for the latency check"
+lat_ms=""
+if capture t6 | grep -q "▸ Start (Docker)"; then
+  t0_ns="$(date +%s%N)"
+  tmux -L "$SOCK" send-keys -t t6 Down
+  for _ in $(seq 1 100); do
+    if capture t6 | grep -q "▸ Start (Tor)"; then
+      t1_ns="$(date +%s%N)"
+      lat_ms=$(( (t1_ns - t0_ns) / 1000000 ))
+      break
+    fi
+    sleep 0.015
+  done
+fi
+if [[ -n "$lat_ms" && "$lat_ms" -lt 300 ]]; then
+  ok "key latency ${lat_ms} ms < 300 ms"
+else
+  bad "key latency measured ${lat_ms:-timeout} ms"
+fi
+tmux -L "$SOCK" kill-session -t t6 >/dev/null 2>&1 || true
+
+# --- 7: producer death — panel refreshes within 2 s --------------------------
+tmux_new t7 100 30 "PATH=$ROOT_DIR/tests/mock:\$PATH ./haven tui"
+if ! wait_for t7 "COUNTER="; then
+  bad "mock log stream did not reach the panel"
+else
+  mock_pid="$(pgrep -f "tests/mock/docker compose" | head -1)"
+  if [[ -z "$mock_pid" ]]; then
+    bad "no mock producer process found to kill"
+  else
+    kill "$mock_pid" 2>/dev/null
+    sleep 2
+    if capture t7 | grep -q "COUNTER=0"; then
+      ok "panel restarted the stream within 2 s (fresh COUNTER=0 visible)"
+    else
+      bad "panel did not refresh after producer death ($(capture t7 | grep -c COUNTER) counter lines)"
+    fi
+  fi
+fi
+tmux -L "$SOCK" kill-session -t t7 >/dev/null 2>&1 || true
 
 say ""
 say "e2e-tui: $PASS passed, $FAIL failed"
