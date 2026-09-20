@@ -3066,6 +3066,9 @@ main() {
   esac
 }
 
-if [[ "${HAVEN_SOURCED:-0}" != "1" ]]; then
+# Runs only when executed directly (./haven ...), not when sourced by the
+# unit tests in tests/ — no environment variable that could leak into a
+# user shell and silently disable main().
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi
