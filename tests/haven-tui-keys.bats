@@ -53,6 +53,24 @@
   [[ "$output" == "k=unknown" ]]
 }
 
+@test "tui_read_key: Insert (ESC[2~) maps to unknown, never into the paste path" {
+  run bash -c 'source haven; set +e; printf "\033[2~" | { tui_read_key; echo "k=$_KEY"; }'
+  [ "$status" -eq 0 ]
+  [[ "$output" == "k=unknown" ]]
+}
+
+@test "tui_read_key: 3-char sequence PgUp survives the finalizer collection" {
+  run bash -c 'source haven; set +e; printf "\033[5~X" | { tui_read_key; echo "k=$_KEY"; }'
+  [ "$status" -eq 0 ]
+  [[ "$output" == "k=pgup" ]]
+}
+
+@test "tui_read_key: rxvt Home variant (ESC[7~) maps to home" {
+  run bash -c 'source haven; set +e; printf "\033[7~" | { tui_read_key; echo "k=$_KEY"; }'
+  [ "$status" -eq 0 ]
+  [[ "$output" == "k=home" ]]
+}
+
 # ---------- tui_read_key: bracketed paste ----------
 
 @test "tui_read_key: bracketed paste yields the paste key and swallows the payload" {

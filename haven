@@ -383,18 +383,15 @@ tui_cleanup() {
   TUI_ACTIVE=0
 }
 
-# Consume the remainder of a bracketed-paste block after ESC [ 2 was seen:
-# the rest of the opening marker ("00~"), then the payload up to the closing
-# ESC [ 2 0 1 ~. The payload is dropped — P4 may turn it into real input.
-tui_consume_bracketed_paste() {
+# Consume the payload of a bracketed-paste block after the opening
+# ESC[200~ marker, up to the closing ESC[201~. The payload is dropped —
+# P4 may turn it into real input.
+tui_consume_bracketed_payload() {
   local ch=""
   local closer=""
-  IFS= read -rsn1 -t 0.1 ch || true
-  IFS= read -rsn1 -t 0.1 ch || true
-  IFS= read -rsn1 -t 0.1 ch || true
   while IFS= read -rsn1 -t 1 ch; do
     [[ "$ch" == $'\x1b' ]] || continue
-    IFS= read -rsn5 -t 0.05 closer || closer=""
+    IFS= read -rsn5 -t 0.05 closer || true
     [[ "$closer" == "[201~" ]] && return 0
   done
   return 0
@@ -412,13 +409,28 @@ tui_read_key() {
   fi
 
   if [[ "$_KEY" == $'\x1b' ]]; then
+    # Collect the bytes after ESC up to a finalizer (letter, '~', '$'), so
+    # sequences of any length decode. Byte-wise reads with 10 ms timeouts:
+    # a bare ESC press costs one timeout and still maps to esc, and the
+    # collected bytes are never discarded on timeout.
     local seq=""
-    IFS= read -rsn2 -t 0.01 seq || seq=""
+    local ch=""
+    local i
+    for i in 1 2 3 4 5; do
+      IFS= read -rsn1 -t 0.01 ch || break
+      seq+="$ch"
+      # 'O' as the first byte after ESC is the SS3 introducer (F-keys,
+      # arrow keys on some terminals), not a finalizer — read one more.
+      if [[ "$i" == 1 && "$ch" == "O" ]]; then
+        continue
+      fi
+      [[ "$ch" =~ [a-zA-Z~$] ]] && break
+    done
     case "$seq" in
-      "[A") _KEY="up" ;;
-      "[B") _KEY="down" ;;
-      "[C") _KEY="right" ;;
-      "[D") _KEY="left" ;;
+      "[A"|"OA") _KEY="up" ;;
+      "[B"|"OB") _KEY="down" ;;
+      "[C"|"OC") _KEY="right" ;;
+      "[D"|"OD") _KEY="left" ;;
       "[H"|"OH"|"[7~") _KEY="home" ;;
       "[F"|"OF"|"[8~") _KEY="end" ;;
       "[5~") _KEY="pgup" ;;
@@ -426,14 +438,14 @@ tui_read_key() {
       "[3~"|"[3$") _KEY="del" ;;
       "OP"|"[11~"|"[[A") _KEY="f1" ;;
       "OQ"|"[12~"|"[[B") _KEY="f2" ;;
+      "[200~")
+        # Bracketed paste — payload is discarded.
+        tui_consume_bracketed_payload
+        _KEY="paste"
+        ;;
       "")
         # Nothing followed within the sequence timeout: a bare ESC press.
         _KEY="esc"
-        ;;
-      "[2"*)
-        # Bracketed paste (ESC[200~ ... ESC[201~) — payload is discarded.
-        tui_consume_bracketed_paste
-        _KEY="paste"
         ;;
       *)
         # Recognized as an escape sequence but not bound: swallow instead of
