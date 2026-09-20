@@ -1,5 +1,79 @@
 # Changelog
 
+## Unreleased
+
+Hardening and quality-of-life pass over the `./haven` TUI, in six steps.
+
+### Added
+
+- Keyboard navigation: `j`/`k`, `g`/`G`, `Home`/`End` and digit shortcuts
+  `1`–`9` for the menus; `Tab` switches the right panel between the log
+  view and a status view (container running/exited with uptime, relay
+  image digest, `du -sh` of `db/` and `blossom/`, refreshed at most every
+  5 s)
+- Log panel scrollback: a 1000-line ring buffer browsed with `PgUp`/`PgDn`;
+  a `paused` banner marks the scroll position while new lines keep
+  buffering, and `/` filters the panel live (case-insensitive substring,
+  match count in the title row, empty Enter clears)
+- A real input editor in prompts: cursor movement, `Ctrl-A`/`Ctrl-E`,
+  `Backspace`/`Delete`, `Ctrl-U`, `Ctrl-W`, and paste inserts at the cursor
+  instead of cancelling; bracketed paste is enabled for terminals that
+  support it
+- Inline validation at the prompt: invalid values (bad port, wrong npub
+  format, …) show the exact error under the input line and keep editing —
+  the view only changes on valid input or cancel
+- Values of `.env` keys containing `SECRET`, `PASSWORD`, `TOKEN` or `KEY`
+  are masked in the editor list (`…1234`) and only shown via an explicit
+  *Reveal value* entry (display-only; the file itself stays plaintext)
+- An *About* screen with the distributed CLI version (image tag from the
+  compose file) and the running relay image digest
+- Timestamped backups: every `.env`/JSON write first copies the file to
+  `<file>.bak.<YYYYmmddHHMMSS>` (10 most recent kept); see the README for
+  the restore path
+- A test harness: 67 unit tests (bats) and a tmux-driven e2e rig with 35
+  checks (terminal I/O, resize, too-small terminals, paste, navigation,
+  masking, scrollback, filter, status view), plus a docker mock so the
+  log-streaming tests run without a daemon — all local, no CI
+
+### Fixed
+
+- `WOT_REFRESH_INTERVAL` values like `24h` were rejected while a bare,
+  invalid-for-Go `24` passed: the earlier `*_INTERVAL` catch-all shadowed
+  the dedicated duration branch (dead code); the dedicated branches now
+  precede the catch-all
+- One-line message bodies never rendered — `tui_message` dropped the last
+  line of every message because the folded text was piped without a
+  trailing newline (`read` hit EOF before yielding it)
+- Pasting into the main menu quit the TUI: unknown escape sequences fell
+  through to `esc`, which navigates back (quits from the main view); the
+  key decoder now swallows unbound sequences and decodes
+  Home/End/PgUp/PgDn/Delete/F1/F2 including SS3 and rxvt variants
+- Terminal minimum: below 66×20 the TUI refuses to start before touching
+  `stty` or the alternate screen, with a clear message; shrinking during
+  runtime shows a placeholder instead of a garbled frame
+- Resizes while a prompt or dialog was open drew into rows that no longer
+  existed — prompts run in `$()` subshells that reset traps, so the
+  SIGWINCH trap is re-armed locally and the prompt redraws at the new
+  geometry
+- Errors now stay visible after a TUI exit: `die` restores the terminal
+  before printing instead of dying with the alternate screen buffer
+- The log fifo raced in a shared `/tmp` (`mktemp -u` + `mkfifo`); it now
+  lives in a private `mktemp -d` directory, the producer is killed via its
+  process group (no orphaned `docker logs` children), and a dead producer
+  restarts the stream within ~1 s
+- Wide glyphs (CJK, Hangul, fullwidth forms, most emoji) shifted the frame
+  borders out of alignment: truncation and padding now count display
+  width, with an ASCII fast path
+- `./haven` now refuses bash < 4.2 with a clear message (`printf
+  %(%s)T` needs 4.2); `help` stays reachable on old shells
+
+### Changed
+
+- The main loop polls every 150 ms instead of 50 ms: keys register within
+  one tick (23 ms measured), idle CPU drops to a third of the old load
+- `shellcheck -S warning` runs clean over `haven`, `haven-guard.sh` and
+  the test scripts
+
 ## v1.2.2-4
 
 Upstream Haven is unchanged (`v1.2.2`); the image is rebuilt because `/app/haven`

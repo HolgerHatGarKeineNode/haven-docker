@@ -128,6 +128,7 @@ ICO_ONION="◎"
 ICO_IMPORT="↓"
 ICO_UPGRADE="↑"
 ICO_HELP="?"
+ICO_INFO="◇"
 ICO_QUIT="×"
 ICO_BACK="←"
 ICO_ADD="+"
@@ -1116,6 +1117,26 @@ read_env_var() {
   ' "$env_file"
 }
 
+# Timestamped backup before every config write, keeping the 10 most
+# recent (restore: cp <file>.bak.<timestamp> <file>, see README).
+backup_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local ts
+  printf -v ts '%(%Y%m%d%H%M%S)T' -1
+  cp -p "$file" "$file.bak.$ts" 2>/dev/null || return 0
+  local -a backups=()
+  local b
+  while IFS= read -r b; do
+    [[ -n "$b" ]] && backups+=("$b")
+  done < <(ls -1 "$file".bak.* 2>/dev/null | sort)
+  if (( ${#backups[@]} > 10 )); then
+    for ((i=0; i < ${#backups[@]} - 10; i++)); do
+      rm -f "${backups[$i]}"
+    done
+  fi
+}
+
 set_env_var() {
   local key="$1"
   local value="$2"
@@ -1125,7 +1146,7 @@ set_env_var() {
   if [[ ! -f "$env_file" ]]; then
     touch "$env_file"
   else
-    cp "$env_file" "$env_file.bak"
+    backup_file "$env_file"
   fi
 
   awk -v key="$key" -v value="$value" '
@@ -1571,7 +1592,7 @@ remove_env_var() {
   local env_file="$ROOT_DIR/.env"
   local tmp_file="$env_file.tmp"
   [[ -f "$env_file" ]] || return 1
-  cp "$env_file" "$env_file.bak"
+  backup_file "$env_file"
   awk -v key="$key" '
     $0 ~ "^[ \t]*export[ \t]+" key "=" { next }
     $0 ~ "^" key "=" { next }
@@ -1671,7 +1692,7 @@ upgrade_env_file() {
     return 0
   fi
 
-  cp "$env_file" "$env_file.bak"
+  backup_file "$env_file"
 
   awk '
     function extract_key(line,    tmp, ep, kp) {
@@ -1784,6 +1805,7 @@ PY
 json_write_tmp() {
   local path="$1"
   local tmp="$path.tmp"
+  backup_file "$path"
   cat > "$tmp"
   mv "$tmp" "$path"
 }
@@ -2642,6 +2664,7 @@ tui_menu_icon() {
     import)       _ICON="$ICO_IMPORT " ;;
     env_upgrade)  _ICON="$ICO_UPGRADE " ;;
     help)         _ICON="$ICO_HELP " ;;
+    about)        _ICON="$ICO_INFO " ;;
     quit)         _ICON="$ICO_QUIT " ;;
     back)         _ICON="$ICO_BACK " ;;
     add)          _ICON="$ICO_ADD " ;;
@@ -2711,8 +2734,8 @@ tui_build_menu() {
       TUI_LEFT_TITLE="⚡ Haven Dashboard"
       MENU_TITLE="Haven"
       MENU_SUBTITLE="$docker_icon Docker: $docker_status │ Mode: $mode"
-      MENU_IDS=(start_plain start_tor stop restart env json env_upgrade onion import help quit)
-      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" ".env Editor" "JSON Editor" "Upgrade .env" "Show Onion Host" "Import notes" "Help" "Quit")
+      MENU_IDS=(start_plain start_tor stop restart env json env_upgrade onion import help about quit)
+      MENU_LABELS=("Start (Docker)" "Start (Tor)" "Stop services" "Restart services" ".env Editor" "JSON Editor" "Upgrade .env" "Show Onion Host" "Import notes" "Help" "About" "Quit")
       ;;
     logs)
       TUI_LEFT_TITLE="⚡ Haven ─ Logs"
@@ -2946,6 +2969,30 @@ tui_run_action() {
   fi
 }
 
+# About screen: the distributed version (image tag from the compose file)
+# plus the running relay image digest, best effort without the daemon.
+tui_about() {
+  local version="-"
+  local compose_file="$ROOT_DIR/docker-compose.yml"
+  if [[ -f "$compose_file" ]]; then
+    version="$(grep -m1 'image:.*haven-docker' "$compose_file" | sed -E 's/.*haven-docker:([^[:space:]]+).*/\1/')"
+    [[ -n "$version" ]] || version="-"
+  fi
+  local digest="-"
+  if docker info >/dev/null 2>&1; then
+    digest="$(docker inspect --format '{{.Image}}' haven-relay 2>/dev/null || true)"
+    if [[ "$digest" == sha256:* ]]; then
+      digest="${digest:0:22}…"
+    else
+      digest="-"
+    fi
+  fi
+  tui_message "About" "haven-docker CLI version: $version
+Relay image digest: $digest
+Upstream: Haven — a High Availability Vault for Events on Nostr.
+Backups: every .env/JSON edit writes a timestamped .bak.<ts> next to the file (10 most recent are kept)."
+}
+
 tui_handle_enter() {
   local id="${MENU_IDS[$TUI_SEL]}"
 
@@ -3075,6 +3122,9 @@ $(cat "$onion_torrc")"
           ;;
         help)
           show_help_screen
+          ;;
+        about)
+          tui_about
           ;;
         quit)
           return 1

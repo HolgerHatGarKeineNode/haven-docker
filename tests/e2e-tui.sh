@@ -502,6 +502,93 @@ else
 fi
 tmux -L "$SOCK" kill-session -t t12 >/dev/null 2>&1 || true
 
+# --- 13: P6 — about screen, timestamped backup on write, docs ---------------
+# only the backups this check created get removed afterwards
+ENV_BAK_BEFORE="$(ls -1 "$ROOT_DIR"/.env.bak.* 2>/dev/null || true)"
+tmux_new t13 120 30 "PATH=$ROOT_DIR/tests/mock:\$PATH ./haven tui"
+if ! wait_for t13 "Dashboard"; then
+  bad "TUI did not start for the P6 checks"
+else
+  # About sits right before Quit: End -> Quit, k -> About, Enter
+  tmux -L "$SOCK" send-keys -t t13 End
+  sleep 0.4
+  tmux -L "$SOCK" send-keys -t t13 k
+  sleep 0.4
+  tmux -L "$SOCK" send-keys -t t13 Enter
+  sleep 0.8
+  out="$(capture t13)"
+  if [[ "$out" == *"haven-docker CLI version:"* ]]; then
+    ok "about screen shows the CLI version"
+  else
+    bad "about screen missing the CLI version"
+  fi
+  if [[ "$out" == *"Relay image digest:"* && "$out" == *"sha256:abcdef123456789…"* ]]; then
+    ok "about screen shows the running image digest"
+  else
+    bad "about screen missing the image digest ($(printf '%s' "$out" | grep -o 'digest.*' | head -c 60))"
+  fi
+  tmux -L "$SOCK" send-keys -t t13 x
+  sleep 0.3
+
+  # A real .env write must leave a timestamped backup next to the file
+  tmux -L "$SOCK" send-keys -t t13 5
+  sleep 0.3
+  tmux -L "$SOCK" send-keys -t t13 Enter
+  wait_for t13 "Add variable"
+  sleep 0.2
+  tmux -L "$SOCK" send-keys -t t13 1
+  sleep 0.3
+  tmux -L "$SOCK" send-keys -t t13 Enter
+  wait_for t13 "New key"
+  sleep 0.2
+  tmux -L "$SOCK" send-keys -t t13 -l "E2E_TEST_KEY"
+  sleep 0.3
+  tmux -L "$SOCK" send-keys -t t13 Enter
+  wait_for t13 "New value"
+  sleep 0.2
+  tmux -L "$SOCK" send-keys -t t13 -l "42"
+  sleep 0.3
+  tmux -L "$SOCK" send-keys -t t13 Enter
+  sleep 1.0
+  new_backup=0
+  while IFS= read -r b; do
+    [[ -e "$b" ]] || continue
+    if [[ -z "$ENV_BAK_BEFORE" || "$ENV_BAK_BEFORE" != *"$b"* ]]; then
+      new_backup=1
+    fi
+  done < <(find "$ROOT_DIR" -maxdepth 1 -name '.env.bak.*' 2>/dev/null)
+  if [[ "$new_backup" == "1" ]] && grep -q "^E2E_TEST_KEY=42$" "$ROOT_DIR/.env"; then
+    ok "env write leaves a timestamped backup and the new value"
+  else
+    bad "env write missing backup or value (new_backup=$new_backup, value=$(grep -c E2E_TEST_KEY "$ROOT_DIR/.env" 2>/dev/null))"
+  fi
+fi
+tmux -L "$SOCK" kill-session -t t13 >/dev/null 2>&1 || true
+# drop the e2e key again and only the backups this check produced
+if grep -q "^E2E_TEST_KEY=" "$ROOT_DIR/.env" 2>/dev/null; then
+  # grep -v exits 1 when nothing is left — do not chain the mv on it
+  grep -v "^E2E_TEST_KEY=" "$ROOT_DIR/.env" > "$ROOT_DIR/.env.tmp"
+  mv "$ROOT_DIR/.env.tmp" "$ROOT_DIR/.env"
+fi
+while IFS= read -r b; do
+  [[ -e "$b" ]] || continue
+  if [[ -z "$ENV_BAK_BEFORE" || "$ENV_BAK_BEFORE" != *"$b"* ]]; then
+    rm -f "$b"
+  fi
+done < <(find "$ROOT_DIR" -maxdepth 1 -name '.env.bak.*' 2>/dev/null)
+
+# docs must mention the new keys and the restore path
+if grep -q "Keyboard reference" "$ROOT_DIR/README.md" && grep -q "Backups and restore" "$ROOT_DIR/README.md"; then
+  ok "README covers keyboard reference and backup restore"
+else
+  bad "README sections missing"
+fi
+if grep -q "## Unreleased" "$ROOT_DIR/CHANGELOG.md"; then
+  ok "CHANGELOG has an Unreleased section for this pass"
+else
+  bad "CHANGELOG entry missing"
+fi
+
 say ""
 say "e2e-tui: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

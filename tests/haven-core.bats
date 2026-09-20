@@ -147,10 +147,49 @@ teardown() {
   [[ "$output" == *"A=1 RELAY=new B=2"* ]]
 }
 
-@test "set_env_var creates a .bak backup before modifying an existing .env" {
-  run bash -c 'source haven; set +e; ROOT_DIR="$(mktemp -d)"; printf "K=v\n" > "$ROOT_DIR/.env"; set_env_var K w; test -f "$ROOT_DIR/.env.bak" && echo backup-ok; rm -rf "$ROOT_DIR"'
+@test "set_env_var creates a timestamped .bak backup before modifying an existing .env" {
+  run bash -c 'source haven; set +e; ROOT_DIR="$(mktemp -d)"; printf "K=v\n" > "$ROOT_DIR/.env"; set_env_var K w; ls -1A "$ROOT_DIR" | grep -c "^\.env\.bak\.[0-9]\{14\}$"; rm -rf "$ROOT_DIR"'
   [ "$status" -eq 0 ]
-  [[ "$output" == *"backup-ok"* ]]
+  [[ "$output" == "1" ]]
+}
+
+@test "backup_file: keeps only the 10 most recent backups" {
+  run bash -c '
+    source haven
+    set +e
+    ROOT_DIR="$(mktemp -d)"
+    f="$ROOT_DIR/x.conf"
+    printf "v0\n" > "$f"
+    # twelve pre-dated backups, sortable by name
+    for ((i=1; i<=12; i++)); do
+      cp "$f" "$(printf "%s.bak.20260101%02d0000" "$f" "$i")"
+    done
+    backup_file "$f"
+    n=$(ls -1 "$f".bak.* 2>/dev/null | wc -l)
+    rm -rf "$ROOT_DIR"
+    echo "backups=$n"
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "backups=10"* ]]
+}
+
+@test "json_write_tmp backs up the json file before replacing it" {
+  run bash -c '
+    source haven
+    set +e
+    ROOT_DIR="$(mktemp -d)"
+    f="$ROOT_DIR/list.json"
+    printf "[]\n" > "$f"
+    printf "[\"a\"]\n" | json_write_tmp "$f"
+    found=$(ls -1 "$f".bak.* 2>/dev/null | wc -l)
+    content=$(cat "$f")
+    rm -rf "$ROOT_DIR"
+    echo "backups=$found"
+    echo "content=$content"
+  '
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" == "backups=1" ]]
+  [[ "${lines[1]}" == 'content=["a"]' ]]
 }
 
 @test "read_env_var strips inline comments and quotes" {

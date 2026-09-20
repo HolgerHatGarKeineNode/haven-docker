@@ -249,6 +249,50 @@ that upstream Haven ships inside the image and names any variable the relay
 supports but your `.env` leaves unset — it then runs on its built-in default.
 `./haven env-upgrade` adds the ones this repo documents.
 
+## Keyboard reference
+
+The interactive TUI (`./haven` without arguments) understands:
+
+| Key | Action |
+|---|---|
+| `↑` `↓` or `k` `j` | Move the menu selection |
+| `g` / `G`, `Home` / `End` | Jump to the first / last menu entry |
+| `1`–`9` | Select the nth menu entry directly (Enter opens it) |
+| `Enter` | Open the selected entry |
+| `←` / `Esc` | Go back one view |
+| `q` | Back one view; from the main view, quit |
+| `Tab` | Switch the right panel between the log view and the status view |
+| `PgUp` / `PgDn` | Scroll the log panel backwards / forwards; a `paused` banner marks the scroll position and new lines keep buffering |
+| `/` | Live filter for the log panel (case-insensitive substring) — the match count shows on the first panel row, an empty Enter clears the filter |
+
+Inside an input prompt:
+
+| Key | Action |
+|---|---|
+| `←` / `→` | Move the cursor within the input |
+| `Ctrl-A` / `Ctrl-E` | Jump to the start / end of the input |
+| `Backspace` / `Delete` | Delete before / after the cursor |
+| `Ctrl-U` | Clear the input |
+| `Ctrl-W` | Delete the word before the cursor |
+| Paste | Pasted text inserts at the cursor position |
+| `Enter` | Accept; invalid values show an inline error and keep editing |
+| `Esc` / `Ctrl-C` | Cancel with the previous value |
+
+## Backups and restore
+
+Every write to `.env` or the JSON lists (add, edit, remove, clear,
+`env-upgrade`) first copies the file to a timestamped backup next to it —
+`.env.bak.20260920153000` — and keeps the 10 most recent backups. To undo
+a change, copy the newest backup back:
+
+```bash
+ls -1t .env.bak.* | head -1     # find the newest backup
+cp .env.bak.20260920153000 .env # restore it
+```
+
+The relay picks the restored values up on the next restart
+(`./haven restart`).
+
 ## Acknowledgements
 
 Haven is built and maintained by [barrydeen](https://github.com/barrydeen) and its [contributors](https://github.com/barrydeen/haven/graphs/contributors). Thanks to everyone who makes this project possible.
