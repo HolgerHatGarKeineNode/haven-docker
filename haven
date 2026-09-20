@@ -169,6 +169,11 @@ TUI_NEED_FRAME=1
 TUI_NEED_LEFT=1
 TUI_NEED_RIGHT=1
 TUI_NEED_RESIZE=0
+TUI_TOO_SMALL=0
+TUI_PASTE_ENABLED=0
+# Minimum terminal geometry the frame can render into without garbling.
+TUI_MIN_COLS=66
+TUI_MIN_LINES=20
 TUI_LEFT_TITLE="Haven Dashboard"
 TUI_RIGHT_TITLE="Logs"
 _SPINNER_TICK=0
@@ -273,6 +278,12 @@ tui_update_layout() {
   TUI_COLS="$(tput cols 2>/dev/null || echo 80)"
   TUI_LINES="$(tput lines 2>/dev/null || echo 24)"
 
+  if (( TUI_COLS < TUI_MIN_COLS || TUI_LINES < TUI_MIN_LINES )); then
+    TUI_TOO_SMALL=1
+  else
+    TUI_TOO_SMALL=0
+  fi
+
   LEFT_W=$((TUI_COLS * 38 / 100))
   if [[ "$LEFT_W" -lt 28 ]]; then
     LEFT_W=28
@@ -318,6 +329,31 @@ tui_update_layout() {
   printf -v _BORDER_V '%b%s%b' "$TUI_FG_SEPARATOR" "$BOX_V" "$CLR_RESET"
 }
 
+tui_supports_bracketed_paste() {
+  case "${TERM:-}" in
+    xterm*|screen*|tmux*|rxvt*|st-*|st|alacritty*|kitty*|wezterm*|foot*|contour*|mlterm*|mintty*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+tui_enable_bracketed_paste() {
+  if [[ "$TUI_PASTE_ENABLED" != "1" ]] && tui_supports_bracketed_paste; then
+    printf '\033[?2004h' >/dev/tty 2>/dev/null || true
+    TUI_PASTE_ENABLED=1
+  fi
+}
+
+tui_disable_bracketed_paste() {
+  if [[ "$TUI_PASTE_ENABLED" == "1" ]]; then
+    printf '\033[?2004l' >/dev/tty 2>/dev/null || true
+    TUI_PASTE_ENABLED=0
+  fi
+}
+
 tui_init() {
   export LC_CTYPE="${LC_CTYPE:-en_US.UTF-8}"
   TUI_ACTIVE=1
@@ -325,19 +361,43 @@ tui_init() {
   stty -echo -icanon time 0 min 0
   tput smcup
   tput civis
+  tui_enable_bracketed_paste
   tui_update_layout
   trap 'tui_cleanup' EXIT
   trap 'tui_cleanup; exit 130' INT TERM
 }
 
 tui_cleanup() {
+  # Idempotent: die() may run cleanup, then the EXIT trap runs it again.
+  if [[ "${TUI_ACTIVE:-0}" != "1" ]]; then
+    return 0
+  fi
   stop_log_stream || true
+  tui_disable_bracketed_paste
   if [[ -n "$TUI_STTY_ORIG" ]]; then
     stty "$TUI_STTY_ORIG"
+    TUI_STTY_ORIG=""
   fi
   tput cnorm 2>/dev/null || true
   tput rmcup 2>/dev/null || true
   TUI_ACTIVE=0
+}
+
+# Consume the remainder of a bracketed-paste block after ESC [ 2 was seen:
+# the rest of the opening marker ("00~"), then the payload up to the closing
+# ESC [ 2 0 1 ~. The payload is dropped — P4 may turn it into real input.
+tui_consume_bracketed_paste() {
+  local ch=""
+  local closer=""
+  IFS= read -rsn1 -t 0.1 ch || true
+  IFS= read -rsn1 -t 0.1 ch || true
+  IFS= read -rsn1 -t 0.1 ch || true
+  while IFS= read -rsn1 -t 1 ch; do
+    [[ "$ch" == $'\x1b' ]] || continue
+    IFS= read -rsn5 -t 0.05 closer || closer=""
+    [[ "$closer" == "[201~" ]] && return 0
+  done
+  return 0
 }
 
 tui_read_key() {
@@ -359,7 +419,27 @@ tui_read_key() {
       "[B") _KEY="down" ;;
       "[C") _KEY="right" ;;
       "[D") _KEY="left" ;;
-      *) _KEY="esc" ;;
+      "[H"|"OH"|"[7~") _KEY="home" ;;
+      "[F"|"OF"|"[8~") _KEY="end" ;;
+      "[5~") _KEY="pgup" ;;
+      "[6~") _KEY="pgdn" ;;
+      "[3~"|"[3$") _KEY="del" ;;
+      "OP"|"[11~"|"[[A") _KEY="f1" ;;
+      "OQ"|"[12~"|"[[B") _KEY="f2" ;;
+      "")
+        # Nothing followed within the sequence timeout: a bare ESC press.
+        _KEY="esc"
+        ;;
+      "[2"*)
+        # Bracketed paste (ESC[200~ ... ESC[201~) — payload is discarded.
+        tui_consume_bracketed_paste
+        _KEY="paste"
+        ;;
+      *)
+        # Recognized as an escape sequence but not bound: swallow instead of
+        # falling through to esc, which would navigate back a view.
+        _KEY="unknown"
+        ;;
     esac
     return 0
   fi
@@ -491,8 +571,11 @@ tui_prompt() {
   local default="$2"
   local input=""
   local ch=""
-  local prompt_row=$((TUI_LINES - 3))
   local prompt_len=${#prompt}
+
+  # Refresh the geometry: prompts may open after the frame was last laid out.
+  tui_update_layout
+  local prompt_row=$((TUI_LINES - 3))
   local max_input=$((LEFT_CONTENT_W - prompt_len - 2))
   (( max_input < 10 )) && max_input=10
 
@@ -509,7 +592,28 @@ tui_prompt() {
     tput cnorm
   } >/dev/tty
 
+  # tui_prompt usually runs inside a $() subshell, which resets inherited
+  # traps — re-arm SIGWINCH locally so a resize during input still redraws.
+  trap 'TUI_NEED_RESIZE=1' SIGWINCH
+
   while true; do
+    # A resize while the prompt is open must redraw the prompt line at the
+    # new geometry instead of printing into rows that no longer exist.
+    if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
+      TUI_NEED_RESIZE=0
+      tui_update_layout
+      prompt_row=$((TUI_LINES - 3))
+      max_input=$((LEFT_CONTENT_W - prompt_len - 2))
+      (( max_input < 10 )) && max_input=10
+      {
+        tput cup "$prompt_row" "$LEFT_X"
+        printf "%-*s" "$LEFT_CONTENT_W" ""
+        tput cup "$prompt_row" "$LEFT_X"
+        printf "%b%s%b " "${TUI_FG_ACCENT}" "$prompt" "$CLR_RESET"
+        printf "%s" "$input"
+      } >/dev/tty
+    fi
+
     IFS= read -rsn1 -t 0.1 ch </dev/tty || continue
 
     # ESC → cancel
@@ -570,13 +674,24 @@ tui_confirm() {
 
   local yes_label="  Yes  "
   local no_label="  No  "
+
+  # Fresh geometry — dialogs may open after the frame was last laid out.
+  tui_update_layout
   local row=$((LEFT_CONTENT_ROW + 2))
 
   tui_draw_frame 1
   tui_render_right_logs
   tui_print_left_styled "$LEFT_CONTENT_ROW" "${TUI_BOLD}${TUI_FG_ACCENT}" "$prompt"
 
+  # May run inside a $() subshell with reset traps — re-arm SIGWINCH locally.
+  trap 'TUI_NEED_RESIZE=1' SIGWINCH
+
   while true; do
+    if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
+      TUI_NEED_RESIZE=0
+      tui_update_layout
+      row=$((LEFT_CONTENT_ROW + 2))
+    fi
     tput cup "$row" "$LEFT_X"
     printf "%-*s" "$LEFT_CONTENT_W" ""
     tput cup "$row" "$LEFT_X"
@@ -609,6 +724,10 @@ tui_message() {
   local title="$1"
   local text="$2"
   local row="$LEFT_CONTENT_ROW"
+
+  # Fresh geometry — messages may open after the frame was last laid out.
+  tui_update_layout
+
   tui_draw_frame 1
   tui_render_right_logs
 
@@ -648,6 +767,12 @@ warn() {
 }
 
 die() {
+  # Leave the alternate screen and restore the terminal BEFORE printing, so
+  # the error stays visible on the normal screen — the EXIT trap's rmcup
+  # would otherwise swallow the message with the alternate buffer.
+  if [[ "${TUI_ACTIVE:-0}" == "1" ]]; then
+    tui_cleanup
+  fi
   printf "%b\n" "${CLR_RED}ERROR${CLR_RESET} $*" >&2
   exit 1
 }
@@ -2757,6 +2882,10 @@ tui_handle_key() {
       fi
       tui_handle_back
       ;;
+    home|end|pgup|pgdn|del|f1|f2|unknown|paste)
+      # Recognized escape sequences that are not bound to an action yet
+      # (P4 wires navigation); they must never fall through to esc/back.
+      ;;
   esac
   return 0
 }
@@ -2764,6 +2893,15 @@ tui_handle_key() {
 tui_loop() {
   local start_view="$1"
   local running=1
+
+  # Size check BEFORE tui_init touches stty/the alternate screen, so a
+  # too-small terminal leaves the shell state untouched.
+  tui_update_layout
+  if [[ "$TUI_TOO_SMALL" == "1" ]]; then
+    printf 'Terminal too small: %s needs at least %d columns x %d lines (current: %d x %d).\n' \
+      "$SCRIPT_NAME" "$TUI_MIN_COLS" "$TUI_MIN_LINES" "$TUI_COLS" "$TUI_LINES" >&2
+    exit 1
+  fi
 
   tui_init
   trap 'TUI_NEED_RESIZE=1' SIGWINCH
@@ -2796,10 +2934,23 @@ tui_loop() {
     if [[ "$TUI_NEED_RESIZE" -eq 1 ]]; then
       TUI_NEED_RESIZE=0
       tui_update_layout
-      TUI_NEED_FRAME=1
-      TUI_NEED_MENU=1
-      TUI_NEED_LEFT=1
-      TUI_NEED_RIGHT=1
+      if [[ "$TUI_TOO_SMALL" == "1" ]]; then
+        # Below the renderable minimum: show a message instead of a garbled
+        # frame; normal operation resumes once the terminal grows again.
+        tui_clear
+        printf '\033[1;1H%s' "${CLR_RESET}"
+        printf 'Terminal too small: need at least %d cols x %d lines (current: %d x %d). Enlarge to continue.' \
+          "$TUI_MIN_COLS" "$TUI_MIN_LINES" "$TUI_COLS" "$TUI_LINES"
+        TUI_NEED_FRAME=0
+        TUI_NEED_MENU=0
+        TUI_NEED_LEFT=0
+        TUI_NEED_RIGHT=0
+      else
+        TUI_NEED_FRAME=1
+        TUI_NEED_MENU=1
+        TUI_NEED_LEFT=1
+        TUI_NEED_RIGHT=1
+      fi
     fi
 
     _SPINNER_TICK=$((_SPINNER_TICK + 1))
