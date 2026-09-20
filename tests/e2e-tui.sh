@@ -250,6 +250,165 @@ else
 fi
 tmux -L "$SOCK" kill-session -t t7 >/dev/null 2>&1 || true
 
+# --- 8: navigation keys (P4) --------------------------------------------------
+tmux_new t8 100 30 "./haven tui"
+if ! wait_for t8 "Dashboard"; then
+  bad "TUI did not start for the navigation check"
+else
+  nav_case() { # nav_case <label> <description>
+    local out
+    out="$(capture t8)"
+    if printf '%s' "$out" | grep -q "▸ $1"; then
+      ok "navigation: $2 selects '$1'"
+    else
+      bad "navigation: $2 did not select '$1'"
+    fi
+  }
+  tmux -L "$SOCK" send-keys -t t8 3;    sleep 0.4; nav_case "Stop services" "digit 3"
+  tmux -L "$SOCK" send-keys -t t8 k;    sleep 0.4; nav_case "Start (Tor)" "k"
+  tmux -L "$SOCK" send-keys -t t8 j;    sleep 0.4; nav_case "Stop services" "j"
+  tmux -L "$SOCK" send-keys -t t8 G;    sleep 0.4; nav_case "Quit" "G"
+  tmux -L "$SOCK" send-keys -t t8 g;    sleep 0.4; nav_case "Start (Docker)" "g"
+  tmux -L "$SOCK" send-keys -t t8 End;  sleep 0.4; nav_case "Quit" "End"
+  tmux -L "$SOCK" send-keys -t t8 Home; sleep 0.4; nav_case "Start (Docker)" "Home"
+  tmux -L "$SOCK" send-keys -t t8 PgDn; sleep 0.4; nav_case "Quit" "PgDn"
+  tmux -L "$SOCK" send-keys -t t8 PgUp; sleep 0.4; nav_case "Start (Docker)" "PgUp"
+fi
+tmux -L "$SOCK" kill-session -t t8 >/dev/null 2>&1 || true
+
+# --- 9+10: prompt editor — paste, Ctrl-U, Ctrl-W (P4) -------------------------
+# 160 cols so the 30-char paste fits the prompt's input budget.
+tmux_new t9 160 30 "./haven tui"
+if ! wait_for t9 "Dashboard"; then
+  bad "TUI did not start for the prompt editor check"
+else
+tmux -L "$SOCK" send-keys -t t9 5      # .env Editor (digits select only)
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t9 Enter
+wait_for t9 "Add variable" || true
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t9 1      # Add variable
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t9 Enter  # -> "New key: " prompt
+if ! wait_for t9 "New key"; then
+  bad "key prompt did not open"
+else
+  # paste 30 characters through bracketed paste
+  tmux -L "$SOCK" send-keys -t t9 -l $'\033[200~abcdefghijklmnopqrstuvwxyz012345\033[201~'
+  sleep 0.6
+  if capture t9 | grep -q "abcdefghijklmnopqrstuvwxyz012345"; then
+    ok "prompt: bracketed paste inserts the full 30-char payload"
+  else
+    bad "prompt: pasted payload missing ($(capture t9 | grep -o 'Tail lines.*' | head -c 60))"
+  fi
+  # Ctrl-U clears the line
+  tmux -L "$SOCK" send-keys -t t9 C-u
+  sleep 0.4
+  if capture t9 | grep -q "abcdefghijklmnopqrstuvwxyz"; then
+    bad "prompt: Ctrl-U did not clear the input"
+  else
+    ok "prompt: Ctrl-U clears the input"
+  fi
+  # Ctrl-W deletes the last word
+  tmux -L "$SOCK" send-keys -t t9 -l "foo bar"
+  sleep 0.4
+  tmux -L "$SOCK" send-keys -t t9 C-w
+  sleep 0.4
+  if capture t9 | grep -q "foo bar"; then
+    bad "prompt: Ctrl-W did not delete the word"
+  elif capture t9 | grep -q "foo "; then
+    ok "prompt: Ctrl-W deletes the word before the cursor"
+  else
+    bad "prompt: Ctrl-W left unexpected input ($(capture t9 | grep -o 'New key.*' | head -c 60))"
+  fi
+  # cancel the prompt — nothing must be written to .env
+  tmux -L "$SOCK" send-keys -t t9 Escape
+  sleep 0.3
+fi
+fi
+tmux -L "$SOCK" kill-session -t t9 >/dev/null 2>&1 || true
+
+# --- 11: masking, reveal, inline validation (P4) ------------------------------
+# The checks write to .env: back it up first, restore in cleanup.
+ENV_BACKUP="$(mktemp)"
+ENV_EXISTED=0
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  cp "$ROOT_DIR/.env" "$ENV_BACKUP"
+  ENV_EXISTED=1
+fi
+printf 'TEST_SECRET_KEY=abcdefgh1234\n' >> "$ROOT_DIR/.env"
+
+tmux_new t11 100 30 "./haven tui"
+if ! wait_for t11 "Dashboard"; then
+  bad "TUI did not start for the masking check"
+else
+tmux -L "$SOCK" send-keys -t t11 5      # .env Editor (digits select only)
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t11 Enter
+wait_for t11 "Add variable"
+sleep 0.3
+out="$(capture t11)"
+if [[ "$out" == *"TEST_SECRET_KEY = …1234"* && "$out" != *"abcdefgh1234"* ]]; then
+  ok "env list masks sensitive values (…1234)"
+else
+  bad "env list does not mask ($(printf '%s' "$out" | grep -o 'TEST_SECRET_KEY.*' | head -c 60))"
+fi
+# open the key (first entry after "Add variable"), then reveal
+tmux -L "$SOCK" send-keys -t t11 Down
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t11 Enter
+wait_for t11 "Reveal value"
+sleep 0.2
+tmux -L "$SOCK" send-keys -t t11 2      # Reveal value
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t11 Enter
+sleep 0.6
+if capture t11 | grep -q "abcdefgh1234"; then
+  ok "reveal shows the plaintext on explicit request"
+else
+  bad "reveal did not show the plaintext"
+fi
+tmux -L "$SOCK" send-keys -t t11 x      # dismiss message
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t11 Escape # env_item -> env_list
+sleep 0.4
+tmux -L "$SOCK" send-keys -t t11 1      # Add variable
+sleep 0.3
+tmux -L "$SOCK" send-keys -t t11 Enter
+wait_for t11 "New key"
+sleep 0.2
+tmux -L "$SOCK" send-keys -t t11 -l "RELAY_PORT"
+sleep 0.4
+tmux -L "$SOCK" send-keys -t t11 Enter
+wait_for t11 "New value"
+sleep 0.2
+tmux -L "$SOCK" send-keys -t t11 -l "70000"
+sleep 0.4
+tmux -L "$SOCK" send-keys -t t11 Enter
+sleep 0.6
+if capture t11 | grep -q "Port must be 1-65535"; then
+  ok "invalid value shows the error inline at the prompt"
+else
+  bad "inline validation message missing ($(capture t11 | tr '\n' '|' | head -c 150))"
+fi
+tmux -L "$SOCK" send-keys -t t11 Escape # cancel value prompt
+sleep 0.3
+fi
+tmux -L "$SOCK" kill-session -t t11 >/dev/null 2>&1 || true
+
+# restore .env state (drop anything the checks wrote, keep user content)
+if [[ "$ENV_EXISTED" == "1" ]]; then
+  cp "$ENV_BACKUP" "$ROOT_DIR/.env"
+else
+  rm -f "$ROOT_DIR/.env"
+fi
+rm -f "$ENV_BACKUP"
+if grep -q "^RELAY_PORT=" "$ROOT_DIR/.env" 2>/dev/null; then
+  bad ".env was modified by the cancelled add (RELAY_PORT present)"
+else
+  ok ".env untouched by the cancelled add"
+fi
+
 say ""
 say "e2e-tui: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

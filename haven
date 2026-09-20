@@ -171,6 +171,7 @@ TUI_NEED_RIGHT=1
 TUI_NEED_RESIZE=0
 TUI_TOO_SMALL=0
 TUI_PASTE_ENABLED=0
+TUI_VISIBLE_ROWS=10
 # Minimum terminal geometry the frame can render into without garbling.
 TUI_MIN_COLS=66
 TUI_MIN_LINES=20
@@ -433,8 +434,8 @@ tui_read_key() {
       "[B"|"OB") _KEY="down" ;;
       "[C"|"OC") _KEY="right" ;;
       "[D"|"OD") _KEY="left" ;;
-      "[H"|"OH"|"[7~") _KEY="home" ;;
-      "[F"|"OF"|"[8~") _KEY="end" ;;
+      "[H"|"OH"|"[7~"|"[1~") _KEY="home" ;;
+      "[F"|"OF"|"[8~"|"[4~") _KEY="end" ;;
       "[5~") _KEY="pgup" ;;
       "[6~") _KEY="pgdn" ;;
       "[3~"|"[3$") _KEY="del" ;;
@@ -650,16 +651,56 @@ tui_wait_key() {
   while ! IFS= read -rsn1 -t 0.1 _; do :; done
 }
 
+# Prompt validators: called by tui_prompt with the raw input; rc != 0 plus
+# VALIDATION_ERROR shows the error inline at the prompt, rc 0 accepts the
+# input (PROMPT_RESULT carries the normalized value).
+
+_validate_prompt_new_key() {
+  VALIDATION_ERROR=""
+  PROMPT_RESULT="$1"
+  if [[ -z "$1" ]]; then
+    VALIDATION_ERROR="Key is empty."
+    return 1
+  fi
+  if [[ ! "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    VALIDATION_ERROR="Key must be A-Z, a-z, 0-9, _ and start with a letter or underscore."
+    return 1
+  fi
+  if [[ -n "$(read_env_var "$1" 2>/dev/null || true)" ]]; then
+    VALIDATION_ERROR="Key already exists in .env."
+    return 1
+  fi
+  return 0
+}
+
+_validate_prompt_env_value() {
+  VALIDATION_ERROR=""
+  PROMPT_RESULT=""
+  if [[ -z "$1" ]]; then
+    VALIDATION_ERROR="Value is empty."
+    return 1
+  fi
+  if ! validate_env_value "$PROMPT_ENV_KEY" "$1"; then
+    return 1
+  fi
+  PROMPT_RESULT="$VALIDATION_VALUE"
+  return 0
+}
+
 tui_prompt() {
   local prompt="$1"
   local default="$2"
+  local validator="${3:-}"
   local input=""
+  local cursor=0
   local ch=""
+  local code=0
   local prompt_len=${#prompt}
 
   # Refresh the geometry: prompts may open after the frame was last laid out.
   tui_update_layout
   local prompt_row=$((TUI_LINES - 3))
+  local err_row=$((TUI_LINES - 2))
   local max_input=$((LEFT_CONTENT_W - prompt_len - 2))
   (( max_input < 10 )) && max_input=10
 
@@ -671,6 +712,8 @@ tui_prompt() {
   {
     tput cup "$prompt_row" "$LEFT_X"
     printf "%-*s" "$LEFT_CONTENT_W" ""
+    tput cup "$err_row" "$LEFT_X"
+    printf "%-*s" "$LEFT_CONTENT_W" ""
     tput cup "$prompt_row" "$LEFT_X"
     printf "%b%s%b " "${TUI_FG_ACCENT}" "$prompt" "$CLR_RESET"
     tput cnorm
@@ -681,69 +724,153 @@ tui_prompt() {
   trap 'TUI_NEED_RESIZE=1' SIGWINCH
 
   while true; do
-    # A resize while the prompt is open must redraw the prompt line at the
-    # new geometry instead of printing into rows that no longer exist.
-    if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
-      TUI_NEED_RESIZE=0
-      tui_update_layout
-      prompt_row=$((TUI_LINES - 3))
-      max_input=$((LEFT_CONTENT_W - prompt_len - 2))
-      (( max_input < 10 )) && max_input=10
-      {
-        tput cup "$prompt_row" "$LEFT_X"
-        printf "%-*s" "$LEFT_CONTENT_W" ""
-        tput cup "$prompt_row" "$LEFT_X"
-        printf "%b%s%b " "${TUI_FG_ACCENT}" "$prompt" "$CLR_RESET"
-        printf "%s" "$input"
-      } >/dev/tty
-    fi
+    # Redraw prompt line and cursor at the current geometry. Also used after
+    # edits: full line redraw, then place the cursor behind input[0:cursor].
+    {
+      if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
+        TUI_NEED_RESIZE=0
+        tui_update_layout
+        prompt_row=$((TUI_LINES - 3))
+        err_row=$((TUI_LINES - 2))
+        max_input=$((LEFT_CONTENT_W - prompt_len - 2))
+        (( max_input < 10 )) && max_input=10
+      fi
+      tput cup "$prompt_row" "$LEFT_X"
+      printf "%-*s" "$LEFT_CONTENT_W" ""
+      tput cup "$prompt_row" "$LEFT_X"
+      printf "%b%s%b " "${TUI_FG_ACCENT}" "$prompt" "$CLR_RESET"
+      printf "%s" "$input"
+      local w=0
+      tui_str_width "${input:0:$cursor}"
+      w=$_WIDTH
+      tput cup "$prompt_row" "$((LEFT_X + prompt_len + 1 + w))"
+    } >/dev/tty
 
     IFS= read -rsn1 -t 0.1 ch </dev/tty || continue
 
-    # ESC → cancel
+    # ESC: cancel, cursor keys, or bracketed paste
     if [[ "$ch" == $'\x1b' ]]; then
-      # Consume any trailing escape sequence chars
-      IFS= read -rsn2 -t 0.01 _ </dev/tty || true
-      input="$default"
-      break
+      local seq=""
+      IFS= read -rsn2 -t 0.01 seq || true
+      case "$seq" in
+        "[D") (( cursor > 0 )) && cursor=$((cursor - 1)) ;;
+        "[C") (( cursor < ${#input} )) && cursor=$((cursor + 1)) ;;
+        "[H") cursor=0 ;;
+        "[F") cursor=${#input} ;;
+        "[3~") (( cursor < ${#input} )) && input="${input:0:$cursor}${input:$((cursor + 1))}" ;;
+        "[2")
+          # Bracketed paste: ESC[200~ <payload> ESC[201~ — insert the payload
+          # at the cursor instead of cancelling.
+          local rest=""
+          IFS= read -rsn3 -t 0.05 rest || true
+          if [[ "$rest" == "00~" ]]; then
+            local pch="" closer=""
+            while IFS= read -rsn1 -t 1 pch; do
+              if [[ "$pch" == $'\x1b' ]]; then
+                IFS= read -rsn5 -t 0.05 closer || true
+                [[ "$closer" == "[201~" ]] && break
+                continue
+              fi
+              (( ${#input} < max_input )) || break
+              input="${input:0:$cursor}$pch${input:$cursor}"
+              cursor=$((cursor + 1))
+            done
+          fi
+          ;;
+        *)
+          # Bare ESC (nothing followed): cancel with the default.
+          input="$default"
+          break
+          ;;
+      esac
+      continue
     fi
 
-    # Enter → confirm
+    # Enter → confirm (validate inline when a validator is set)
     if [[ -z "$ch" || "$ch" == $'\n' || "$ch" == $'\r' ]]; then
-      if [[ -z "$input" ]]; then
+      if [[ -z "$input" && -n "$default" ]]; then
         input="$default"
+      fi
+      if [[ -n "$validator" && -n "$input" ]]; then
+        VALIDATION_ERROR=""
+        PROMPT_RESULT=""
+        if "$validator" "$input"; then
+          [[ -n "$PROMPT_RESULT" ]] && input="$PROMPT_RESULT"
+          break
+        fi
+        {
+          tput cup "$err_row" "$LEFT_X"
+          printf "%-*s" "$LEFT_CONTENT_W" ""
+          tput cup "$err_row" "$LEFT_X"
+          printf "%b✗ %s%b" "${TUI_FG_LOG_ERROR}" "$VALIDATION_ERROR" "$CLR_RESET"
+        } >/dev/tty
+        continue
       fi
       break
     fi
 
-    # Backspace (0x7f or 0x08)
+    # Backspace (0x7f or 0x08): delete before the cursor
     if [[ "$ch" == $'\x7f' || "$ch" == $'\x08' ]]; then
-      if [[ -n "$input" ]]; then
-        input="${input%?}"
-        # Redraw input area
-        {
-          tput cup "$prompt_row" "$((LEFT_X + prompt_len + 1))"
-          printf "%-*s" "$max_input" "$input"
-          tput cup "$prompt_row" "$((LEFT_X + prompt_len + 1 + ${#input}))"
-        } >/dev/tty
+      if (( cursor > 0 )); then
+        input="${input:0:$((cursor - 1))}${input:$cursor}"
+        cursor=$((cursor - 1))
       fi
       continue
     fi
 
-    # Ctrl-C → cancel
+    # Ctrl-C → cancel with the default
     if [[ "$ch" == $'\x03' ]]; then
       input="$default"
       break
     fi
 
-    # Append printable character
+    # Ctrl-A / Ctrl-E: line start / end (readline convention)
+    if [[ "$ch" == $'\x01' ]]; then
+      cursor=0
+      continue
+    fi
+    if [[ "$ch" == $'\x05' ]]; then
+      cursor=${#input}
+      continue
+    fi
+
+    # Ctrl-U: clear the whole line
+    if [[ "$ch" == $'\x15' ]]; then
+      input=""
+      cursor=0
+      continue
+    fi
+
+    # Ctrl-W: delete the word before the cursor
+    if [[ "$ch" == $'\x17' ]]; then
+      local before="${input:0:$cursor}"
+      if [[ "$before" =~ ^(.*)[[:space:]]+[^[:space:]]+$ ]]; then
+        before="${BASH_REMATCH[1]}"
+      else
+        before=""
+      fi
+      input="$before${input:$cursor}"
+      cursor=${#before}
+      continue
+    fi
+
+    # Append printable character at the cursor (UTF-8 bytes pass through
+    # and combine once complete)
+    printf -v code '%d' "'$ch"
+    if (( code < 32 )); then
+      continue
+    fi
     if (( ${#input} < max_input )); then
-      input+="$ch"
-      printf "%s" "$ch" >/dev/tty
+      input="${input:0:$cursor}$ch${input:$cursor}"
+      cursor=$((cursor + 1))
     fi
   done
 
-  tput civis >/dev/tty
+  {
+    tput cup "$err_row" "$LEFT_X"
+    printf "%-*s" "$LEFT_CONTENT_W" ""
+    tput civis
+  } >/dev/tty
   printf "%s" "$input"
 }
 
@@ -831,7 +958,7 @@ tui_message() {
     fi
     tui_print_left "$row" "$line"
     row=$((row + 1))
-  done < <(printf "%s" "$text" | fold -s -w "$LEFT_CONTENT_W")
+  done < <(printf "%s\n" "$text" | fold -s -w "$LEFT_CONTENT_W")
 
   # Dim footer
   tui_print_left_styled $((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT - 1)) "$TUI_DIM" "Press any key to continue."
@@ -2399,6 +2526,27 @@ tui_breadcrumb() {
   esac
 }
 
+# Display-only masking for values of sensitive keys in the env list.
+# Not a security feature — the .env itself stays plaintext; this only keeps
+# shoulder-surfers and screenshots from carrying the secret away.
+mask_env_value() {
+  local v="${1:-}"
+  if (( ${#v} > 8 )); then
+    _MASKED="…${v: -4}"
+  elif [[ -n "$v" ]]; then
+    _MASKED="…"
+  else
+    _MASKED=""
+  fi
+}
+
+env_key_is_sensitive() {
+  case "$1" in
+    *SECRET*|*PASSWORD*|*TOKEN*|*KEY*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 tui_build_menu() {
   MENU_IDS=()
   MENU_LABELS=()
@@ -2454,10 +2602,15 @@ tui_build_menu() {
       MENU_IDS=(add)
       MENU_LABELS=("Add variable")
       local key
+      local value
       while IFS= read -r key; do
         [[ -n "$key" ]] || continue
-        local value=""
+        value=""
         value="$(read_env_var "$key" 2>/dev/null || true)"
+        if env_key_is_sensitive "$key"; then
+          mask_env_value "$value"
+          value="$_MASKED"
+        fi
         MENU_IDS+=("key:$key")
         MENU_LABELS+=("$key = $value")
       done < <(list_env_keys)
@@ -2468,8 +2621,8 @@ tui_build_menu() {
       TUI_LEFT_TITLE="⚡ Haven ─ .env ─ $CURRENT_ENV_KEY"
       MENU_TITLE=".env: $CURRENT_ENV_KEY"
       MENU_SUBTITLE="Edit or remove this variable."
-      MENU_IDS=(edit remove back)
-      MENU_LABELS=("Edit value" "Remove variable" "Back")
+      MENU_IDS=(edit reveal remove back)
+      MENU_LABELS=("Edit value" "Reveal value" "Remove variable" "Back")
       ;;
     json_files)
       TUI_LEFT_TITLE="⚡ Haven ─ JSON Editor"
@@ -2519,6 +2672,7 @@ tui_build_menu() {
 tui_render_left_menu() {
   local row="$LEFT_CONTENT_ROW"
   local visible_rows="$LEFT_CONTENT_HEIGHT"
+  TUI_VISIBLE_ROWS="$visible_rows"
 
   # Only rebuild menu data when needed (not on simple navigation)
   if [[ "$TUI_NEED_MENU" -eq 1 ]]; then
@@ -2838,21 +2992,16 @@ $(cat "$onion_torrc")"
         add)
           local new_key
           local new_value
-          new_key="$(tui_prompt "New key: " "")"
+          new_key="$(tui_prompt "New key: " "" _validate_prompt_new_key)"
           if [[ -z "$new_key" ]]; then
-            tui_message ".env" "Key is empty."
             return
           fi
-          if [[ ! "$new_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            tui_message ".env" "Invalid key format."
+          PROMPT_ENV_KEY="$new_key"
+          new_value="$(tui_prompt "New value: " "" _validate_prompt_env_value)"
+          if [[ -z "$new_value" ]]; then
             return
           fi
-          new_value="$(tui_prompt "New value: " "")"
-          if ! validate_env_value "$new_key" "$new_value"; then
-            tui_message ".env" "$VALIDATION_ERROR"
-            return
-          fi
-          set_env_var "$new_key" "$VALIDATION_VALUE"
+          set_env_var "$new_key" "$new_value"
           restart_after_env_change
           ;;
         back)
@@ -2872,16 +3021,22 @@ $(cat "$onion_torrc")"
           local current=""
           local new_value=""
           current="$(read_env_var "$CURRENT_ENV_KEY" 2>/dev/null || true)"
-          new_value="$(tui_prompt "New value (blank to keep): " "$current")"
+          PROMPT_ENV_KEY="$CURRENT_ENV_KEY"
+          new_value="$(tui_prompt "New value (blank to keep): " "$current" _validate_prompt_env_value)"
           if [[ -z "$new_value" ]]; then
             return
           fi
-          if ! validate_env_value "$CURRENT_ENV_KEY" "$new_value"; then
-            tui_message ".env" "$VALIDATION_ERROR"
-            return
-          fi
-          set_env_var "$CURRENT_ENV_KEY" "$VALIDATION_VALUE"
+          set_env_var "$CURRENT_ENV_KEY" "$new_value"
           restart_after_env_change
+          ;;
+        reveal)
+          # Explicit reveal: the list view only ever shows masked values.
+          local shown=""
+          shown="$(read_env_var "$CURRENT_ENV_KEY" 2>/dev/null || true)"
+          if [[ -z "$shown" ]]; then
+            shown="(empty)"
+          fi
+          tui_message "$CURRENT_ENV_KEY" "$shown"
           ;;
         remove)
           if tui_confirm "Remove $CURRENT_ENV_KEY?" "n"; then
@@ -2971,15 +3126,39 @@ tui_handle_key() {
   local count=${#MENU_IDS[@]}
 
   case "$key" in
-    up)
+    up|k)
       if [[ "$TUI_SEL" -gt 0 ]]; then
         TUI_SEL=$((TUI_SEL - 1))
         TUI_NEED_LEFT=1
       fi
       ;;
-    down)
+    down|j)
       if [[ "$TUI_SEL" -lt $((count - 1)) ]]; then
         TUI_SEL=$((TUI_SEL + 1))
+        TUI_NEED_LEFT=1
+      fi
+      ;;
+    home|g)
+      TUI_SEL=0
+      TUI_NEED_LEFT=1
+      ;;
+    end|G)
+      TUI_SEL=$((count - 1))
+      TUI_NEED_LEFT=1
+      ;;
+    pgup)
+      TUI_SEL=$((TUI_SEL - TUI_VISIBLE_ROWS + 1))
+      (( TUI_SEL < 0 )) && TUI_SEL=0
+      TUI_NEED_LEFT=1
+      ;;
+    pgdn)
+      TUI_SEL=$((TUI_SEL + TUI_VISIBLE_ROWS - 1))
+      (( TUI_SEL > count - 1 )) && TUI_SEL=$((count - 1))
+      TUI_NEED_LEFT=1
+      ;;
+    [1-9])
+      if (( key >= 1 && key <= count )); then
+        TUI_SEL=$((key - 1))
         TUI_NEED_LEFT=1
       fi
       ;;
@@ -2995,9 +3174,9 @@ tui_handle_key() {
       fi
       tui_handle_back
       ;;
-    home|end|pgup|pgdn|del|f1|f2|unknown|paste)
-      # Recognized escape sequences that are not bound to an action yet
-      # (P4 wires navigation); they must never fall through to esc/back.
+    del|f1|f2|unknown|paste)
+      # Recognized escape sequences not bound to a menu action; they must
+      # never fall through to esc/back.
       ;;
   esac
   return 0
