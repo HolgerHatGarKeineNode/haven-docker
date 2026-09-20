@@ -5,6 +5,21 @@ IFS=$'\n\t'
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
 
+# Bash version guard: the script needs bash >= 4.2 — `printf %(%s)T`
+# (tui_update_docker_status) requires 4.2 and `exec {fd}<` (start_log_stream)
+# requires 4.1. Help/usage stay reachable on older shells (macOS ships 3.2).
+case "${1:-}" in
+  help|-h|--help|"") : ;;
+  *)
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
+      printf 'haven: bash 4.2 or newer is required, found %s.\n' "$BASH_VERSION" >&2
+      printf 'haven: macOS ships bash 3.2 by default — install a newer bash (e.g. brew install bash).\n' >&2
+      printf 'haven: run "%s help" for usage on any bash.\n' "$SCRIPT_NAME" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 CLR_RESET=""
 CLR_RED=""
 CLR_GREEN=""
@@ -33,7 +48,6 @@ TUI_FG_MENU_DIM=""
 TUI_FG_SEPARATOR=""
 TUI_FG_SHORTCUT=""
 TUI_FG_STATUS=""
-TUI_FG_BRANDING=""
 TUI_FG_SELECTED=""
 TUI_BG_TITLEBAR=""
 TUI_BG_STATUSBAR=""
@@ -57,7 +71,6 @@ if [[ -t 1 ]]; then
     TUI_FG_SEPARATOR="\033[38;5;240m"
     TUI_FG_SHORTCUT="\033[38;5;75m"
     TUI_FG_STATUS="\033[38;5;250m"
-    TUI_FG_BRANDING="\033[38;5;75m"
     TUI_FG_SELECTED="\033[38;5;15m"
     TUI_BG_TITLEBAR="\033[48;5;236m"
     TUI_BG_STATUSBAR="\033[48;5;236m"
@@ -76,7 +89,6 @@ if [[ -t 1 ]]; then
     TUI_FG_SEPARATOR="\033[2;37m"
     TUI_FG_SHORTCUT="\033[1;34m"
     TUI_FG_STATUS="\033[37m"
-    TUI_FG_BRANDING="\033[1;34m"
     TUI_FG_SELECTED="\033[1;37m"
     TUI_BG_TITLEBAR="\033[40m"
     TUI_BG_STATUSBAR="\033[40m"
@@ -142,7 +154,6 @@ TUI_STTY_ORIG=""
 TUI_COLS=0
 TUI_LINES=0
 LEFT_W=0
-RIGHT_W=0
 LEFT_X=1
 RIGHT_X=0
 LEFT_CONTENT_W=0
@@ -160,10 +171,7 @@ TUI_NEED_RIGHT=1
 TUI_NEED_RESIZE=0
 TUI_LEFT_TITLE="Haven Dashboard"
 TUI_RIGHT_TITLE="Logs"
-RIGHT_CONTENT_X=0
 _SPINNER_TICK=0
-TUI_MESSAGE_TITLE=""
-TUI_MESSAGE_TEXT=""
 CURRENT_ENV_KEY=""
 CURRENT_JSON_FILE=""
 LOG_FIFO=""
@@ -277,8 +285,6 @@ tui_update_layout() {
   # Rows 3..N-3: content, Row N-2: bottom border, Row N-1: status bar
   LEFT_X=2
   RIGHT_X=$((LEFT_W + 2))
-  RIGHT_W=$((TUI_COLS - LEFT_W - 1))
-  RIGHT_CONTENT_X=$((LEFT_W + 2))
 
   LEFT_CONTENT_W=$((LEFT_W - 3))
   RIGHT_CONTENT_W=$((TUI_COLS - LEFT_W - 4))
@@ -962,7 +968,7 @@ validate_env_value() {
   fi
 
   case "$key" in
-    *_NPUB|OWNER_NPUB|PRIVATE_RELAY_NPUB|CHAT_RELAY_NPUB|OUTBOX_RELAY_NPUB|INBOX_RELAY_NPUB)
+    *_NPUB)
       if [[ -z "$value" ]]; then
         VALIDATION_ERROR="NPUB cannot be empty."
         return 1
@@ -1032,7 +1038,20 @@ validate_env_value() {
       fi
       VALIDATION_VALUE="${value,,}"
       ;;
-    *_TOKENS_PER_INTERVAL|*_INTERVAL|*_MAX_TOKENS|*_INTERVAL_SECONDS|*_TIMEOUT_SECONDS|*_DEPTH|*_MINIMUM_FOLLOWERS|*_INTERVAL_HOURS|INBOX_PULL_INTERVAL_SECONDS)
+    WOT_REFRESH_INTERVAL)
+      if ! is_duration "$value"; then
+        VALIDATION_ERROR="WOT_REFRESH_INTERVAL must look like 24h, 30m, or 10s."
+        return 1
+      fi
+      ;;
+    BACKUP_INTERVAL_HOURS)
+      if ! is_int "$value"; then
+        VALIDATION_ERROR="BACKUP_INTERVAL_HOURS must be a number >= 0."
+        return 1
+      fi
+      VALIDATION_VALUE="$value"
+      ;;
+    *_TOKENS_PER_INTERVAL|*_INTERVAL|*_MAX_TOKENS|*_INTERVAL_SECONDS|*_TIMEOUT_SECONDS|*_DEPTH|*_MINIMUM_FOLLOWERS)
       if ! is_int "$value"; then
         VALIDATION_ERROR="Value must be a number >= 0."
         return 1
@@ -1061,13 +1080,6 @@ validate_env_value() {
       fi
       VALIDATION_VALUE="$(wrap_like_raw "$raw" "${value,,}")"
       ;;
-    BACKUP_INTERVAL_HOURS)
-      if ! is_int "$value"; then
-        VALIDATION_ERROR="BACKUP_INTERVAL_HOURS must be a number >= 0."
-        return 1
-      fi
-      VALIDATION_VALUE="$value"
-      ;;
     S3_ACCESS_KEY_ID|S3_SECRET_KEY|S3_ENDPOINT|S3_REGION|S3_BUCKET_NAME)
       provider="$(read_env_var BACKUP_PROVIDER 2>/dev/null || true)"
       provider="$(strip_quotes "$provider")"
@@ -1087,12 +1099,6 @@ validate_env_value() {
           VALIDATION_ERROR="S3_BUCKET_NAME must be 3-63 chars (lowercase, numbers, dot, dash)."
           return 1
         fi
-      fi
-      ;;
-    WOT_REFRESH_INTERVAL)
-      if ! is_duration "$value"; then
-        VALIDATION_ERROR="WOT_REFRESH_INTERVAL must look like 24h, 30m, or 10s."
-        return 1
       fi
       ;;
     HAVEN_LOG_LEVEL)
@@ -1658,7 +1664,7 @@ ensure_data_dirs() {
     owner="$(path_owner_uid "$path")"
     # 10# forces base 10: bash arithmetic would read a leading zero as octal,
     # while Docker and chown read the same string as decimal.
-    if is_int "$owner" && [[ "10#$owner" -ne "10#$container_uid" ]]; then
+    if is_int "$owner" && [[ $((10#$owner)) -ne $((10#$container_uid)) ]]; then
       die "$dir/ is owned by uid $owner but the container runs as uid $container_uid — Haven cannot write to it. Fix with: sudo chown -R ${container_uid}:${container_gid} $path"
     fi
 
@@ -3060,4 +3066,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${HAVEN_SOURCED:-0}" != "1" ]]; then
+  main "$@"
+fi
