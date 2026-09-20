@@ -2054,7 +2054,31 @@ warn_import_flag() {
   warn "Set it to false and use './haven import' for a one-shot import."
 }
 
+# The relay cannot serve without these; a start on an (almost) empty .env
+# used to sail through silently — the only thing that ended up in .env was
+# DOCKER_UID/DOCKER_GID from ensure_docker_uid, and the container ran with
+# no owner and no relay identity at all.
+warn_missing_critical_env() {
+  local env_file="$ROOT_DIR/.env"
+  [[ -f "$env_file" ]] || return 0
+  local -a missing=()
+  local key v
+  for key in OWNER_NPUB RELAY_URL RELAY_PORT PRIVATE_RELAY_NPUB CHAT_RELAY_NPUB OUTBOX_RELAY_NPUB INBOX_RELAY_NPUB; do
+    v="$(read_env_var "$key" 2>/dev/null || true)"
+    v="$(strip_quotes "$v")"
+    [[ -z "$v" ]] && missing+=("$key")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    # join explicitly: the script's global IFS starts with a newline
+    local joined
+    printf -v joined '%s ' "${missing[@]}"
+    warn "Your .env is missing critical variables: ${joined% }"
+    warn "The relay cannot run like this. Run './haven env-upgrade', fill in at least OWNER_NPUB and RELAY_URL, then start again."
+  fi
+}
+
 prepare_start() {
+  warn_missing_critical_env
   ensure_docker_uid
   ensure_data_dirs
   ensure_example_jsons

@@ -204,3 +204,33 @@ teardown() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"rc=1"* ]]
 }
+
+@test "warn_missing_critical_env names the missing keys on a stripped .env" {
+  run bash -c '
+    source haven
+    set +e
+    ROOT_DIR="$(mktemp -d)"
+    printf "DOCKER_UID=1000\nDOCKER_GID=100\n" > "$ROOT_DIR/.env"
+    out="$(warn_missing_critical_env 2>&1)"
+    rm -rf "$ROOT_DIR"
+    echo "$out" | grep -o "OWNER_NPUB RELAY_URL RELAY_PORT" | head -1
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "OWNER_NPUB RELAY_URL RELAY_PORT" ]]
+}
+
+@test "warn_missing_critical_env stays silent on a complete .env" {
+  run bash -c '
+    source haven
+    set +e
+    ROOT_DIR="$(mktemp -d)"
+    { echo "OWNER_NPUB=npub1abc234def"; echo "RELAY_URL=relay.example.com"; echo "RELAY_PORT=3355";
+      echo "PRIVATE_RELAY_NPUB=npub1abc234def"; echo "CHAT_RELAY_NPUB=npub1abc234def";
+      echo "OUTBOX_RELAY_NPUB=npub1abc234def"; echo "INBOX_RELAY_NPUB=npub1abc234def"; } > "$ROOT_DIR/.env"
+    out="$(warn_missing_critical_env 2>&1)"
+    rm -rf "$ROOT_DIR"
+    echo "lines=$(printf "%s" "$out" | grep -c . || true)"
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "lines=0" ]]
+}

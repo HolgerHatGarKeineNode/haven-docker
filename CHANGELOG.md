@@ -34,6 +34,10 @@ Hardening and quality-of-life pass over the `./haven` TUI, in six steps.
   checks (terminal I/O, resize, too-small terminals, paste, navigation,
   masking, scrollback, filter, status view), plus a docker mock so the
   log-streaming tests run without a daemon — all local, no CI
+- `./haven` now warns loudly before starting on an (almost) empty `.env`:
+  starting used to sail through silently with only `DOCKER_UID`/`GID`
+  auto-written, leaving the relay without owner or identity — the warning
+  names every missing critical variable and points at `env-upgrade`
 
 ### Fixed
 
