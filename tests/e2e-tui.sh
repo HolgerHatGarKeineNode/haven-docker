@@ -23,6 +23,11 @@ bad()  { FAIL=$((FAIL + 1)); say "FAIL: $*"; }
 cleanup() {
   tmux -L "$SOCK" kill-server >/dev/null 2>&1 || true
   rm -rf "$WORK"
+  # Remove the .env the rig created for the env-editor path (CI checkouts
+  # have none); a pre-existing user .env is never touched.
+  if [[ "${ENV_CREATED:-0}" == "1" && -f "$ROOT_DIR/.env" ]]; then
+    rm -f "$ROOT_DIR/.env"
+  fi
 }
 trap cleanup EXIT
 
@@ -73,6 +78,14 @@ fi
 tmux -L "$SOCK" kill-session -t t1 >/dev/null 2>&1 || true
 
 # --- 2: resize while a prompt is open --------------------------------------
+# The env editor refuses to open without a .env (and asks interactively,
+# which the raw-mode TUI cannot handle); create an empty one if the
+# checkout has none — removed again in cleanup.
+ENV_CREATED=0
+if [[ ! -f "$ROOT_DIR/.env" ]]; then
+  : > "$ROOT_DIR/.env"
+  ENV_CREATED=1
+fi
 tmux_new t2 120 40 "./haven tui"
 if ! wait_for t2 "Dashboard"; then
   bad "TUI did not reach the main view (startup)"
