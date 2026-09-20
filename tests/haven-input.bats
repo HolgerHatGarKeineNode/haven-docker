@@ -5,13 +5,6 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 
-nav_setup() {
-  MENU_IDS=(one two three four five six seven eight nine ten)
-  TUI_SEL=0
-  TUI_VISIBLE_ROWS=4
-  TUI_NEED_LEFT=0
-}
-
 @test "tui_handle_key: j and k move the selection like down/up" {
   run bash -c 'source '"$REPO_ROOT"'/haven; set +e
     MENU_IDS=(one two three four five); TUI_SEL=0; TUI_NEED_LEFT=0
