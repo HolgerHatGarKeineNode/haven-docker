@@ -1,5 +1,17 @@
 # Changelog
 
+## Image v1.2.2-5 — 2026-10-22 (security hotfix)
+
+### Security
+
+- Rebuilt on a fresh `alpine:latest` (`ca-certificates-bundle 20261020-r0`).
+  The trust store no longer contains **emSign ECC Root CA - G3**, whose
+  intermediates had trivially recoverable private keys (Mozilla bug
+  [2083449](https://bugzilla.mozilla.org/show_bug.cgi?id=2083449); removed
+  in NSS 3.131.1). Earlier images, including `v1.2.2-4` and older, still
+  trust it — upgrade by pulling `v1.2.2-5` or `latest`.
+- No code change; same upstream Haven `v1.2.2`.
+
 ## Unreleased
 
 Hardening and quality-of-life pass over the `./haven` TUI, in six steps.
