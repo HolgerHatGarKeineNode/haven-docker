@@ -1,5 +1,28 @@
 # Changelog
 
+## Image v1.2.2-6 — 2026-11-10 (Blossom BUD-11 fix)
+
+### Fixed
+
+- Blossom accepts BUD-11 authorization tokens (base64url, unpadded).
+  Haven `v1.2.2` ships khatru `v0.19.1`, which decodes the `Authorization:
+  Nostr <token>` header with standard base64 only, so BUD-11 clients got
+  `404 invalid "Authorization": invalid base64 token` on every upload whose
+  event JSON length is not a multiple of 3 — about two in three. Measured
+  against `v1.2.2-5`: 4 of 6 base64url uploads rejected; this image: 12 of 12
+  (both encodings) stored and read back with matching sha256.
+  ([#13](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/13),
+  upstream [barrydeen/haven#138](https://github.com/barrydeen/haven/issues/138))
+- The fix is a temporary shim carried in `patches/` and applied on top of
+  upstream `v1.2.2` at build time: it rewrites the token to padded standard
+  base64 before khatru reads it; tokens it cannot decode pass through
+  unchanged. It goes away once khatru decodes BUD-11 itself — the build fails
+  if the patch stops applying.
+  It sits in front of every relay endpoint, so khatru's NIP-86 management
+  API accepts base64url tokens as well; standard tokens are byte-identical.
+- Haven now reports its version as `v1.2.2+dirty` (relay info and
+  User-Agent), because the build tree carries the patch.
+
 ## Image v1.2.2-5 — 2026-10-22 (security hotfix)
 
 ### Security

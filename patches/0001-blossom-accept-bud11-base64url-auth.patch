@@ -1,0 +1,102 @@
+diff --git a/blossom_auth.go b/blossom_auth.go
+new file mode 100644
+index 0000000..bd619ad
+--- /dev/null
++++ b/blossom_auth.go
+@@ -0,0 +1,39 @@
++package main
++
++import (
++	"encoding/base64"
++	"net/http"
++	"strings"
++)
++
++// Temporary shim, carried by haven-docker until khatru decodes BUD-11 tokens
++// itself (barrydeen/haven#138, haven-docker#13).
++//
++// khatru v0.19.1 blossom decodes the "Nostr <token>" Authorization header with
++// base64.StdEncoding only. BUD-11 mandates base64url without padding, so those
++// tokens fail with `404 invalid "Authorization": invalid base64 token` whenever
++// the event JSON length is not a multiple of 3 (about two uploads in three).
++
++// decodeNostrAuthToken accepts standard and URL-safe base64, padded or not.
++func decodeNostrAuthToken(token string) ([]byte, error) {
++	token = strings.TrimRight(strings.TrimSpace(token), "=")
++	if strings.ContainsAny(token, "-_") {
++		return base64.RawURLEncoding.DecodeString(token)
++	}
++	return base64.RawStdEncoding.DecodeString(token)
++}
++
++// normalizeNostrAuthHeader rewrites a Blossom auth token into padded standard
++// base64, the only form khatru v0.19.1 decodes. Anything it cannot decode is
++// left untouched, so khatru answers exactly as before.
++func normalizeNostrAuthHeader(r *http.Request) {
++	h := r.Header.Get("Authorization")
++	if !strings.HasPrefix(h, "Nostr ") {
++		return
++	}
++	raw, err := decodeNostrAuthToken(h[6:])
++	if err != nil {
++		return
++	}
++	r.Header.Set("Authorization", "Nostr "+base64.StdEncoding.EncodeToString(raw))
++}
+diff --git a/blossom_auth_test.go b/blossom_auth_test.go
+new file mode 100644
+index 0000000..ae1eb8a
+--- /dev/null
++++ b/blossom_auth_test.go
+@@ -0,0 +1,39 @@
++package main
++
++import (
++	"encoding/base64"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestNormalizeNostrAuthHeaderAcceptsAllBase64Forms(t *testing.T) {
++	// Lengths 1..6 cover every padding remainder; "?>" forces - and _ in url form.
++	for _, s := range []string{`{`, `{"k`, `{"ki`, `{"kin`, `{"kind`, `{"?>?>`} {
++		raw := []byte(s)
++		want := "Nostr " + base64.StdEncoding.EncodeToString(raw)
++		for name, enc := range map[string]*base64.Encoding{
++			"std": base64.StdEncoding, "rawstd": base64.RawStdEncoding,
++			"url": base64.URLEncoding, "rawurl": base64.RawURLEncoding,
++		} {
++			r := httptest.NewRequest("PUT", "/upload", nil)
++			r.Header.Set("Authorization", "Nostr "+enc.EncodeToString(raw)+" ")
++			normalizeNostrAuthHeader(r)
++			if got := r.Header.Get("Authorization"); got != want {
++				t.Errorf("%s %q: got %q want %q", name, s, got, want)
++			}
++		}
++	}
++}
++
++func TestNormalizeNostrAuthHeaderLeavesOthersAlone(t *testing.T) {
++	for _, h := range []string{"", "Bearer abc", "Nostr !!!not base64"} {
++		r := httptest.NewRequest("PUT", "/upload", nil)
++		if h != "" {
++			r.Header.Set("Authorization", h)
++		}
++		normalizeNostrAuthHeader(r)
++		if got := r.Header.Get("Authorization"); got != h {
++			t.Errorf("%q changed to %q", h, got)
++		}
++	}
++}
+diff --git a/main.go b/main.go
+index aa23e6a..0ec607d 100644
+--- a/main.go
++++ b/main.go
+@@ -138,6 +138,7 @@ func dynamicRelayHandler(w http.ResponseWriter, r *http.Request) {
+ 		relay = outboxRelay
+ 	}
+ 
++	normalizeNostrAuthHeader(r) // BUD-11 shim, see blossom_auth.go
+ 	relay.ServeHTTP(w, r)
+ }
+ 

@@ -18,6 +18,23 @@ RUN if [ -z "$VERSION" ]; then \
       echo "ERROR: VERSION is required (tag or commit SHA)." && exit 1; \
     fi && \
     git clone --depth 1 --single-branch --branch "${VERSION}" -- ${REPO_URL} .
+
+# Carry local fixes on top of upstream until they land there (see patches/).
+# `git apply` fails the build if a patch no longer applies — that is the signal
+# to drop it after a version bump, instead of shipping it silently stale.
+COPY patches/ /patches/
+RUN set -e; for p in /patches/*.patch; do \
+      [ -e "$p" ] || continue; \
+      echo "applying $p"; git apply --verbose "$p"; \
+    done
+
+# Run the tests the patches bring along. Haven loads its config at package
+# init, so they need upstream's example files in place; removed right after.
+RUN --mount=type=cache,target=/gomod-cache --mount=type=cache,target=/go-cache \
+    set -e; cp .env.example .env; \
+    for f in *.example.json; do cp "$f" "${f%.example.json}.json"; done; \
+    go test -count=1 -run 'TestNormalizeNostrAuthHeader' .; \
+    rm -f .env relays_import.json relays_blastr.json whitelisted_npubs.json blacklisted_npubs.json
 RUN --mount=type=cache,target=/gomod-cache --mount=type=cache,target=/go-cache \
     go build -a -tags netgo -ldflags '-w -s -extldflags "-static"' -o haven .
 
