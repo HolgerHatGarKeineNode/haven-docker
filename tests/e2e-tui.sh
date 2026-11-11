@@ -531,6 +531,23 @@ kill_pane t8
 
 prompt_has_q() { capture t9 | grep 'New key' | grep -q 'Q'; }
 
+# prompt_cancelled <session> <label> — Escape at an open prompt, then PROOF that it
+# closed. Looking for the label to vanish cannot work: a closed prompt leaves its row
+# painted until the next full redraw (measured: "New key:" still on screen after
+# Escape, gone after the next selection change), so a wait for its absence ran into
+# its bound in every green run. What closing really means is that the keys reach the
+# menu again: "j" moves the selection when the list has the keys, and is typed INTO the
+# prompt when it is still open. The Escape itself is settled first, so the "j" cannot
+# be read as part of an escape sequence. True only when the selection left
+# "Add variable" AND the prompt row is gone (the redraw the "j" causes repaints it).
+prompt_cancelled() {
+  local s="$1" label="$2"
+  send_settled "$s" Escape || return 1
+  send_settled "$s" j || return 1
+  poll_until "$WAIT_T" prompt_row_gone "$s" "$label"
+}
+prompt_row_gone() { no_text "$1" "▸ Add variable" && no_text "$1" "$2"; }
+
 # --- 9+10: prompt editor — paste, Ctrl-U, Ctrl-W (P4) -------------------------
 section "9+10 prompt editor"
 # 160 cols so the 30-char paste fits the prompt's input budget.
@@ -583,8 +600,11 @@ else
       bad "prompt: Ctrl-W left unexpected input ($(printf '%s' "$row" | head -c 80))"
     fi
     # cancel the prompt — nothing must be written to .env
-    tmx send-keys -t t9 Escape
-    wait_absent t9 "New key" 10 || true
+    if prompt_cancelled t9 "New key"; then
+      ok "Escape closes the key prompt (the keys reach the list again)"
+    else
+      bad "Escape did not close the key prompt ($(capture t9 | grep -m1 'New key' | head -c 60))"
+    fi
     if [[ "$(sha256sum "$SB/.env" | cut -d' ' -f1)" == "$env_hash_t9" ]]; then
       ok "cancelled prompt leaves .env byte-identical"
     else
@@ -653,8 +673,11 @@ else
   else
     bad "inline validation message missing ($(capture t11 | tr '\n' '|' | head -c 150))"
   fi
-  tmx send-keys -t t11 Escape # cancel value prompt
-  wait_absent t11 "New value" 10 || true
+  if prompt_cancelled t11 "New value"; then
+    ok "Escape closes the value prompt (the keys reach the list again)"
+  else
+    bad "Escape did not close the value prompt ($(capture t11 | grep -m1 'New value' | head -c 60))"
+  fi
 fi
 kill_pane t11
 if [[ "$(sha256sum "$SB/.env" | cut -d' ' -f1)" == "$env_hash_t11" ]]; then
@@ -859,6 +882,24 @@ kill_pane t12
 # --- 13: P6 — about screen, timestamped backup on write, docs ---------------
 section "13 about screen, env backup"
 new_sandbox t13
+# The sandbox holds the TRACKED files only; the four <name>.json files the relay mounts
+# are untracked and normally exist on a machine that ran haven before. Without them the
+# start half of the restart opens one "Missing X.json. Copy from X.example.json now?"
+# dialog per file and WAITS for an answer — `up` is not sent until the user has answered
+# four dialogs, which this check never did (it hit its 30 s bound in every green run and
+# the isolation proof only ever saw `down`). Seed them, as on a machine that has run haven.
+for example in "$SB"/*.example.json; do
+  cp "$example" "${example/.example.json/.json}"
+done
+# What the restart path really sends to docker (plain mode: no haven-tor container
+# runs), read from the product and a kept calls.log: stop_services -> `down
+# --remove-orphans`, start_services -> `up -d --build` (BUILD_IMAGES=1), then `ps` and
+# the read-only drift probe (`run ... --entrypoint cat relay /app/.env.example.upstream`).
+T13_DOWN="compose -f $SB/docker-compose.yml down --remove-orphans"
+T13_UP="compose -f $SB/docker-compose.yml up -d --build"
+T13_DRIFT="compose -f $SB/docker-compose.yml run --rm --no-deps -T --entrypoint cat relay /app/.env.example.upstream"
+risky='(^| )(stop|start|up|down|run|rm|restart|pull|kill|create)( |$)'   # docker calls that change state
+state_calls() { grep -E "$risky" "$1" 2>/dev/null; }   # <calls.log> — those calls, in order
 start_pane t13 120 30 "$SB" './haven tui'
 if ! wait_for t13 "Dashboard"; then
   bad "TUI did not start for the P6 checks"
@@ -909,12 +950,20 @@ else
     fi
     # The restart (down, then up) follows the write in the TUI. Killing the pane
     # right after the write races it, and the isolation proof below reads the
-    # mock's call log — so wait until the restart has reached the mock.
-    restart_reached() {
-      grep -qE '(^| )down( |$)' "$SB/.rig/calls.log" 2>/dev/null \
-        && grep -qE '(^| )up( |$)' "$SB/.rig/calls.log" 2>/dev/null
-    }
-    poll_until "$WAIT_T" restart_reached || true   # judged by the isolation proof
+    # mock's call log — so wait until the restart has reached the mock: the exact
+    # `up` line, then two render passes (the handler is synchronous, the main loop
+    # only renders once it has returned, so the rest of start_services is done).
+    restart_reached() { grep -qxF -- "$T13_UP" "$SB/.rig/calls.log" 2>/dev/null; }
+    if poll_until "$WAIT_T" restart_reached; then
+      n0="$(sync_n t13)"
+      settle_after t13 "$n0"
+    fi
+    got="$(state_calls "$SB/.rig/calls.log" | grep -vxF -- "$T13_DRIFT")"
+    if [[ "$got" == "$T13_DOWN"$'\n'"$T13_UP" ]]; then
+      ok "env write with a running relay restarts exactly: down --remove-orphans, then up -d --build"
+    else
+      bad "restart sequence is not 'down --remove-orphans' then 'up -d --build' (got: $(printf '%s' "$got" | sed "s# -f $SB/# -f SB/#" | tr '\n' '|' | head -c 200))"
+    fi
   else
     bad "menu entry '.env Editor' not reachable"
   fi
@@ -938,17 +987,14 @@ section "isolation proofs"
 # 1) no state-changing docker call reached the mock of any sandbox — except
 #    the one a check provokes on purpose: the env write of check 13 makes the
 #    TUI restart a running relay (down, then up), which the mock answers.
-risky='(^| )(stop|start|up|down|run|rm|restart|pull|kill|create)( |$)'
 risky_calls=0
 for sb in "${SANDBOXES[@]}"; do
   [[ -f "$sb/.rig/calls.log" ]] || continue
   if [[ "$sb" == */sb-t13 ]]; then
-    n="$(grep -E "$risky" "$sb/.rig/calls.log" | grep -cvE '(^| )(down|up)( |$)')"
-    if grep -qE '(^| )down( |$)' "$sb/.rig/calls.log"; then
-      ok "env write with a running relay triggers the restart path (down reached the mock, not docker)"
-    else
-      bad "env write did not trigger the restart path (no down in the mock log)"
-    fi
+    # the restart of check 13 is judged THERE (exact sequence); here it is only the
+    # allowance: its own down, its own up, and the read-only drift probe — exact lines,
+    # so a different or additional state-changing call still counts
+    n="$(grep -E "$risky" "$sb/.rig/calls.log" | grep -cvxF -e "$T13_DOWN" -e "$T13_UP" -e "$T13_DRIFT")"
   else
     n="$(grep -cE "$risky" "$sb/.rig/calls.log")"
   fi
