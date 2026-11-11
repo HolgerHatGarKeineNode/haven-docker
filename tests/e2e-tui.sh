@@ -589,15 +589,19 @@ else
     tmx send-keys -t t9 C-w
     tmx send-keys -t t9 -l "Q"
     poll_until "$WAIT_T" prompt_has_q
-    # the prompt row only: "bar" must be gone, "foo" must stay (the
-    # implementation also removes the blank in front of the deleted word)
-    row="$(capture t9 | grep 'New key' | head -1)"
-    if [[ "$row" == *"bar"* ]]; then
-      bad "prompt: Ctrl-W did not delete the word"
-    elif [[ "$row" == *"Z9foo"* && "$row" == *"Q"* ]]; then
+    # the whole input cell, not a substring test: "foo" stays, "bar" and the blank in
+    # front of it (the implementation removes both) are gone, the marker follows
+    # directly — "Z9fooQ" and nothing else. A Ctrl-W that deleted one character
+    # would leave "Z9foo baQ"; the cell is cut at the pane border like the filter prompt's.
+    row="$(capture t9 | grep -m1 'New key: ')"
+    cell="${row#*New key: }"
+    cell="${cell%%│*}"
+    cell="${cell#"${cell%%[! ]*}"}"
+    cell="${cell%"${cell##*[! ]}"}"
+    if [[ "$cell" == "Z9fooQ" ]]; then
       ok "prompt: Ctrl-W deletes the word before the cursor"
     else
-      bad "prompt: Ctrl-W left unexpected input ($(printf '%s' "$row" | head -c 80))"
+      bad "prompt: Ctrl-W deletes the word before the cursor (input cell is '$cell', want 'Z9fooQ')"
     fi
     # cancel the prompt — nothing must be written to .env
     if prompt_cancelled t9 "New key"; then
@@ -898,8 +902,23 @@ done
 T13_DOWN="compose -f $SB/docker-compose.yml down --remove-orphans"
 T13_UP="compose -f $SB/docker-compose.yml up -d --build"
 T13_DRIFT="compose -f $SB/docker-compose.yml run --rm --no-deps -T --entrypoint cat relay /app/.env.example.upstream"
-risky='(^| )(stop|start|up|down|run|rm|restart|pull|kill|create)( |$)'   # docker calls that change state
-state_calls() { grep -E "$risky" "$1" 2>/dev/null; }   # <calls.log> — those calls, in order
+# The calls a sandbox's mock may see are an ALLOWLIST: a call is fine when it is read-only
+# (the verbs info, version, ps, inspect, logs — `docker`, or `docker compose -f
+# <sandbox>/docker-compose[.tor].yml` for ps/logs) or when it is one of the exact lines the
+# check in question expects. Everything else is unexpected, whatever its verb: a denylist of
+# verbs (stop|up|down|…) let `system prune -af` through between down and up.
+# The sandbox path is rewritten to SB/ before matching, so the shapes are exact.
+READONLY_CALL='^(info|version|ps( .*)?|inspect( .*)?|logs( .*)?|compose version|compose -f SB/docker-compose(\.tor)?\.yml (ps|logs)( .*)?)$'
+unexpected_calls() { # <sandbox> [<exact allowed line>…] — the calls.log lines that are neither, in order
+  local sb="$1" line x
+  shift
+  [[ -f "$sb/.rig/calls.log" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    for x in "$@"; do [[ "$line" == "$x" ]] && continue 2; done
+    [[ "${line//"$sb/"/SB/}" =~ $READONLY_CALL ]] && continue
+    printf '%s\n' "$line"
+  done < "$sb/.rig/calls.log"
+}
 start_pane t13 120 30 "$SB" './haven tui'
 if ! wait_for t13 "Dashboard"; then
   bad "TUI did not start for the P6 checks"
@@ -958,11 +977,11 @@ else
       n0="$(sync_n t13)"
       settle_after t13 "$n0"
     fi
-    got="$(state_calls "$SB/.rig/calls.log" | grep -vxF -- "$T13_DRIFT")"
+    got="$(unexpected_calls "$SB" "$T13_DRIFT")"
     if [[ "$got" == "$T13_DOWN"$'\n'"$T13_UP" ]]; then
       ok "env write with a running relay restarts exactly: down --remove-orphans, then up -d --build"
     else
-      bad "restart sequence is not 'down --remove-orphans' then 'up -d --build' (got: $(printf '%s' "$got" | sed "s# -f $SB/# -f SB/#" | tr '\n' '|' | head -c 200))"
+      bad "env write with a running relay restarts exactly: down --remove-orphans, then up -d --build (got: $(printf '%s' "$got" | sed "s# -f $SB/# -f SB/#" | tr '\n' '|' | head -c 200))"
     fi
   else
     bad "menu entry '.env Editor' not reachable"
@@ -984,29 +1003,32 @@ fi
 
 # --- isolation proofs --------------------------------------------------------
 section "isolation proofs"
-# 1) no state-changing docker call reached the mock of any sandbox — except
-#    the one a check provokes on purpose: the env write of check 13 makes the
-#    TUI restart a running relay (down, then up), which the mock answers.
-risky_calls=0
+# 1) every call that reached the mock of any sandbox is read-only or expected — the
+#    one provoked on purpose is the env write of check 13, which makes the TUI restart
+#    a running relay (down, then up) and probe the upstream .env.example (read-only).
+#    Allowlist: anything else fails the run and is printed, whatever its verb.
+unexpected=0
+seen=0
 for sb in "${SANDBOXES[@]}"; do
   [[ -f "$sb/.rig/calls.log" ]] || continue
+  seen=$((seen + $(wc -l < "$sb/.rig/calls.log")))
   if [[ "$sb" == */sb-t13 ]]; then
     # the restart of check 13 is judged THERE (exact sequence); here it is only the
-    # allowance: its own down, its own up, and the read-only drift probe — exact lines,
-    # so a different or additional state-changing call still counts
-    n="$(grep -E "$risky" "$sb/.rig/calls.log" | grep -cvxF -e "$T13_DOWN" -e "$T13_UP" -e "$T13_DRIFT")"
+    # allowance: its own down, its own up, and the read-only drift probe — exact lines
+    out="$(unexpected_calls "$sb" "$T13_DOWN" "$T13_UP" "$T13_DRIFT")"
   else
-    n="$(grep -cE "$risky" "$sb/.rig/calls.log")"
+    out="$(unexpected_calls "$sb")"
   fi
-  if [[ "$n" -gt 0 ]]; then
-    say "  unexpected state-changing call(s) in $(basename "$sb"): $(grep -E "$risky" "$sb/.rig/calls.log" | head -3 | tr '\n' '|')"
+  if [[ -n "$out" ]]; then
+    say "  unexpected docker call(s) in $(basename "$sb"):"
+    while IFS= read -r line; do say "    ${line//"$sb/"/SB/}"; done <<< "$out"
+    unexpected=$((unexpected + $(printf '%s\n' "$out" | wc -l)))
   fi
-  risky_calls=$((risky_calls + n))
 done
-if [[ "$risky_calls" -eq 0 ]]; then
-  ok "no unexpected state-changing docker call reached the mock (${#SANDBOXES[@]} sandboxes)"
+if [[ "$unexpected" -eq 0 && "$seen" -gt 0 ]]; then
+  ok "no unexpected state-changing docker call reached the mock (${#SANDBOXES[@]} sandboxes, $seen calls all read-only or expected)"
 else
-  bad "$risky_calls unexpected state-changing docker call(s) reached the mock"
+  bad "no unexpected state-changing docker call reached the mock ($unexpected unexpected of $seen calls)"
 fi
 # 2) the real tree is exactly as it was
 FP_AFTER="$(fingerprint)"
