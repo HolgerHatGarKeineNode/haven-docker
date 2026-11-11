@@ -380,6 +380,12 @@ else
   bad "key latency measured ${lat_ms:-timeout} ms"
 fi
 kill_pane t6
+# seam unset: the TUI must not write a counter (nor a temp file) anywhere
+if [[ -z "$(find "$SB" -name 'sync*' -print -quit)" ]]; then
+  ok "HAVEN_TUI_SYNC_FILE unset: no render counter written"
+else
+  bad "render counter written although HAVEN_TUI_SYNC_FILE was unset"
+fi
 
 # --- 7: producer death — the panel restarts the stream -----------------------
 new_sandbox t7
@@ -658,6 +664,11 @@ else
   else
     bad "Tab back did not restore the log view"
   fi
+fi
+if [[ "$(sync_n t12)" -gt 0 ]]; then
+  ok "HAVEN_TUI_SYNC_FILE set: render counter advanced ($(sync_n t12) passes)"
+else
+  bad "render counter did not advance with HAVEN_TUI_SYNC_FILE set"
 fi
 kill_pane t12
 
