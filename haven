@@ -214,6 +214,16 @@ DOCKER_COMPOSE=()
 COMPOSE_FILE_PLAIN="$ROOT_DIR/docker-compose.yml"
 COMPOSE_FILE_TOR="$ROOT_DIR/docker-compose.tor.yml"
 
+# Relay container name as the host side looks it up (docker ps / inspect). The
+# compose files pin it to haven-relay; HAVEN_CONTAINER_NAME is a seam so tests
+# can run against a differently named (or mocked) container.
+RELAY_CONTAINER="${HAVEN_CONTAINER_NAME:-haven-relay}"
+
+# Optional test seam: with HAVEN_TUI_SYNC_FILE set, the TUI loop writes an
+# incrementing number to that file after every completed render pass (unset:
+# nothing is written). TUI_SYNC_COUNT is the last number written.
+TUI_SYNC_COUNT=0
+
 JSON_FILES=(
   "relays_import.json"
   "relays_blastr.json"
@@ -1035,7 +1045,7 @@ has_tor_container() {
 }
 
 relay_container_running() {
-  docker ps --format '{{.Names}}' | grep -qx 'haven-relay'
+  docker ps --format '{{.Names}}' | grep -qxF -- "$RELAY_CONTAINER"
 }
 
 resolve_mode() {
@@ -2112,7 +2122,7 @@ run_import_once() {
     # a bug in the import (issue #12) — abort with the actual cause instead.
     if relay_container_running; then
       warn "The relay container is still running; the import cannot open db/ while it holds the lock."
-      warn "Stop it manually ('./haven stop' or 'docker stop haven-relay') and run the import again."
+      warn "Stop it manually ('./haven stop' or 'docker stop $RELAY_CONTAINER') and run the import again."
       return 1
     fi
   fi
@@ -2494,12 +2504,12 @@ tui_collect_status() {
       uptime="up ${uptime}"
     fi
     TUI_STATUS_CACHE+=("$name: $state ${uptime}")
-  done < <(docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null | grep -E '^haven-' || true)
+  done < <(docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null | grep -E "^haven-|^${RELAY_CONTAINER}[|]" || true)
   if (( ${#TUI_STATUS_CACHE[@]} == 0 )); then
     TUI_STATUS_CACHE+=("no haven containers")
   fi
 
-  digest="$(docker inspect --format '{{.Image}}' haven-relay 2>/dev/null || true)"
+  digest="$(docker inspect --format '{{.Image}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
   if [[ "$digest" == sha256:* ]]; then
     TUI_STATUS_CACHE+=("image: ${digest:0:22}…")
   else
@@ -3004,7 +3014,7 @@ tui_about() {
   fi
   local digest="-"
   if docker info >/dev/null 2>&1; then
-    digest="$(docker inspect --format '{{.Image}}' haven-relay 2>/dev/null || true)"
+    digest="$(docker inspect --format '{{.Image}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
     if [[ "$digest" == sha256:* ]]; then
       digest="${digest:0:22}…"
     else
@@ -3427,9 +3437,20 @@ tui_handle_key() {
   return 0
 }
 
+# Test seam (see HAVEN_TUI_SYNC_FILE at the top): publish "a render pass has
+# completed" as an incrementing number. Written via a temp file and rename so a
+# reader never sees a half-written value.
+tui_sync_mark() {
+  [[ -n "${HAVEN_TUI_SYNC_FILE:-}" ]] || return 0
+  TUI_SYNC_COUNT=$((TUI_SYNC_COUNT + 1))
+  { printf '%s\n' "$TUI_SYNC_COUNT" > "$HAVEN_TUI_SYNC_FILE.tmp" \
+      && mv -f "$HAVEN_TUI_SYNC_FILE.tmp" "$HAVEN_TUI_SYNC_FILE"; } 2>/dev/null || true
+}
+
 tui_loop() {
   local start_view="$1"
   local running=1
+  local rendered=0
 
   # Size check BEFORE tui_init touches stty/the alternate screen, so a
   # too-small terminal leaves the shell state untouched.
@@ -3482,6 +3503,7 @@ tui_loop() {
         TUI_NEED_MENU=0
         TUI_NEED_LEFT=0
         TUI_NEED_RIGHT=0
+        rendered=1
       else
         TUI_NEED_FRAME=1
         TUI_NEED_MENU=1
@@ -3506,16 +3528,24 @@ tui_loop() {
       TUI_NEED_FRAME=0
       TUI_NEED_LEFT=1
       TUI_NEED_RIGHT=1
+      rendered=1
     fi
 
     if [[ "$TUI_NEED_RIGHT" -eq 1 ]]; then
       tui_render_right_panel
       TUI_NEED_RIGHT=0
+      rendered=1
     fi
 
     if [[ "$TUI_NEED_LEFT" -eq 1 ]]; then
       tui_render_left_menu
       TUI_NEED_LEFT=0
+      rendered=1
+    fi
+
+    if [[ "$rendered" -eq 1 ]]; then
+      rendered=0
+      tui_sync_mark
     fi
 
     tui_read_key || continue
@@ -3534,7 +3564,7 @@ restart_after_env_change() {
   local mode=""
   if docker ps --format '{{.Names}}' | grep -qx 'haven-tor'; then
     mode="tor"
-  elif docker ps --format '{{.Names}}' | grep -qx 'haven-relay'; then
+  elif relay_container_running; then
     mode="plain"
   else
     warn "No running containers to restart."
