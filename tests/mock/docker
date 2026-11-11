@@ -4,6 +4,157 @@
 # that exited, a fixed image digest, and a logs stream that emits a
 # counter line every 200 ms and spawns a marked child process so orphan
 # checks can find it (marker sleep 21777).
+#
+# Scripted mode — active ONLY when MOCK_DOCKER_STATE_DIR is set (unset: the
+# behaviour below the scripted block, unchanged). State lives in that dir:
+#   calls.log   every call, one line, the raw argv ("compose -f f stop relay")
+#   running     names of running containers, one per line (docker ps, compose ps)
+#   exited      names listed as "Exited (0)" by `ps -a`; `stop` appends to it
+#   run-count   number of `compose run` calls so far
+#   started     touched by a held `run`, release: touch `release` to let it go
+# Knobs (environment):
+#   MOCK_STOP_FAILS=1   `compose stop` returns 0 but leaves `running` untouched
+#   MOCK_RUN_EXIT=<n>   exit status of every `compose run` (default 0)
+#   MOCK_FAIL_AT=<n>    the n-th `compose run` (1-based) exits MOCK_RUN_EXIT if
+#                       that is non-zero, else 1
+#   MOCK_RUN_WRITES=1   a `run ... backup /app/backups/<f>` creates <f> on the
+#                       host side of the `-v <host>:/app/backups` mount
+#                       (content: $MOCK_RUN_PAYLOAD or "mock-backup")
+#   MOCK_RUN_HOLD=1     `run` touches `started`, then polls up to MOCK_HOLD_MAX
+#                       seconds (default 10) for `release` before it continues
+#   HAVEN_CONTAINER_NAME  name that start/up/restart mark as running
+#                         (default haven-relay)
+# Only `compose logs` keeps today's endless counter stream in scripted mode.
+
+mock_log() { printf '%s\n' "$*" >> "$MOCK_DOCKER_STATE_DIR/calls.log"; }
+
+mock_ps() { # mock_ps <all:0|1> <format>
+  local all="$1" fmt="$2" n
+  local d="$MOCK_DOCKER_STATE_DIR"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    if [[ "$fmt" == "{{.Names}}|{{.Status}}" ]]; then
+      printf '%s|Up 2 hours (healthy)\n' "$n"
+    else
+      printf '%s\n' "$n"
+    fi
+  done < <(cat "$d/running" 2>/dev/null)
+  if (( all )); then
+    while IFS= read -r n; do
+      [[ -n "$n" ]] || continue
+      grep -qxF -- "$n" "$d/running" 2>/dev/null && continue
+      if [[ "$fmt" == "{{.Names}}|{{.Status}}" ]]; then
+        printf '%s|Exited (0) 4 minutes ago\n' "$n"
+      else
+        printf '%s\n' "$n"
+      fi
+    done < <(cat "$d/exited" 2>/dev/null)
+  fi
+}
+
+mock_scripted() {
+  local d="$MOCK_DOCKER_STATE_DIR" name="${HAVEN_CONTAINER_NAME:-haven-relay}"
+  mkdir -p "$d"
+  mock_log "$*"
+  case "${1:-}" in
+    info) exit 0 ;;
+    inspect)
+      printf 'sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890\n'
+      exit 0
+      ;;
+    ps)
+      local all=0 fmt="{{.Names}}" a
+      for a in "${@:2}"; do
+        [[ "$a" == "-a" ]] && all=1
+        [[ "$a" == "{{.Names}}|"* ]] && fmt="$a"
+      done
+      mock_ps "$all" "$fmt"
+      exit 0
+      ;;
+    compose) ;;
+    *) exit 0 ;;
+  esac
+
+  # compose: skip the global options in front of the subcommand
+  local -a args=("${@:2}")
+  while ((${#args[@]})); do
+    case "${args[0]}" in
+      -f|-p|--file|--project-name|--env-file|--profile) args=("${args[@]:2}") ;;
+      -*) args=("${args[@]:1}") ;;
+      *) break ;;
+    esac
+  done
+  local sub="${args[0]:-}"
+  args=("${args[@]:1}")
+
+  case "$sub" in
+    version) exit 0 ;;
+    logs) return 0 ;;   # falls through to the counter stream below
+    ps)
+      printf 'NAME\tSTATUS\n'
+      mock_ps 0 "{{.Names}}|{{.Status}}" | tr '|' '\t'
+      exit 0
+      ;;
+    stop)
+      if [[ "${MOCK_STOP_FAILS:-0}" != "1" ]]; then
+        if [[ -s "$d/running" ]]; then
+          cat "$d/running" >> "$d/exited"
+        fi
+        : > "$d/running"
+      fi
+      exit 0
+      ;;
+    start|up|restart)
+      printf '%s\n' "$name" > "$d/running"
+      exit 0
+      ;;
+    down)
+      : > "$d/running"
+      exit 0
+      ;;
+    run)
+      local n=0
+      [[ -f "$d/run-count" ]] && n="$(cat "$d/run-count")"
+      n=$((n + 1))
+      printf '%s' "$n" > "$d/run-count"
+      if [[ "${MOCK_RUN_HOLD:-0}" == "1" ]]; then
+        : > "$d/started"
+        local waited=0 max="${MOCK_HOLD_MAX:-10}"
+        while [[ ! -e "$d/release" ]] && (( $(awk "BEGIN{print ($waited < $max)}") )); do
+          sleep 0.05
+          waited="$(awk "BEGIN{print $waited + 0.05}")"
+        done
+      fi
+      if [[ "${MOCK_RUN_WRITES:-0}" == "1" ]]; then
+        local i host="" target="" verb_seen=0 a
+        for ((i = 0; i < ${#args[@]}; i++)); do
+          a="${args[$i]}"
+          if [[ "$a" == "-v" ]]; then
+            [[ "${args[$((i + 1))]:-}" == *":/app/backups" ]] && host="${args[$((i + 1))]%:/app/backups}"
+          elif [[ "$a" == "backup" ]]; then
+            verb_seen=1
+          elif (( verb_seen )) && [[ "$a" == /app/backups/* ]]; then
+            target="$a"
+          fi
+        done
+        if [[ -n "$host" && -n "$target" ]]; then
+          printf '%s' "${MOCK_RUN_PAYLOAD:-mock-backup}" > "$host/${target#/app/backups/}"
+        fi
+      fi
+      local rc="${MOCK_RUN_EXIT:-0}"
+      if [[ -n "${MOCK_FAIL_AT:-}" && "$n" == "$MOCK_FAIL_AT" ]]; then
+        (( rc != 0 )) || rc=1
+      fi
+      exit "$rc"
+      ;;
+    *) exit 0 ;;
+  esac
+}
+
+if [[ -n "${MOCK_DOCKER_STATE_DIR:-}" ]]; then
+  mock_scripted "$@"
+fi
+
 case "${1:-}" in
   info)
     exit 0
