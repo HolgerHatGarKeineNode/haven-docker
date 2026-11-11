@@ -17,6 +17,11 @@ setup() {
 }
 
 teardown() {
+  # a failed assertion must not leave a backgrounded mock holding bats' pipes
+  if [[ -n "${BG_PID:-}" ]]; then
+    kill "$BG_PID" 2>/dev/null || true
+    wait "$BG_PID" 2>/dev/null || true
+  fi
   [[ -n "${TEST_DIR:-}" ]] && rm -rf "$TEST_DIR"
 }
 
@@ -260,6 +265,76 @@ calls() { cat "$MOCK_DOCKER_STATE_DIR/calls.log" 2>/dev/null; }
   [[ "$output" == *"MOCKLOG COUNTER=0"* ]]
   run calls
   [[ "$output" == "compose -f f.yml logs -f relay" ]]
+  after="$(pgrep -fc 'sleep 21777' || true)"
+  [ "${after:-0}" -le "${before:-0}" ]
+}
+
+# ---------- MOCK_LOG_COUNT: a frozen stream ----------
+
+# bg_mock <outfile> — the mock's `compose logs -f` in the background, output in
+# <outfile>, its pid in BG_PID (teardown ends it; fd 3 closed so bats cannot
+# hang on it). `timeout` is only the safety bound.
+bg_mock() {
+  timeout 60 docker compose -f f.yml logs -f relay > "$1" 2>/dev/null 3>&- &
+  BG_PID=$!
+}
+
+# wait_lines <file> <n> — true once the file holds at least n lines (bounded: 10 s)
+wait_lines() {
+  local i
+  for ((i = 0; i < 200; i++)); do
+    (( $(wc -l < "$1") >= $2 )) && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# reap — end the backgrounded mock now (TERM: `&` jobs of a non-interactive shell
+# ignore INT)
+reap() {
+  kill "$BG_PID" 2>/dev/null || true
+  wait "$BG_PID" 2>/dev/null || true
+  BG_PID=""
+}
+
+@test "scripted: MOCK_LOG_COUNT=7 emits exactly COUNTER=0..6, then stays attached without emitting" {
+  local out="$TEST_DIR/out" before after
+  before="$(pgrep -fc 'sleep 21777' || true)"
+  MOCK_LOG_COUNT=7 bg_mock "$out"
+  wait_lines "$out" 7
+  # observation window: five ticks of the endless stream's 200 ms rhythm; a mock
+  # that goes on counting would have written COUNTER=7 long before it ends
+  sleep 1
+  kill -0 "$BG_PID"   # still attached: a finished producer would trip the TUI's restart
+  [[ "$(cat "$out")" == $'MOCKLOG COUNTER=0\nMOCKLOG COUNTER=1\nMOCKLOG COUNTER=2\nMOCKLOG COUNTER=3\nMOCKLOG COUNTER=4\nMOCKLOG COUNTER=5\nMOCKLOG COUNTER=6' ]]
+  reap
+  after="$(pgrep -fc 'sleep 21777' || true)"
+  [ "${after:-0}" -le "${before:-0}" ]
+}
+
+@test "scripted: MOCK_LOG_COUNT unset or empty keeps the endless stream (control for the frozen one)" {
+  local out="$TEST_DIR/out"
+  MOCK_LOG_COUNT="" bg_mock "$out"
+  wait_lines "$out" 9   # more lines than the frozen cases above ever produce
+  reap
+  [[ "$(sed -n 9p "$out")" == "MOCKLOG COUNTER=8" ]]
+}
+
+@test "scripted: MOCK_LOG_COUNT=0 emits nothing and stays attached" {
+  local out="$TEST_DIR/out"
+  MOCK_LOG_COUNT=0 bg_mock "$out"
+  sleep 1
+  kill -0 "$BG_PID"
+  [ ! -s "$out" ]
+  reap
+}
+
+@test "scripted: a non-numeric MOCK_LOG_COUNT is refused with exit 2, not read as an empty stream" {
+  local before after
+  before="$(pgrep -fc 'sleep 21777' || true)"
+  MOCK_LOG_COUNT=abc run timeout 5 docker compose -f f.yml logs -f relay
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"MOCK_LOG_COUNT must be a non-negative integer"* ]]
   after="$(pgrep -fc 'sleep 21777' || true)"
   [ "${after:-0}" -le "${before:-0}" ]
 }

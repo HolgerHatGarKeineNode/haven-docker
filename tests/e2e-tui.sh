@@ -16,6 +16,11 @@
 # working tree is read for writing; the rig proves that at the end by comparing
 # fingerprints of the real .env and of db/ + blossom/ before and after.
 #
+# Stream content: only check 7 (producer restart), 5 and 6 (CPU, latency: the
+# stream is part of the load) run against the endless counter stream. Every claim
+# about WHAT the log panel shows (check 12) is made on a frozen stream, see there.
+# Each section prints its wall time and how many polls ran into their bound.
+#
 # Waiting: no fixed sleeps in front of assertions. Checks poll for a condition
 # (text on screen, selected row, file) with a generous bound; where a negative
 # has to be settled, the TUI's HAVEN_TUI_SYNC_FILE render counter is used.
@@ -30,11 +35,15 @@ WORK="$(mktemp -d)"
 PASS=0
 FAIL=0
 WAIT_T="${E2E_WAIT_T:-30}"   # upper bound (s) for every condition poll
-STREAM_T=40                   # bound (s) for waits on the mock stream's progress: it makes
-                              # 5 lines/s whatever the load, so COUNTER=70 needs 14 s of
+STREAM_T=40                   # bound (s) for waits on the ENDLESS mock stream's progress (check 7): it
+                              # makes 5 lines/s whatever the load, so COUNTER=40 needs 8 s of
                               # stream time, which a short WAIT_T override must not cut off
 declare -A SBOF=()            # tmux session name -> its sandbox directory
 SANDBOXES=()
+TIMEOUT_LOG="$WORK/poll-timeouts.log"   # one line per poll_until that hit its bound
+SEC_NAME=""
+SEC_T0=0
+SEC_TO0=0
 
 # Pinned terminal environment of every pane (the tmux server inherits the
 # caller's environment; the panes get exactly this on top).
@@ -62,6 +71,26 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+
+# --- per-section wall time ----------------------------------------------------
+# section <name> closes the previous section (prints its wall time and how many
+# polls ran into their bound — in a green run that must be 0 for every section
+# that does not wait for a negative on purpose) and opens the next one.
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+timeouts_so_far() { [[ -f "$TIMEOUT_LOG" ]] && wc -l < "$TIMEOUT_LOG" || echo 0; }
+section_end() {
+  [[ -n "$SEC_NAME" ]] || return 0
+  local ms hits
+  ms=$(( $(now_ms) - SEC_T0 ))
+  hits=$(( $(timeouts_so_far) - SEC_TO0 ))
+  say "TIME: $SEC_NAME: $((ms / 1000)).$((ms % 1000 / 100)) s, polls that hit their bound: $hits"
+  if (( hits > 0 )); then
+    tail -n "$hits" "$TIMEOUT_LOG" | sed 's/^/  bound hit: /' | cut -c1-140
+  fi
+  SEC_NAME=""
+}
+section() { section_end; SEC_NAME="$1"; SEC_T0="$(now_ms)"; SEC_TO0="$(timeouts_so_far)"; }
+RUN_T0="$(now_ms)"
 
 # --- fingerprints of the real tree (hashes only, never content) -------------
 
@@ -135,7 +164,12 @@ poll_until() {
   deadline=$(( $(date +%s%N) / 1000000 + t * 1000 ))
   while :; do
     "$@" && return 0
-    (( $(date +%s%N) / 1000000 >= deadline )) && return 1
+    if (( $(date +%s%N) / 1000000 >= deadline )); then
+      # a poll that ran into its bound is a wait that was not a condition (or a
+      # failed check); the file survives command substitutions, an array would not
+      printf '%s\n' "$*" >> "$TIMEOUT_LOG"
+      return 1
+    fi
     sleep 0.05
   done
 }
@@ -144,6 +178,20 @@ has_text() { local out; out="$(capture "$1")"; [[ "$out" == *"$2"* ]]; }
 no_text()  { ! has_text "$1" "$2"; }
 wait_for()    { poll_until "${3:-$WAIT_T}" has_text "$1" "$2"; }
 wait_absent() { poll_until "${3:-$WAIT_T}" no_text "$1" "$2"; }
+
+# right_cells <session> <screen-lines> — the log panel's content rows (4 .. lines-2) of the
+# right pane, trimmed, empty cells left out, one per line. Pure bash: the left pane contains
+# a "│" of its own, so the cell is what follows the LAST "│ " of the row.
+right_cells() {
+  local row cell
+  while IFS= read -r row; do
+    row="${row%│}"
+    cell="${row##*│ }"
+    cell="${cell%"${cell##*[! ]}"}"
+    [[ -n "${cell// /}" ]] && printf '%s\n' "$cell"
+  done < <(capture "$1" | sed -n "4,$(( $2 - 2 ))p")
+}
+cell_present() { right_cells "$1" "$2" | grep -qxF -- "$3"; }
 
 # The render counter of a session (0 while the file does not exist yet).
 sync_n() {
@@ -210,6 +258,7 @@ cpu_ticks() { # utime+stime of pid $1 from /proc
 }
 
 # --- 1: too-small terminal -------------------------------------------------
+section "1 too-small terminal"
 new_sandbox t1
 start_pane t1 60 15 "$SB" 'stty -g > @RIG@/stty-before; ./haven tui; echo $? > @RIG@/rc; stty -g > @RIG@/stty-after; sleep 30'
 poll_until "$WAIT_T" test -s "$SB/.rig/stty-after"
@@ -232,6 +281,7 @@ fi
 kill_pane t1
 
 # --- 2: resize while a prompt is open --------------------------------------
+section "2 resize with prompt"
 new_sandbox t2
 start_pane t2 120 40 "$SB" './haven tui'
 if ! wait_for t2 "Dashboard"; then
@@ -276,6 +326,7 @@ fi
 kill_pane t2
 
 # --- 3: bracketed paste in the main view ------------------------------------
+section "3 bracketed paste"
 new_sandbox t3
 start_pane t3 100 30 "$SB" './haven tui'
 if ! wait_for t3 "Haven"; then
@@ -309,6 +360,7 @@ fi
 kill_pane t3
 
 # --- 4: die() visible after TUI cleanup --------------------------------------
+section "4 die() visibility"
 # Runs in a subshell so die()'s exit does not close the tmux window before
 # the capture; sleep keeps the pane alive with the message on screen. The pane
 # is put on the alternate screen first, like the real TUI: only there does a
@@ -326,6 +378,7 @@ fi
 kill_pane t4
 
 # --- 5: idle CPU — absolute budget -------------------------------------------
+section "5 idle CPU"
 # The TUI's OWN utime+stime over an idle window must stay under a fixed number
 # of ticks. (Until 2026-11-11 this compared against the 50 ms-poll baseline
 # 753dab5; that claim was false once the tick fields were read correctly:
@@ -367,6 +420,7 @@ else
 fi
 
 # --- 6: key latency below 300 ms ---------------------------------------------
+section "6 key latency"
 new_sandbox t6
 : > "$SB/.rig/t6-start"   # files the TUI creates from here on are newer than this
 SYNC=0 start_pane t6 100 30 "$SB" './haven tui'
@@ -411,13 +465,14 @@ else
 fi
 
 # --- 7: producer death — the panel restarts the stream -----------------------
+section "7 producer death"
 new_sandbox t7
 start_pane t7 100 30 "$SB" './haven tui'
 # the first lines (COUNTER=0) must have scrolled out of the panel, otherwise
 # seeing COUNTER=0 after the kill would prove nothing
 if ! wait_for t7 "COUNTER=40" "$STREAM_T"; then
   bad "mock log stream did not reach the panel"
-elif has_text t7 "COUNTER=0 "; then
+elif cell_present t7 30 "MOCKLOG COUNTER=0"; then
   bad "COUNTER=0 still on screen before the kill — restart check would be vacuous"
 else
   # only the producer of THIS sandbox's mock: its argv carries the sandbox path
@@ -427,7 +482,12 @@ else
   else
     kill "$mock_pid" 2>/dev/null
     t0_ms=$(( $(date +%s%N) / 1000000 ))
-    if wait_for t7 "COUNTER=0"; then
+    # Cannot be satisfied by coincidence: the stream counts up from 0 per producer,
+    # the first producer is dead after the kill (no new line from it), and the
+    # pre-check above showed COUNTER=0 is off the screen — so the whole-cell line
+    # "MOCKLOG COUNTER=0" can only be drawn by a producer started AFTER the kill,
+    # i.e. by the restart (a restarted buffer shows it for ~5 s, 5 lines/s).
+    if poll_until "$WAIT_T" cell_present t7 30 "MOCKLOG COUNTER=0"; then
       ok "panel restarted the stream after producer death (fresh COUNTER=0 visible after $(( $(date +%s%N) / 1000000 - t0_ms )) ms)"
     else
       bad "panel did not refresh after producer death ($(capture t7 | grep -c COUNTER) counter lines)"
@@ -437,6 +497,7 @@ fi
 kill_pane t7
 
 # --- 8: navigation keys (P4) --------------------------------------------------
+section "8 navigation"
 new_sandbox t8
 start_pane t8 100 30 "$SB" './haven tui'
 if ! wait_for t8 "Dashboard"; then
@@ -471,6 +532,7 @@ kill_pane t8
 prompt_has_q() { capture t9 | grep 'New key' | grep -q 'Q'; }
 
 # --- 9+10: prompt editor — paste, Ctrl-U, Ctrl-W (P4) -------------------------
+section "9+10 prompt editor"
 # 160 cols so the 30-char paste fits the prompt's input budget.
 new_sandbox t9
 env_hash_t9="$(sha256sum "$SB/.env" | cut -d' ' -f1)"
@@ -533,6 +595,7 @@ fi
 kill_pane t9
 
 # --- 11: masking, reveal, inline validation (P4) ------------------------------
+section "11 masking and validation"
 # A small .env of its own keeps the list on one screen (no scrolling to find
 # the entry); it lives in the sandbox like everything else.
 new_sandbox t11
@@ -600,109 +663,157 @@ else
   bad ".env was modified by the cancelled add"
 fi
 
-# The filter prompt is open when its row shows the label without a filter text
-# after it. (A submitted prompt leaves its row painted until the next prompt
-# overwrites it, so the bare label is not enough to tell "open" from "stale".)
-filter_prompt_ready() {
-  capture t12 | grep 'Filter (empty clears):' | grep -qv 'COUNTER'
+# --- 12: panel QoL — scrollback, filter, status view (P5) ---------------------
+section "12 scrollback, filter, status"
+# Everything this check says about stream CONTENT is said about a FROZEN stream:
+# the mock emits exactly STREAM_N lines (MOCK_LOG_COUNT) and then stays attached
+# and silent, so the screen can be waited for ONCE (the complete expected tail is
+# on it) and read afterwards without a later stream position being able to
+# satisfy or spoil anything. Counts and line sets are compared whole: the cells
+# of the right pane, trimmed, one per row, against the full expected list — not
+# a substring, not "contains", not a poll that a different state could satisfy.
+# After every key that defines the view, settle_after (two finished render
+# passes) comes BEFORE the one read.
+STREAM_N=120                 # lines of the finite stream: COUNTER=0 .. 119
+T12_LINES=34
+T12_H=$((T12_LINES - 5))     # content rows of the log panel (haven-render.bats pins 29 for 120x34)
+
+counters_text() { # <from> <to> — the stream's lines from..to
+  local n
+  for ((n = $1; n <= $2; n++)); do printf 'MOCKLOG COUNTER=%d\n' "$n"; done
+}
+t12_cells() { right_cells t12 "$T12_LINES"; }
+t12_tail_text() { counters_text $((STREAM_N - T12_H)) $((STREAM_N - 1)); }
+# the complete expected live tail is on screen: only the final state of the
+# frozen stream has it, an earlier stream position does not
+t12_tail_shown() { [[ "$(t12_cells)" == "$(t12_tail_text)" ]]; }
+
+# The filter prompt row: its cell (between the label and the pane border) has to
+# equal <text> — "" is "open and empty". A submitted prompt leaves its row painted
+# until the next prompt overwrites it, so the cell, not the bare label, tells
+# "open" from "stale". The row shares its terminal row with the right pane, which
+# is why this reads the cell and not the row.
+filter_prompt_is() { # <text>
+  local row cell
+  row="$(capture t12 | grep -m1 'Filter (empty clears):')" || return 1
+  cell="${row#*Filter (empty clears):}"
+  cell="${cell%%│*}"
+  cell="${cell#"${cell%%[! ]*}"}"
+  cell="${cell%"${cell##*[! ]}"}"
+  [[ "$cell" == "$1" ]]
+}
+# t12_filter <text> — open the filter prompt, type, submit, and wait for the render
+# that applies it (two passes after the Enter)
+t12_filter() {
+  local n0
+  tmx send-keys -t t12 /
+  poll_until "$WAIT_T" filter_prompt_is "" || return 1
+  if [[ -n "$1" ]]; then
+    tmx send-keys -t t12 -l "$1"
+    poll_until "$WAIT_T" filter_prompt_is "$1" || return 1
+  fi
+  n0="$(sync_n t12)"
+  tmx send-keys -t t12 Enter
+  settle_after t12 "$n0"
 }
 
-# --- 12: panel QoL — scrollback, filter, status view (P5) ---------------------
-# The mock stream is endless and the pane shows only its tail, so every claim
-# about older lines or about a filter must be made about data that is NOT in the
-# live tail at that moment. The filter used is "COUNTER=3": it matches exactly
-# the lines 3 and 30-39 (the stream reaches 300 only after a minute), all of them
-# scrolled out of the live tail once the stream is past ~65. One view-defining key
-# is always followed by settle_after, so the capture read afterwards is a finished
-# render, not a title-bar-only half pass.
-# NOT asserted on purpose: the line COUNTER=3 itself. With a filter active the
-# panel hides the first line of the filtered window (the hit-count row takes row
-# 0 but the line index is not shifted) — see the report; asserting 30-39 only
-# keeps this check independent of that.
-counter_rows() { capture t12 | grep -o 'MOCKLOG COUNTER=[0-9]*'; }
-# the filter banner shows exactly "<n> match(es)" — the non-digit in front rules
-# out "61 match(es)" satisfying "1 match(es)"
-hit_count_is() { capture t12 | grep -qE "(^|[^0-9])$1 match\(es\) for 'COUNTER=3'"; }
 new_sandbox t12
 # distinct, known sizes for the status view: db/ gets 3 MB of filler, blossom/ stays
 # as tracked, so a swapped or missing du shows up in the numbers
 head -c 3000000 /dev/zero > "$SB/db/filler"
 du_db="$(du -sh "$SB/db" | awk '{print $1}')"
 du_blossom="$(du -sh "$SB/blossom" | awk '{print $1}')"
-start_pane t12 120 34 "$SB" './haven tui'
-if ! wait_for t12 "COUNTER="; then
-  bad "mock stream did not reach the panel for the P5 checks"
-elif ! wait_for t12 "COUNTER=70" "$STREAM_T"; then
-  # buffer deeper than a page + a screen: PgUp then scrolls a full page (34 rows
-  # -> ~28 visible), and COUNTER=30-39 are out of the live tail
-  bad "mock stream did not reach COUNTER=70 within ${STREAM_T} s (last: $(counter_rows | tail -1))"
+start_pane t12 120 "$T12_LINES" "$SB" "MOCK_LOG_COUNT=$STREAM_N ./haven tui"
+if ! poll_until "$STREAM_T" t12_tail_shown; then
+  bad "frozen stream did not settle: the panel never showed exactly COUNTER=$((STREAM_N - T12_H))..$((STREAM_N - 1)) (rows: $(t12_cells | wc -l), last: $(t12_cells | tail -1))"
 else
-  n0="$(sync_n t12)"
-  tmx send-keys -t t12 PgUp
-  settle_after t12 "$n0" || true
-  if wait_for t12 "paused"; then
+  ok "frozen stream settled: the panel shows exactly the newest $T12_H lines (COUNTER=$((STREAM_N - T12_H))..$((STREAM_N - 1)))"
+
+  # --- scrollback: one page back, the top, and the way down again
+  page=$((T12_H - 1))
+  lo=$((STREAM_N - T12_H - page))
+  send_settled t12 PgUp
+  if has_text t12 "paused (PgDn: resume)"; then
     ok "PgUp pauses the panel and shows the pause banner"
   else
     bad "PgUp did not show the pause banner"
   fi
-  older_n="$(counter_rows | tail -1 | grep -o '[0-9]*$')"
-  n0="$(sync_n t12)"
-  tmx send-keys -t t12 PgDn
-  settle_after t12 "$n0" || true
-  if wait_absent t12 "paused"; then
-    ok "PgDn resumes the live view"
+  if [[ "$(t12_cells)" == "$(counters_text "$lo" $((lo + T12_H - 1)))" ]]; then
+    ok "PgUp pages back exactly one page (COUNTER=$lo..$((lo + T12_H - 1)))"
   else
-    bad "PgDn did not resume the live view"
+    bad "PgUp page is not COUNTER=$lo..$((lo + T12_H - 1)) (rows: $(t12_cells | head -1) .. $(t12_cells | tail -1), $(t12_cells | wc -l) rows)"
   fi
-  # The bottom row of the paused view is a page behind the live end. Measured
-  # against the live end seen AFTER the resume (which can only be further on, so
-  # load cannot turn a healthy view red); a PgUp that pauses but keeps showing
-  # the tail lands within a few lines of it.
-  live_n="$(counter_rows | tail -1 | grep -o '[0-9]*$')"
-  rows="$(counter_rows | wc -l)"
-  if ! [[ "$older_n" =~ ^[0-9]+$ && "$live_n" =~ ^[0-9]+$ ]] || (( rows < 10 )); then
-    bad "scrollback check has no data (older='$older_n' live='$live_n' rows=$rows)"
-  elif (( live_n - older_n >= rows / 2 )); then
-    ok "scrollback shows older lines (paused bottom COUNTER=$older_n, live end COUNTER=$live_n, $rows rows)"
+  # four more pages: the 4th already reaches the top, the 5th must not scroll past it
+  for _ in 1 2 3 4; do send_settled t12 PgUp; done
+  if [[ "$(t12_cells)" == "$(counters_text 0 $((T12_H - 1)))" ]]; then
+    ok "PgUp at the top stops at the oldest line (COUNTER=0..$((T12_H - 1)))"
   else
-    bad "scrollback still shows the live tail (paused bottom COUNTER=$older_n, live end COUNTER=$live_n, $rows rows)"
+    bad "top of the scrollback is not COUNTER=0..$((T12_H - 1)) (rows: $(t12_cells | head -1) .. $(t12_cells | tail -1), $(t12_cells | wc -l) rows)"
+  fi
+  # the way back: from the clamped top four pages bring the live end back — had the
+  # scroll position overshot the top, four PgDn would still be paused
+  for _ in 1 2 3 4; do send_settled t12 PgDn; done
+  if has_text t12 "paused"; then
+    bad "PgDn did not resume the live view after four pages down from the top"
+  elif t12_tail_shown; then
+    ok "PgDn resumes the live view (exactly COUNTER=$((STREAM_N - T12_H))..$((STREAM_N - 1)) again)"
+  else
+    bad "after PgDn the live tail is not restored (rows: $(t12_cells | head -1) .. $(t12_cells | tail -1))"
   fi
 
-  # live filter via slash
-  if counter_rows | grep -qx 'MOCKLOG COUNTER=35'; then
-    bad "COUNTER=35 still in the live tail — the filter check would be vacuous"
-  fi
-  tmx send-keys -t t12 /
-  poll_until "$WAIT_T" filter_prompt_ready
-  tmx send-keys -t t12 -l "COUNTER=3"
-  wait_for t12 "COUNTER=3"
-  tmx send-keys -t t12 Enter
-  if poll_until "$WAIT_T" hit_count_is 11; then
-    ok "slash search shows the exact live match count (11 match(es) for 'COUNTER=3')"
+  # --- live filter via slash: every line of the finite stream containing a 9
+  want_lines="$(seq 0 $((STREAM_N - 1)) | grep -F 9 | sed 's/^/MOCKLOG COUNTER=/')"
+  want_n="$(printf '%s\n' "$want_lines" | wc -l)"
+  if [[ "$want_n" != "21" ]]; then
+    bad "filter fixture changed: expected 21 lines containing a 9 in the stream, found $want_n"
+  elif ! t12_filter "9"; then
+    bad "filter prompt did not open, take the text or apply it (prompt row: $(capture t12 | grep -m1 'Filter (empty clears):' | head -c 80))"
   else
-    bad "slash search missing/wrong match count ($(capture t12 | grep -o '[0-9]* match(es)[^│]*' | head -1))"
-  fi
-  # kept: a matching line that is no longer in the live tail is shown — only a
-  # filter that keeps matching lines can put it on screen
-  if poll_until 10 has_text t12 "MOCKLOG COUNTER=35"; then
-    ok "filter keeps matching lines that scrolled out of the live tail (COUNTER=35)"
-  else
-    bad "filter does not show the matching line COUNTER=35"
-  fi
-  # hidden: nothing but 3 / 30-39 is left of the stream
-  stray_rows="$(counter_rows | grep -vxE 'MOCKLOG COUNTER=3[0-9]?' | sort -u | tr '\n' ',')"
-  if [[ -z "$stray_rows" ]]; then
-    ok "filter hides non-matching lines"
-  else
-    bad "filter does not hide non-matching lines (still shown: ${stray_rows:0:100})"
-  fi
-  tmx send-keys -t t12 /
-  poll_until "$WAIT_T" filter_prompt_ready
-  tmx send-keys -t t12 Enter
-  if wait_absent t12 "match(es)"; then
-    ok "empty filter input clears the search"
-  else
-    bad "empty filter did not clear the search"
+    cells="$(t12_cells)"
+    banner="$(printf '%s\n' "$cells" | head -1)"
+    shown="$(printf '%s\n' "$cells" | tail -n +2)"
+    if [[ "$banner" == "21 match(es) for '9' (/ resets)" ]]; then
+      ok "slash search shows the exact match count (21 match(es) for '9')"
+    else
+      bad "slash search banner is not '21 match(es) for '9' (/ resets)' (got: ${banner:0:60})"
+    fi
+    # kept: the stream's oldest (9) and newest (119) matches and everything between
+    missing="$(LC_ALL=C comm -13 <(printf '%s\n' "$shown" | LC_ALL=C sort) <(printf '%s\n' "$want_lines" | LC_ALL=C sort) | tr '\n' ',')"
+    if [[ -z "$missing" ]]; then
+      ok "filter keeps every matching line, oldest (COUNTER=9) and newest (COUNTER=119) included"
+    else
+      bad "filter lost matching lines: ${missing:0:120}"
+    fi
+    # hidden: nothing but matching lines, none twice
+    stray="$(LC_ALL=C comm -23 <(printf '%s\n' "$shown" | LC_ALL=C sort) <(printf '%s\n' "$want_lines" | LC_ALL=C sort) | tr '\n' ',')"
+    dups="$(printf '%s\n' "$shown" | LC_ALL=C sort | uniq -d | tr '\n' ',')"
+    if [[ -z "$stray" && -z "$dups" ]]; then
+      ok "filter hides every non-matching line"
+    else
+      bad "filter shows lines it should not (stray: ${stray:0:100} duplicated: ${dups:0:60})"
+    fi
+    if [[ "$shown" == "$want_lines" ]]; then
+      ok "filtered lines come in stream order, the first one right under the banner"
+    else
+      bad "filtered lines are not exactly the expected 21 in stream order (first: $(printf '%s\n' "$shown" | head -1), $(printf '%s\n' "$shown" | wc -l) rows)"
+    fi
+
+    # one match: the banner AND that line — the hit-count row must not eat the first line
+    if ! t12_filter "COUNTER=77"; then
+      bad "second filter prompt did not open or apply"
+    elif [[ "$(t12_cells)" == $'1 match(es) for \'COUNTER=77\' (/ resets)\nMOCKLOG COUNTER=77' ]]; then
+      ok "one match: the banner and that one line are drawn (COUNTER=77)"
+    else
+      bad "one match is not banner + COUNTER=77 (got: $(t12_cells | tr '\n' '|' | head -c 120))"
+    fi
+    # empty input clears: banner gone, live tail back (after the settle, one read)
+    if ! t12_filter ""; then
+      bad "clearing prompt did not open or apply"
+    elif [[ "$(t12_cells)" == "$(t12_tail_text)" ]]; then
+      ok "empty filter input clears the search (banner gone, live tail restored)"
+    else
+      bad "empty filter did not clear the search (rows: $(t12_cells | head -1) .. $(t12_cells | tail -1))"
+    fi
   fi
 
   # status panel via Tab
@@ -731,11 +842,11 @@ else
   else
     bad "directory sizes wrong or missing in the status view (want db/: $du_db blossom/: $du_blossom; got: $(printf '%s' "$out" | grep -o '\(db\|blossom\)/: [^ ]*' | tr '\n' ' '))"
   fi
-  tmx send-keys -t t12 Tab
-  if wait_for t12 "COUNTER="; then
-    ok "Tab switches back to the log view"
+  send_settled t12 Tab
+  if t12_tail_shown; then
+    ok "Tab switches back to the log view (the frozen tail is drawn again)"
   else
-    bad "Tab back did not restore the log view"
+    bad "Tab back did not restore the log view (rows: $(t12_cells | head -1) .. $(t12_cells | tail -1))"
   fi
 fi
 if [[ "$(sync_n t12)" -gt 0 ]]; then
@@ -746,6 +857,7 @@ fi
 kill_pane t12
 
 # --- 13: P6 — about screen, timestamped backup on write, docs ---------------
+section "13 about screen, env backup"
 new_sandbox t13
 start_pane t13 120 30 "$SB" './haven tui'
 if ! wait_for t13 "Dashboard"; then
@@ -822,6 +934,7 @@ else
 fi
 
 # --- isolation proofs --------------------------------------------------------
+section "isolation proofs"
 # 1) no state-changing docker call reached the mock of any sandbox — except
 #    the one a check provokes on purpose: the env write of check 13 makes the
 #    TUI restart a running relay (down, then up), which the mock answers.
@@ -857,6 +970,8 @@ else
   bad "real repo changed during the run"
 fi
 
+section_end
+say "TIME: whole run $(( ($(now_ms) - RUN_T0) / 1000 )) s"
 say ""
 say "e2e-tui: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

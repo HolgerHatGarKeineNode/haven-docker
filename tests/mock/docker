@@ -24,7 +24,15 @@
 #                       seconds (default 10) for `release` before it continues
 #   HAVEN_CONTAINER_NAME  name that start/up/restart mark as running
 #                         (default haven-relay)
-# Only `compose logs` keeps today's endless counter stream in scripted mode.
+#   MOCK_LOG_COUNT=<n>  `compose logs` emits exactly n lines (MOCKLOG COUNTER=0 ..
+#                       n-1) without pausing, then stays attached and silent until
+#                       it is killed — a FROZEN stream, so an e2e check can wait once
+#                       for the last line and then read a screen that cannot move
+#                       (and the TUI's producer-death restart does not fire, the
+#                       producer is alive). Works in both modes; unset or empty =
+#                       the endless counter stream (every 200 ms) below.
+# Without MOCK_LOG_COUNT `compose logs` keeps today's endless counter stream in
+# scripted mode.
 
 mock_log() { printf '%s\n' "$*" >> "$MOCK_DOCKER_STATE_DIR/calls.log"; }
 
@@ -189,8 +197,20 @@ case "${1:-}" in
       exit 0
     fi
     # logs path (arguments ignored): marker child + counter stream
+    if [[ -n "${MOCK_LOG_COUNT:-}" ]] && ! [[ "$MOCK_LOG_COUNT" =~ ^[0-9]+$ ]]; then
+      # before the marker child exists, so a refusal leaves no orphan behind
+      printf 'mock docker: MOCK_LOG_COUNT must be a non-negative integer, got "%s"\n' "$MOCK_LOG_COUNT" >&2
+      exit 2
+    fi
     ( sleep 21777 ) &
     n=0
+    if [[ -n "${MOCK_LOG_COUNT:-}" ]]; then
+      while (( n < MOCK_LOG_COUNT )); do
+        printf 'MOCKLOG COUNTER=%d\n' "$n"
+        n=$((n + 1))
+      done
+      wait   # attached and silent: the marker child above keeps this process alive
+    fi
     while :; do
       printf 'MOCKLOG COUNTER=%d\n' "$n"
       n=$((n + 1))
