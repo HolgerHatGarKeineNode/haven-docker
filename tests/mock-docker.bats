@@ -195,7 +195,13 @@ calls() { cat "$MOCK_DOCKER_STATE_DIR/calls.log" 2>/dev/null; }
 
 # ---------- run: hold gate ----------
 
-@test "scripted: MOCK_RUN_HOLD=1 holds run until release appears" {
+@test "scripted: MOCK_RUN_HOLD=1 holds run until release appears, and release ends it well inside the bound" {
+  # The bound is set far above what a working release needs. A mock that
+  # ignored the release file would still exit 0 — but only after sitting out
+  # the whole bound, which the elapsed-time check below tells apart.
+  export MOCK_HOLD_MAX=20
+  local t0 t1
+  t0="$(date +%s%N)"
   MOCK_RUN_HOLD=1 docker compose -f f.yml run --rm relay &
   local pid=$! i
   for i in $(seq 1 100); do
@@ -208,7 +214,11 @@ calls() { cat "$MOCK_DOCKER_STATE_DIR/calls.log" 2>/dev/null; }
   touch "$MOCK_DOCKER_STATE_DIR/release"
   local rc=0
   wait "$pid" || rc=$?
+  t1="$(date +%s%N)"
   [ "$rc" -eq 0 ]
+  # released: gone within half of the 20 s bound (a working release takes
+  # ~0.1 s; a mock that waits out the bound takes 20 s)
+  [ $(( (t1 - t0) / 1000000 )) -lt 10000 ]
 }
 
 @test "scripted: the hold gate is bounded by MOCK_HOLD_MAX" {

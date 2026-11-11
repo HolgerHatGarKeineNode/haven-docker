@@ -68,6 +68,27 @@ relay_probe() {
   grep -qxF "inspect --format {{.Image}} haven-relay" "$MOCK_DOCKER_STATE_DIR/calls.log"
 }
 
+# about_probe — runs tui_about with tui_message stubbed to print its text
+about_probe() {
+  bash -c 'source '"$REPO_ROOT"'/haven; set +e; tui_message() { printf "%s|%s\n" "$1" "$2"; }; tui_about'
+}
+
+@test "seam name: the about screen asks docker about the configured name" {
+  export HAVEN_CONTAINER_NAME=haven-test-4711
+  run about_probe
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Relay image digest: sha256:abcdef123456789…"* ]]
+  grep -qxF "inspect --format {{.Image}} haven-test-4711" "$MOCK_DOCKER_STATE_DIR/calls.log"
+  ! grep -q "inspect --format {{.Image}} haven-relay" "$MOCK_DOCKER_STATE_DIR/calls.log"
+}
+
+@test "seam name: unset, the about screen still asks for haven-relay" {
+  run about_probe
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Relay image digest: sha256:abcdef123456789…"* ]]
+  grep -qxF "inspect --format {{.Image}} haven-relay" "$MOCK_DOCKER_STATE_DIR/calls.log"
+}
+
 @test "seam name: the status list shows a configured name that lacks the haven- prefix" {
   export HAVEN_CONTAINER_NAME=relay-under-test
   printf 'relay-under-test\nunrelated\n' > "$MOCK_DOCKER_STATE_DIR/running"
