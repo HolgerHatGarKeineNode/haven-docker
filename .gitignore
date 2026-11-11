@@ -1,11 +1,17 @@
 .idea
 .env
 .env.bak
+.env.bak.*
 .env.tmp
 relays_import.json
 relays_blastr.json
 blacklisted_npubs.json
 whitelisted_npubs.json
+relays_import.json.bak.*
+relays_blastr.json.bak.*
+blacklisted_npubs.json.bak.*
+whitelisted_npubs.json.bak.*
+backups/
 db.zip
 .DS_Store
 /remotion
