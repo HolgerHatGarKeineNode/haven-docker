@@ -2550,11 +2550,16 @@ tui_render_right_logs() {
     "$_BORDER_V" "${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}" \
     "$_PADDED" "$CLR_RESET" "$_BORDER_V"
 
-  tui_log_view_lines "$RIGHT_CONTENT_HEIGHT"
+  # With a filter the hit count takes the first content row: the window of
+  # lines is one row shorter and its row 1 shows the window's first line.
+  local hit_rows=0
+  [[ -n "$LOG_FILTER" ]] && hit_rows=1
+  local body_h=$((RIGHT_CONTENT_HEIGHT - hit_rows))
+  tui_log_view_lines "$body_h"
   local -a view_lines=("${_VIEW_LINES[@]+"${_VIEW_LINES[@]}"}")
   local total=${#view_lines[@]}
   local start=$_VIEW_START
-  local count=$((total - start > RIGHT_CONTENT_HEIGHT ? RIGHT_CONTENT_HEIGHT : total - start))
+  local count=$((total - start > body_h ? body_h : total - start))
   local end=$((start + count))
 
   # Filter hit count goes on the first content row so it stays visible
@@ -2565,14 +2570,13 @@ tui_render_right_logs() {
 
   local row idx line line_color
   for ((row=0; row<RIGHT_CONTENT_HEIGHT; row++)); do
-    idx=$((start + row))
+    idx=$((start + row - hit_rows))
     line=""
     line_color=""
     if [[ -n "$hitline" && "$row" -eq 0 ]]; then
       line="$hitline"
       line_color="${TUI_DIM}${TUI_ITALIC}"
       hitline=""
-      idx=$((idx - 1))
     elif [[ "$idx" -lt "$end" ]]; then
       line="${view_lines[$idx]}"
       # Colorize based on content
