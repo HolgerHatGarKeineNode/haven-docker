@@ -109,3 +109,53 @@ render() {
   done
   [[ "$output" == "$want" ]]
 }
+
+# render_after_pgup <n-lines> <filter> <presses> — like render, but the scroll
+# position comes from pressing PgUp <presses> times (tui_handle_key), so the
+# clamp of the key handler decides what the window shows
+render_after_pgup() {
+  N="$1" F="$2" P="$3" bash -c '
+    export TERM=xterm-256color COLUMNS=120 LINES=34
+    source '"$REPO_ROOT"'/haven
+    set +e
+    tui_update_layout
+    LOG_LINES=(); for ((i = 0; i < N; i++)); do LOG_LINES+=("MOCKLOG COUNTER=$i"); done
+    LOG_FILTER="$F"; LOG_SCROLL=0; TUI_RIGHT_MODE=logs
+    for ((p = 0; p < P; p++)); do tui_handle_key pgup; done
+    tui_render_right_logs
+  ' | sed -E 's/\x1b\[([0-9]+);[0-9]+H/\n@\1:/g' \
+    | grep -E '^@([4-9]|[12][0-9]|3[0-2]):' \
+    | sed -E 's/\x1b\[[0-9;]*m//g; s/ +$//' \
+    | grep -vE '^@[0-9]+:$'
+}
+
+@test "render: PgUp with a filter matching every line reaches the oldest line" {
+  # 60 lines, all matching: 28 body rows under the banner. The clamp has to use the
+  # filtered length and the filtered window height; against the full height (29) the
+  # top stops one line short and COUNTER=0 is never drawn.
+  run render_after_pgup 60 'COUNTER=' 10
+  [ "$status" -eq 0 ]
+  local want=$'@4:60 match(es) for \'COUNTER=\' (/ resets)' i row=5
+  for ((i = 0; i < 28; i++)); do
+    want+=$'\n'"@$row:MOCKLOG COUNTER=$i"
+    row=$((row + 1))
+  done
+  [[ "$output" == "$want" ]]
+}
+
+@test "render: PgUp with a filter matching some lines stops at the oldest match" {
+  # 120 lines, filter COUNTER=1: 31 matches; the top window is matches 0..27
+  run render_after_pgup 120 'COUNTER=1' 10
+  [ "$status" -eq 0 ]
+  local -a hits=()
+  local i k
+  for ((i = 0; i < 120; i++)); do
+    [[ "$i" == 1 || "$i" == 1[0-9] || "$i" == 1[0-9][0-9] ]] && hits+=("$i")
+  done
+  local want=$'@4:31 match(es) for \'COUNTER=1\' (/ resets)' row=5
+  for ((k = 0; k < 28; k++)); do
+    want+=$'\n'"@$row:MOCKLOG COUNTER=${hits[$k]}"
+    row=$((row + 1))
+  done
+  [[ "$output" == "$want" ]]
+}

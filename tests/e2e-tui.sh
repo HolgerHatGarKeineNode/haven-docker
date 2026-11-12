@@ -8,6 +8,9 @@
 #   5-7. idle CPU, key latency, log producer death
 #   8. navigation keys; 9-11. prompt editor, masking, inline validation
 #   12. log scrollback, filter, status view; 13. about screen, env write backup
+#   14. frame geometry (capture -N) at five sizes and after a resize
+#   15. NO_COLOR; 16. restart after an .env change asks before it stops
+#   17. TUI stderr stays empty through every view
 #
 # Isolation (enforced here, not requested): every check runs in its OWN copy of
 # the repository's tracked files under a temp dir, with .env.example as .env, a
@@ -155,6 +158,7 @@ kill_pane() { tmx kill-session -t "$1" >/dev/null 2>&1 || true; }
 # --- polling helpers --------------------------------------------------------
 
 capture()   { tmx capture-pane -p -t "$1"; }
+capture_n() { tmx capture-pane -p -N -t "$1"; }   # trailing blanks kept: columns stay true
 pane_dead() { tmx list-panes -t "$1" -F '#{pane_dead}' 2>/dev/null | head -1; }
 
 # poll_until <timeout_s> <command...> — true as soon as the command succeeds
@@ -284,10 +288,10 @@ kill_pane t1
 section "2 resize with prompt"
 new_sandbox t2
 start_pane t2 120 40 "$SB" './haven tui'
-if ! wait_for t2 "Dashboard"; then
+if ! wait_for t2 "▸ s Start"; then
   bad "TUI did not reach the main view (startup)"
-elif ! goto_item t2 ".env Editor"; then
-  bad "menu entry '.env Editor' not reachable"
+elif ! goto_item t2 "c Settings (.env)"; then
+  bad "menu entry 'c Settings (.env)' not reachable"
 else
   tmx send-keys -t t2 Enter                             # open env_list
   wait_for t2 "Add variable"
@@ -332,12 +336,12 @@ start_pane t3 100 30 "$SB" './haven tui'
 if ! wait_for t3 "Haven"; then
   bad "TUI did not start for the paste check"
 else
-  wait_for t3 "▸ Start (Docker)"
+  wait_for t3 "▸ s Start"
   alive_before="$(pane_dead t3)"
   tmx send-keys -t t3 -l $'\033[200~pasted-garbage\033[201~'
   # Barrier: keys are consumed in order, so once the Down below took effect the
   # paste has been fully handled.
-  if goto_item t3 "Start (Tor)"; then
+  if goto_item t3 "t Start with Tor"; then
     barrier=1
   else
     barrier=0
@@ -500,7 +504,7 @@ kill_pane t7
 section "8 navigation"
 new_sandbox t8
 start_pane t8 100 30 "$SB" './haven tui'
-if ! wait_for t8 "Dashboard"; then
+if ! wait_for t8 "▸ s Start"; then
   bad "TUI did not start for the navigation check"
 else
   # nav_case <label> <description> — the selection has to END on the label
@@ -511,42 +515,81 @@ else
       bad "navigation: $2 did not select '$1'"
     fi
   }
-  if goto_item t8 "Stop services"; then
-    send_settled t8 k;   nav_case "Start (Tor)" "k"
-    send_settled t8 j;   nav_case "Stop services" "j"
-    send_settled t8 G;   nav_case "Quit" "G"
-    send_settled t8 g;   nav_case "Start (Docker)" "g"
-    send_settled t8 End; nav_case "Quit" "End"
-    send_settled t8 Home; nav_case "Start (Docker)" "Home"
+  if goto_item t8 "x Stop"; then
+    send_settled t8 k;   nav_case "t Start with Tor" "k"
+    send_settled t8 j;   nav_case "x Stop" "j"
+    send_settled t8 G;   nav_case "q Quit" "G"
+    send_settled t8 g;   nav_case "s Start" "g"
+    send_settled t8 End; nav_case "q Quit" "End"
+    send_settled t8 Home; nav_case "s Start" "Home"
+    # group names are skipped: Down from the last Relay entry lands on the first
+    # Data entry, Up from there comes back (the "Data" row is never selected)
+    if goto_item t8 "r Restart"; then
+      send_settled t8 j;  nav_case "b Back up now" "j across the Data group name"
+      send_settled t8 k;  nav_case "r Restart" "k across the Data group name"
+    else
+      bad "navigation: menu entry 'r Restart' not reachable"
+    fi
   else
-    bad "navigation: menu entry 'Stop services' not reachable"
+    bad "navigation: menu entry 'x Stop' not reachable"
   fi
 fi
 kill_pane t8
 
 # NOTE: the digit shortcuts are proven at unit level (tests/haven-input.bats,
-# "digit shortcuts select the nth entry directly"); an e2e case for them can
-# only be index-based and is not kept here. PgUp/PgDn paged the menu until P4;
+# "digit shortcuts select the nth entry directly", and tests/haven-menu.bats for
+# the grouped main menu, where digits count entries, not group names); an e2e
+# case for them can only be index-based and is not kept here. The letter
+# shortcuts are proven against Enter at unit level (tests/haven-menu.bats). PgUp/PgDn paged the menu until P4;
 # P5 assigns them to the log scrollback — see check 12.
 
 prompt_has_q() { capture t9 | grep 'New key' | grep -q 'Q'; }
 
 # prompt_cancelled <session> <label> — Escape at an open prompt, then PROOF that it
-# closed. Looking for the label to vanish cannot work: a closed prompt leaves its row
-# painted until the next full redraw (measured: "New key:" still on screen after
-# Escape, gone after the next selection change), so a wait for its absence ran into
-# its bound in every green run. What closing really means is that the keys reach the
-# menu again: "j" moves the selection when the list has the keys, and is typed INTO the
-# prompt when it is still open. The Escape itself is settled first, so the "j" cannot
-# be read as part of an escape sequence. True only when the selection left
-# "Add variable" AND the prompt row is gone (the redraw the "j" causes repaints it).
+# closed: once the Escape is settled (two render passes), the label row is gone and
+# the terminal row the prompt used shows exactly what it showed before the prompt
+# opened (the menu repainted it), with no further key. Until P5 a closed prompt left
+# its row painted until the next full redraw, and this helper had to send "j" to
+# provoke that redraw. The row text before the prompt is taken by prompt_open.
 prompt_cancelled() {
   local s="$1" label="$2"
   send_settled "$s" Escape || return 1
-  send_settled "$s" j || return 1
-  poll_until "$WAIT_T" prompt_row_gone "$s" "$label"
+  # polled: the end state only — the stale row of the old code is never repainted
+  # by a later pass (spinner passes draw the right pane only), so waiting cannot
+  # turn it into a pass
+  poll_until "$WAIT_T" prompt_row_restored "$s" "$label"
 }
-prompt_row_gone() { no_text "$1" "▸ Add variable" && no_text "$1" "$2"; }
+# prompt_open <session> <expected label> — Enter on the selected entry, remembering
+# the terminal row the prompt is about to use (row TUI_LINES-3, 1-based LINES-2)
+PROMPT_ROW_BEFORE=""
+prompt_open() {
+  local s="$1" label="$2" lines
+  lines="$(tmx display -p -t "$s" '#{pane_height}')"
+  # the list may still be drawing when its first entry shows: two finished passes
+  settle_after "$s" "$(sync_n "$s")"
+  PROMPT_ROW_BEFORE="$(capture_n "$s" | sed -n "$((lines - 2))p")"
+  tmx send-keys -t "$s" Enter
+  wait_for "$s" "$label"
+}
+prompt_row_restored() {
+  local s="$1" label="$2" lines
+  lines="$(tmx display -p -t "$s" '#{pane_height}')"
+  no_text "$s" "$label" && [[ "$(left_cell "$(capture_n "$s" | sed -n "$((lines - 2))p")")" == "$(left_cell "$PROMPT_ROW_BEFORE")" ]]
+}
+# prompt_cell_is <session> <label> <text> — the input cell of the open prompt <label>
+# (between the label and the pane border, trimmed) equals <text>
+prompt_cell_is() {
+  local row cell
+  row="$(capture "$1" | grep -m1 -F -- "$2")" || return 1
+  cell="${row#*"$2"}"
+  cell="${cell%%│*}"
+  cell="${cell#"${cell%%[! ]*}"}"
+  cell="${cell%"${cell##*[! ]}"}"
+  [[ "$cell" == "$3" ]]
+}
+# left_cell <row> — the left pane's part of a screen row (between the first two │);
+# the right pane streams and is no part of the comparison
+left_cell() { local r="${1#│}"; printf '%s' "${r%%│*}"; }
 
 # --- 9+10: prompt editor — paste, Ctrl-U, Ctrl-W (P4) -------------------------
 section "9+10 prompt editor"
@@ -554,16 +597,15 @@ section "9+10 prompt editor"
 new_sandbox t9
 env_hash_t9="$(sha256sum "$SB/.env" | cut -d' ' -f1)"
 start_pane t9 160 30 "$SB" './haven tui'
-if ! wait_for t9 "Dashboard"; then
+if ! wait_for t9 "▸ s Start"; then
   bad "TUI did not start for the prompt editor check"
-elif ! goto_item t9 ".env Editor"; then
-  bad "menu entry '.env Editor' not reachable"
+elif ! goto_item t9 "c Settings (.env)"; then
+  bad "menu entry 'c Settings (.env)' not reachable"
 else
   tmx send-keys -t t9 Enter
   wait_for t9 "Add variable"
   goto_item t9 "Add variable"
-  tmx send-keys -t t9 Enter  # -> "New key: " prompt
-  if ! wait_for t9 "New key"; then
+  if ! prompt_open t9 "New key"; then  # "Add variable" opens the "New key: " prompt
     bad "key prompt did not open"
   else
     # paste 30 characters through bracketed paste
@@ -605,7 +647,7 @@ else
     fi
     # cancel the prompt — nothing must be written to .env
     if prompt_cancelled t9 "New key"; then
-      ok "Escape closes the key prompt (the keys reach the list again)"
+      ok "Escape closes the key prompt and clears its row (the menu row is back, no further key)"
     else
       bad "Escape did not close the key prompt ($(capture t9 | grep -m1 'New key' | head -c 60))"
     fi
@@ -627,10 +669,10 @@ printf 'RELAY_URL="relay.example.org"\nTEST_SECRET_KEY=abcdefgh1234\n' > "$SB/.e
 mkdir -p "$SB/db/private" && printf 'fake\n' > "$SB/db/private/MANIFEST"
 env_hash_t11="$(sha256sum "$SB/.env" | cut -d' ' -f1)"
 start_pane t11 100 30 "$SB" './haven tui'
-if ! wait_for t11 "Dashboard"; then
+if ! wait_for t11 "▸ s Start"; then
   bad "TUI did not start for the masking check"
-elif ! goto_item t11 ".env Editor"; then
-  bad "menu entry '.env Editor' not reachable"
+elif ! goto_item t11 "c Settings (.env)"; then
+  bad "menu entry 'c Settings (.env)' not reachable"
 else
   tmx send-keys -t t11 Enter
   wait_for t11 "TEST_SECRET_KEY = "
@@ -664,8 +706,7 @@ else
   tmx send-keys -t t11 Escape # env_item -> env_list
   wait_for t11 "Add variable"
   goto_item t11 "Add variable"
-  tmx send-keys -t t11 Enter
-  wait_for t11 "New key"
+  prompt_open t11 "New key"
   tmx send-keys -t t11 -l "RELAY_PORT"
   wait_for t11 "RELAY_PORT"
   tmx send-keys -t t11 Enter
@@ -679,17 +720,16 @@ else
     bad "inline validation message missing ($(capture t11 | tr '\n' '|' | head -c 150))"
   fi
   if prompt_cancelled t11 "New value"; then
-    ok "Escape closes the value prompt (the keys reach the list again)"
+    ok "Escape closes the value prompt and clears its row"
   else
     bad "Escape did not close the value prompt ($(capture t11 | grep -m1 'New value' | head -c 60))"
   fi
   # DB_ENGINE away from the engine of the data in db/ is refused at the prompt
   # and names the db-switch that moves the data (the sandbox db/ holds badger)
   wait_for t11 "Add variable"
-  send_settled t11 Home   # prompt_cancelled moved down; goto_item only walks down
+  send_settled t11 Home   # back to the top; goto_item only walks down
   goto_item t11 "Add variable"
-  tmx send-keys -t t11 Enter
-  wait_for t11 "New key"
+  prompt_open t11 "New key"
   tmx send-keys -t t11 -l "DB_ENGINE"
   wait_for t11 "DB_ENGINE"
   tmx send-keys -t t11 Enter
@@ -741,10 +781,11 @@ t12_tail_text() { counters_text $((STREAM_N - T12_H)) $((STREAM_N - 1)); }
 t12_tail_shown() { [[ "$(t12_cells)" == "$(t12_tail_text)" ]]; }
 
 # The filter prompt row: its cell (between the label and the pane border) has to
-# equal <text> — "" is "open and empty". A submitted prompt leaves its row painted
-# until the next prompt overwrites it, so the cell, not the bare label, tells
-# "open" from "stale". The row shares its terminal row with the right pane, which
-# is why this reads the cell and not the row.
+# equal <text> — "" is "open and empty". (Until P5 a submitted prompt left its row
+# painted, so the cell, not the bare label, had to tell "open" from "stale"; since
+# P5 the row is cleared on submit, which t12_filter's caller checks.) The row shares
+# its terminal row with the right pane, which is why this reads the cell and not
+# the row.
 filter_prompt_is() { # <text>
   local row cell
   row="$(capture t12 | grep -m1 'Filter (empty clears):')" || return 1
@@ -758,6 +799,7 @@ filter_prompt_is() { # <text>
 # that applies it (two passes after the Enter)
 t12_filter() {
   local n0
+  PROMPT_ROW_BEFORE="$(capture_n t12 | sed -n "$((T12_LINES - 2))p")"
   tmx send-keys -t t12 /
   poll_until "$WAIT_T" filter_prompt_is "" || return 1
   if [[ -n "$1" ]]; then
@@ -821,6 +863,13 @@ else
   elif ! t12_filter "9"; then
     bad "filter prompt did not open, take the text or apply it (prompt row: $(capture t12 | grep -m1 'Filter (empty clears):' | head -c 80))"
   else
+    # submitted: the prompt row is cleared and the menu row under it is back, with
+    # no further key (two render passes after the Enter have run)
+    if poll_until "$WAIT_T" prompt_row_restored t12 "Filter (empty clears):"; then
+      ok "a submitted prompt clears its row (the menu row is back)"
+    else
+      bad "a submitted prompt left its row painted ($(capture_n t12 | sed -n "$((T12_LINES - 2))p" | head -c 60))"
+    fi
     cells="$(t12_cells)"
     banner="$(printf '%s\n' "$cells" | head -1)"
     shown="$(printf '%s\n' "$cells" | tail -n +2)"
@@ -913,10 +962,9 @@ section "13 about screen, env backup"
 new_sandbox t13
 # The sandbox holds the TRACKED files only; the four <name>.json files the relay mounts
 # are untracked and normally exist on a machine that ran haven before. Without them the
-# start half of the restart opens one "Missing X.json. Copy from X.example.json now?"
-# dialog per file and WAITS for an answer — `up` is not sent until the user has answered
-# four dialogs, which this check never did (it hit its 30 s bound in every green run and
-# the isolation proof only ever saw `down`). Seed them, as on a machine that has run haven.
+# restart asks one "Missing X.json. Copy from X.example.json now?" dialog per file and
+# WAITS for an answer (since P5 before the stop; check 16 covers that path). This check
+# is about the restart sequence alone: seed them, as on a machine that has run haven.
 for example in "$SB"/*.example.json; do
   cp "$example" "${example/.example.json/.json}"
 done
@@ -945,10 +993,10 @@ unexpected_calls() { # <sandbox> [<exact allowed line>…] — the calls.log lin
   done < "$sb/.rig/calls.log"
 }
 start_pane t13 120 30 "$SB" './haven tui'
-if ! wait_for t13 "Dashboard"; then
+if ! wait_for t13 "▸ s Start"; then
   bad "TUI did not start for the P6 checks"
 else
-  if goto_item t13 "About"; then
+  if goto_item t13 "a About"; then
     tmx send-keys -t t13 Enter
     wait_for t13 "Relay image digest:" || true
     out="$(capture t13)"
@@ -965,12 +1013,12 @@ else
     tmx send-keys -t t13 x
     wait_absent t13 "Relay image digest:" 10 || true
   else
-    bad "menu entry 'About' not reachable"
+    bad "menu entry 'a About' not reachable"
   fi
 
   # A real .env write must leave a timestamped backup next to the file
   send_settled t13 Home   # back to the top; goto_item only walks down
-  if goto_item t13 ".env Editor"; then
+  if goto_item t13 "c Settings (.env)"; then
     tmx send-keys -t t13 Enter
     wait_for t13 "Add variable"
     goto_item t13 "Add variable"
@@ -1009,10 +1057,324 @@ else
       bad "env write with a running relay restarts exactly: down --remove-orphans, then up -d --build (got: $(printf '%s' "$got" | sed "s# -f $SB/# -f SB/#" | tr '\n' '|' | head -c 200))"
     fi
   else
-    bad "menu entry '.env Editor' not reachable"
+    bad "menu entry 'c Settings (.env)' not reachable"
   fi
 fi
 kill_pane t13
+
+# --- 14: frame geometry as tmux draws it (P5) ---------------------------------
+section "14 frame geometry"
+# Layer 2 of the geometry proof (layer 1: tests/haven-geometry.bats). The captured
+# screen (`capture-pane -p -N`: without -N trailing blanks are dropped and the
+# widths are wrong) is replayed through tests/term-emu.py: row 1 ends with │ at
+# column COLS-1, row 2 starts with ├, and ┬, the title-row │, ┼ and ┴ share one
+# column; nothing is wider than COLS. Every view that draws the title row, at five
+# sizes, and once after a resize.
+frame_report() { capture_n "$1" | sed 's/$/\r/' | python3 -I "$ROOT_DIR/tests/term-emu.py" "$2" "$3" frame; }
+frame_right() { # <session> <cols> <lines>
+  local rep a b c d
+  rep="$(frame_report "$1" "$2" "$3")"
+  grep -qx 'overflow 0' <<<"$rep" || return 1
+  grep -qx "end 1 $(($2 - 1))" <<<"$rep" || return 1
+  grep -qx 'last 1 │' <<<"$rep" || return 1
+  grep -qx 'first 2 ├' <<<"$rep" || return 1
+  read -r _ a b c d < <(grep '^junction' <<<"$rep")
+  [[ "$a" -gt 0 && "$a" == "$b" && "$a" == "$c" && "$a" == "$d" ]]
+}
+geometry_case() { # <session> <cols> <lines> <view>
+  if poll_until "$WAIT_T" frame_right "$1" "$2" "$3"; then
+    ok "geometry ${2}x${3} $4: row 1 ends with │ at column $(($2 - 1)), row 2 starts with ├, junctions share a column"
+  else
+    bad "geometry ${2}x${3} $4: $(frame_report "$1" "$2" "$3" | grep -E '^(overflow|junction|end 1 |last 1 |first 2 )' | tr '\n' ' ')"
+  fi
+}
+# left_rows <session> <from> <to> — the left pane's cells of screen rows from..to (1-based)
+left_rows() { capture_n "$1" | sed -n "$2,$3p" | while IFS= read -r r; do left_cell "$r"; echo; done; }
+# geometry_walk <session> <cols> <lines> — main, settings, access lists, status, log filter
+geometry_walk() {
+  local s="$1" c="$2" l="$3"
+  geometry_case "$s" "$c" "$l" "main"
+  send_settled "$s" c
+  if wait_for "$s" "Add variable"; then
+    geometry_case "$s" "$c" "$l" "settings"
+    if [[ "$c" == 80 ]]; then
+      if [[ "$(capture "$s" | sed -n 2p)" == *"Settings"* ]]; then
+        ok "after opening Settings row 1 names it ($(capture "$s" | sed -n 2p | cut -c1-30))"
+      else
+        bad "row 1 does not name Settings ($(capture "$s" | sed -n 2p | cut -c1-40))"
+      fi
+    fi
+  else
+    bad "geometry ${c}x${l}: settings did not open"
+  fi
+  send_settled "$s" Escape
+  wait_for "$s" "▸ s Start"
+  send_settled "$s" l
+  if wait_for "$s" "Haven / Access lists"; then
+    geometry_case "$s" "$c" "$l" "access lists"
+  else
+    bad "geometry ${c}x${l}: access lists did not open"
+  fi
+  send_settled "$s" Escape
+  wait_for "$s" "▸ s Start"
+  send_settled "$s" Tab
+  if wait_for "$s" "◉ Status"; then
+    geometry_case "$s" "$c" "$l" "status"
+  else
+    bad "geometry ${c}x${l}: status view did not open"
+  fi
+  send_settled "$s" Tab
+  tmx send-keys -t "$s" /
+  wait_for "$s" "Filter (empty clears):"
+  tmx send-keys -t "$s" -l "=1"
+  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter (empty clears):" "=1"
+  tmx send-keys -t "$s" Enter
+  if wait_for "$s" "match(es) for '=1'"; then
+    geometry_case "$s" "$c" "$l" "log filter"
+  else
+    bad "geometry ${c}x${l}: the log filter did not apply"
+  fi
+}
+
+for size in 66x20 80x24 100x24 120x30 160x40; do
+  c="${size%x*}" l="${size#*x}" s="t14_$c"
+  new_sandbox "t14-$c"
+  start_pane "$s" "$c" "$l" "$SB" "MOCK_LOG_COUNT=40 ./haven tui"
+  if ! wait_for "$s" "▸ s Start"; then
+    bad "geometry ${size}: TUI did not reach the main view"
+    kill_pane "$s"
+    continue
+  fi
+  if [[ "$c" == 80 ]]; then
+    # rows 1-4 (1-based) hold "Haven" once: row 2 names the view, the menu body has
+    # no breadcrumb and no title row of its own
+    top="$(capture "$s" | sed -n '1,4p')"
+    if [[ "$(grep -o Haven <<<"$top" | wc -l)" -eq 1 ]]; then
+      ok "rows 1-4 of the main view contain Haven once"
+    else
+      bad "rows 1-4 of the main view contain Haven $(grep -o Haven <<<"$top" | wc -l) times"
+    fi
+    # the state line at 80 columns: whole words only, no ellipsis
+    state="$(left_rows "$s" 4 4)"
+    if [[ "$state" == *"●"* || "$state" == *"○"* ]] && [[ "$state" != *"..."* && "$state" != *"…"* ]]; then
+      ok "the state line at 80 columns is not cut ($(sed 's/ *$//' <<<"$state"))"
+    else
+      bad "the state line at 80 columns is cut or missing ('$state')"
+    fi
+    # the whole menu on one screen: the last entry is drawn, nothing scrolled
+    if has_text "$s" "q Quit" && has_text "$s" "Relay" && has_text "$s" "s Start"; then
+      ok "all 15 entries and the group names are visible at 80x24 (first and last drawn)"
+    else
+      bad "the main menu does not fit 80x24"
+    fi
+  fi
+  geometry_walk "$s" "$c" "$l"
+  if [[ "$c" == 120 ]]; then
+    tmx resize-window -t "$s" -x 100 -y 24
+    geometry_case "$s" 100 24 "log filter, after a resize from 120x30"
+  fi
+  kill_pane "$s"
+done
+
+# --- 15: NO_COLOR (P5) ---------------------------------------------------------
+section "15 NO_COLOR"
+# colour_sgr — the colour parameters (30-38, 40-48, 90-97, 100-107) in the SGR
+# sequences on stdin, space separated; empty when there are none
+colour_sgr() {
+  python3 -I -c '
+import re, sys
+found = set()
+for m in re.finditer(r"\x1b\[([0-9;:]*)m", sys.stdin.read()):
+    for p in re.split("[;:]", m.group(1)):
+        if p and (30 <= int(p) <= 38 or 40 <= int(p) <= 48 or 90 <= int(p) <= 97 or 100 <= int(p) <= 107):
+            found.add(int(p))
+print(" ".join(str(n) for n in sorted(found)))'
+}
+new_sandbox t15
+start_pane t15 80 24 "$SB" 'NO_COLOR=1 MOCK_LOG_COUNT=30 ./haven tui'
+new_sandbox t15c
+start_pane t15c 80 24 "$SB" 'env -u NO_COLOR MOCK_LOG_COUNT=30 ./haven tui'
+if wait_for t15 "▸ s Start" && wait_for t15 "COUNTER=29"; then
+  sgr="$(tmx capture-pane -p -e -t t15 | colour_sgr)"
+  if [[ -z "$sgr" ]]; then
+    ok "NO_COLOR=1: the main view holds no colour SGR code"
+  else
+    bad "NO_COLOR=1: colour SGR codes on screen: $sgr"
+  fi
+  sel_row="$(tmx capture-pane -p -e -t t15 | grep -m1 '▸ s Start')"
+  if [[ -n "$sel_row" && "$sel_row" =~ $'\e'\[([0-9]+\;)*7(\;[0-9]+)*m ]]; then
+    ok "NO_COLOR=1: the selected row shows ▸ in reverse video"
+  else
+    bad "NO_COLOR=1: the selected row lacks ▸ or reverse video ($(printf '%q' "${sel_row:0:60}"))"
+  fi
+else
+  bad "NO_COLOR=1: TUI did not reach the main view"
+fi
+if wait_for t15c "▸ s Start" && wait_for t15c "COUNTER=29"; then
+  sgr="$(tmx capture-pane -p -e -t t15c | colour_sgr)"
+  if [[ -n "$sgr" ]]; then
+    ok "control without NO_COLOR: colour SGR codes found ($sgr)"
+  else
+    bad "control without NO_COLOR: no colour codes — the NO_COLOR check has no resolving power"
+  fi
+else
+  bad "control without NO_COLOR: TUI did not reach the main view"
+fi
+kill_pane t15
+kill_pane t15c
+
+# --- 16: restart after an .env change asks its dialogs before the stop (P5) -----
+section "16 restart dialogs before stop"
+# The sandbox has no <name>.json (untracked files are not copied): the start half
+# of the restart asks one "Missing X.json" dialog per file. They must come BEFORE
+# the relay is stopped, so an unanswered dialog never leaves it down. The dialog is
+# drawn from inside the restart handler, synchronously: once it is on screen,
+# every docker call before it is in calls.log.
+new_sandbox t16
+T16_DOWN="compose -f $SB/docker-compose.yml down --remove-orphans"
+T16_UP="compose -f $SB/docker-compose.yml up -d --build"
+T16_DRIFT="compose -f $SB/docker-compose.yml run --rm --no-deps -T --entrypoint cat relay /app/.env.example.upstream"
+start_pane t16 120 30 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui'
+if ! wait_for t16 "▸ s Start"; then
+  bad "TUI did not start for the restart dialog check"
+else
+  send_settled t16 c
+  wait_for t16 "Add variable"
+  goto_item t16 "Add variable"
+  prompt_open t16 "New key"
+  tmx send-keys -t t16 -l "E2E_RESTART_KEY"
+  poll_until "$WAIT_T" prompt_cell_is t16 "New key:" "E2E_RESTART_KEY"
+  tmx send-keys -t t16 Enter
+  wait_for t16 "New value"
+  tmx send-keys -t t16 -l "7"
+  poll_until "$WAIT_T" prompt_cell_is t16 "New value:" "7"
+  tmx send-keys -t t16 Enter
+  if wait_for t16 "Missing blacklisted_npubs.json"; then
+    early="$(grep -E '^compose .* (down|stop)( |$)' "$SB/.rig/calls.log" 2>/dev/null)"
+    if [[ -z "$early" ]]; then
+      ok "restart after an .env change: the first JSON dialog is up and no down/stop reached the mock"
+    else
+      bad "restart after an .env change stopped the relay before the dialogs: $(printf '%s' "$early" | sed "s# -f $SB/# -f SB/#" | head -1)"
+    fi
+    for name in blacklisted_npubs relays_blastr relays_import whitelisted_npubs; do
+      wait_for t16 "Missing $name.json" || break
+      tmx send-keys -t t16 Enter
+    done
+    t16_up() { grep -qxF -- "$T16_UP" "$SB/.rig/calls.log" 2>/dev/null; }
+    if poll_until "$WAIT_T" t16_up; then
+      settle_after t16 "$(sync_n t16)"
+    fi
+    got="$(unexpected_calls "$SB" "$T16_DRIFT")"
+    if [[ "$got" == "$T16_DOWN"$'\n'"$T16_UP" ]]; then
+      ok "after the four dialogs the restart runs: down --remove-orphans, then up -d --build"
+    else
+      bad "restart after the dialogs is not down, then up (got: $(printf '%s' "$got" | sed "s# -f $SB/# -f SB/#" | tr '\n' '|' | head -c 200))"
+    fi
+  else
+    bad "no 'Missing blacklisted_npubs.json' dialog after the .env write ($(capture t16 | tr '\n' '|' | head -c 160))"
+  fi
+fi
+kill_pane t16
+
+# --- 17: TUI stderr stays empty through every view (P5) -------------------------
+section "17 TUI stderr"
+# The console of a bash TUI is its stderr: a failing command in a render path
+# prints there and nothing else notices. A scripted walk through every view and
+# dialog (state-changing entries are cancelled at their confirm), then Quit; the
+# stderr file must be 0 bytes. Control: a copy with one failing command injected
+# into the menu painter makes it non-empty.
+tui_walk() { # <session>
+  local s="$1" k text
+  wait_for "$s" "▸ s Start" || return 1
+  for k in s t x r i; do
+    case "$k" in
+      s) text="Start services (Docker)?" ;;
+      t) text="Start services (Tor)?" ;;
+      x) text="Stop services (" ;;
+      r) text="Restart services (" ;;
+      i) text="Import notes now?" ;;
+    esac
+    tmx send-keys -t "$s" "$k"
+    wait_for "$s" "$text" || return 1
+    tmx send-keys -t "$s" Escape
+    wait_absent "$s" "$text" || return 1
+  done
+  for k in b e d '?' a o u; do
+    case "$k" in
+      b) text="To back up the database" ;;
+      e) text="To restore a backup" ;;
+      d) text="To move the data" ;;
+      '?') text="Quick help" ;;
+      a) text="Relay image digest" ;;
+      o) text="Onion Host" ;;
+      u) text="No missing variables" ;;
+    esac
+    tmx send-keys -t "$s" "$k"
+    wait_for "$s" "$text" || return 1
+    tmx send-keys -t "$s" x
+    wait_absent "$s" "$text" || return 1
+  done
+  send_settled "$s" c
+  wait_for "$s" "Add variable" || return 1
+  goto_item "$s" "RELAY_URL" || return 1
+  send_settled "$s" Enter
+  wait_for "$s" "Reveal value" || return 1
+  send_settled "$s" Escape
+  wait_for "$s" "Add variable" || return 1
+  send_settled "$s" Escape
+  wait_for "$s" "▸ s Start" || return 1
+  send_settled "$s" l
+  wait_for "$s" "Relays Import" || return 1
+  send_settled "$s" Enter
+  wait_for "$s" "Add item" || return 1
+  send_settled "$s" Escape
+  send_settled "$s" Escape
+  wait_for "$s" "▸ s Start" || return 1
+  send_settled "$s" Tab
+  wait_for "$s" "◉ Status" || return 1
+  send_settled "$s" Tab
+  tmx send-keys -t "$s" /
+  wait_for "$s" "Filter (empty clears):" || return 1
+  tmx send-keys -t "$s" -l "=1"
+  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter (empty clears):" "=1" || return 1
+  tmx send-keys -t "$s" Enter
+  wait_for "$s" "match(es) for '=1'" || return 1
+  tmx send-keys -t "$s" /
+  wait_for "$s" "Filter (empty clears):" || return 1
+  tmx send-keys -t "$s" Enter
+  wait_absent "$s" "match(es) for" || return 1
+  tmx send-keys -t "$s" q
+  poll_until "$WAIT_T" test -s "${SBOF[$s]}/.rig/rc"
+}
+seed_jsons() { local e; for e in "$1"/*.example.json; do cp "$e" "${e/.example.json/.json}"; done; }
+new_sandbox t17
+seed_jsons "$SB"
+start_pane t17 120 30 "$SB" 'MOCK_LOG_COUNT=20 ./haven tui 2>@RIG@/stderr; echo $? > @RIG@/rc; sleep 30'
+if tui_walk t17; then
+  if [[ -f "$SB/.rig/stderr" && ! -s "$SB/.rig/stderr" && "$(cat "$SB/.rig/rc")" == 0 ]]; then
+    ok "TUI stderr is 0 bytes after a walk through every view (exit 0)"
+  else
+    bad "TUI stderr after the walk: $(wc -c < "$SB/.rig/stderr" 2>/dev/null) bytes, rc $(cat "$SB/.rig/rc" 2>/dev/null): $(head -c 160 "$SB/.rig/stderr" 2>/dev/null | tr '\n' '|')"
+  fi
+else
+  bad "the scripted walk through the views did not finish ($(capture t17 | tr '\n' '|' | head -c 200))"
+fi
+kill_pane t17
+new_sandbox t17c
+seed_jsons "$SB"
+# control: one failing command in the menu painter of this copy only
+sed -i 's|^tui_render_left_menu() {$|&\n  ls /nonexistent-haven-e2e-probe \|\| true|' "$SB/haven"
+start_pane t17c 120 30 "$SB" 'MOCK_LOG_COUNT=20 ./haven tui 2>@RIG@/stderr; echo $? > @RIG@/rc; sleep 30'
+if wait_for t17c "▸ s Start"; then
+  tmx send-keys -t t17c q
+  poll_until "$WAIT_T" test -s "$SB/.rig/rc"
+fi
+if grep -q 'nonexistent-haven-e2e-probe' "$SB/.rig/stderr" 2>/dev/null; then
+  ok "control: an injected failing command shows up in the TUI stderr ($(wc -c < "$SB/.rig/stderr") bytes)"
+else
+  bad "control: the injected failing command left the stderr file empty — the stderr check has no resolving power"
+fi
+kill_pane t17c
 
 # docs must mention the new keys and the restore path
 if grep -q "Keyboard reference" "$ROOT_DIR/README.md" && grep -q "Backups and restore" "$ROOT_DIR/README.md"; then
@@ -1041,6 +1403,9 @@ for sb in "${SANDBOXES[@]}"; do
     # the restart of check 13 is judged THERE (exact sequence); here it is only the
     # allowance: its own down, its own up, and the read-only drift probe — exact lines
     out="$(unexpected_calls "$sb" "$T13_DOWN" "$T13_UP" "$T13_DRIFT")"
+  elif [[ "$sb" == */sb-t16 ]]; then
+    # the same allowance for the restart of check 16 (judged there, in order)
+    out="$(unexpected_calls "$sb" "$T16_DOWN" "$T16_UP" "$T16_DRIFT")"
   else
     out="$(unexpected_calls "$sb")"
   fi
