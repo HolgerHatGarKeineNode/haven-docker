@@ -2142,35 +2142,49 @@ prepare_start() {
 # when it runs, and verify that it is gone. Sets ONESHOT_RELAY_WAS_RUNNING (1/0)
 # for relay_restart_after_oneshot; returns 1 with a hint when the stop did not
 # take.
+# Runs inside the signal guard: every message is `|| true` (a closed pipe or a
+# hung-up terminal must not end the script with the relay stopped), and compose
+# is called directly, not through dc — a redirection on a shell function applies
+# to the shell itself, so a trap firing during it would inherit /dev/null.
 ONESHOT_RELAY_WAS_RUNNING=0
 relay_stop_for_oneshot() {
   local compose_file="$1" what="$2"
   ONESHOT_RELAY_WAS_RUNNING=0
   relay_container_running || return 0
   ONESHOT_RELAY_WAS_RUNNING=1
-  info "Stopping the relay — the database allows a single writer."
-  dc "$compose_file" stop relay >/dev/null 2>&1 || true
+  info "Stopping the relay — the database allows a single writer." || true
+  "${DOCKER_COMPOSE[@]}" -f "$compose_file" stop relay >/dev/null 2>&1 || true
 
   # Verify rather than assume. If the stop did not take, the one-shot opens db/
   # against a live relay and dies in badger with a lock panic that reads like
   # a bug in the import (issue #12) — abort with the actual cause instead.
   if relay_container_running; then
-    warn "The relay container is still running; the $what cannot open db/ while it holds the lock."
-    warn "Stop it manually ('./haven stop' or 'docker stop $RELAY_CONTAINER') and run the $what again."
+    warn "The relay container is still running; the $what cannot open db/ while it holds the lock." || true
+    warn "Stop it manually ('./haven stop' or 'docker stop $RELAY_CONTAINER') and run the $what again." || true
     return 1
   fi
   return 0
 }
 
+# relay_start_again <compose_file> — the start alone, without a message of its
+# own: compose start, compose up -d as the fallback (its output stays visible,
+# it names the reason), then the container check. Compose is called directly
+# for the same reason as in relay_stop_for_oneshot.
+relay_start_again() {
+  local compose_file="$1"
+  "${DOCKER_COMPOSE[@]}" -f "$compose_file" start relay >/dev/null 2>&1 \
+    || "${DOCKER_COMPOSE[@]}" -f "$compose_file" up -d || return 1
+  relay_container_running
+}
+
 # Returns 1 with a warning when the relay does not come back, so a caller never
 # reports success while the relay is down.
 relay_restart_after_oneshot() {
-  local compose_file="$1" was_running="$2" rc=0
+  local compose_file="$1" was_running="$2"
   [[ "$was_running" == "1" ]] || return 0
-  info "Starting the relay again..."
-  dc "$compose_file" start relay >/dev/null 2>&1 || dc "$compose_file" up -d || rc=$?
-  if [[ "$rc" -ne 0 ]] || ! relay_container_running; then
-    warn "The relay did not start again; it is NOT running. Check './$SCRIPT_NAME logs relay', then start it with './$SCRIPT_NAME start'."
+  info "Starting the relay again..." || true
+  if ! relay_start_again "$compose_file"; then
+    warn "The relay did not start again; it is NOT running. Check './$SCRIPT_NAME logs relay', then start it with './$SCRIPT_NAME start'." || true
     return 1
   fi
   return 0
@@ -2189,6 +2203,10 @@ relay_down_final_warning() {
 # one-shot has finished. The handler stops the one-shot container first (a
 # relay started next to it would hit the database lock), then restarts the
 # relay if it was running, prints the relay state and re-raises the signal.
+# Output never decides whether the relay comes back: SIGPIPE is ignored inside
+# the window, every message there is `|| true` (a write into a closed pipe or a
+# hung-up terminal fails, and the trap action runs with errexit active), and the
+# handler does all of its work before it prints the first line.
 ONESHOT_PID=""
 ONESHOT_GUARD_FILE=""
 ONESHOT_GUARD_WHAT=""
@@ -2204,14 +2222,15 @@ oneshot_guard_on() { # <compose_file> <what>
   ONESHOT_GUARD_PARTIAL=""
   ONESHOT_PID=""
   # The TUI's own INT/TERM trap is put back by oneshot_guard_off.
-  ONESHOT_SAVED_TRAPS="$(trap -p INT TERM HUP)"
+  ONESHOT_SAVED_TRAPS="$(trap -p INT TERM HUP PIPE)"
   trap 'oneshot_on_signal INT' INT
   trap 'oneshot_on_signal TERM' TERM
   trap 'oneshot_on_signal HUP' HUP
+  trap '' PIPE
 }
 
 oneshot_guard_off() {
-  trap - INT TERM HUP
+  trap - INT TERM HUP PIPE
   if [[ -n "$ONESHOT_SAVED_TRAPS" ]]; then
     eval "$ONESHOT_SAVED_TRAPS"
   fi
@@ -2238,10 +2257,9 @@ oneshot_run() {
 }
 
 oneshot_on_signal() {
-  local sig="$1" i
+  local sig="$1" i blocked=0 relay_rc=0
   trap '' INT TERM HUP
-  printf '\n' >&2
-  warn "Received SIG$sig during the $ONESHOT_GUARD_WHAT — stopping the one-shot container before the relay is started again."
+  # --- the work: nothing below prints until the relay state is settled ---
   if [[ -n "$ONESHOT_PID" ]] && kill -0 "$ONESHOT_PID" 2>/dev/null; then
     docker stop -t 10 "$ONESHOT_CONTAINER" >/dev/null 2>&1 || true
     kill -TERM "$ONESHOT_PID" 2>/dev/null || true
@@ -2257,22 +2275,30 @@ oneshot_on_signal() {
   ONESHOT_PID=""
 
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
-    warn "The one-shot container $ONESHOT_CONTAINER is still running; the relay is NOT started next to it (database lock)."
-    warn "Stop it with 'docker stop $ONESHOT_CONTAINER', then start the relay with './$SCRIPT_NAME start'."
+    blocked=1
   elif [[ "$ONESHOT_RELAY_WAS_RUNNING" == "1" ]]; then
-    relay_restart_after_oneshot "$ONESHOT_GUARD_FILE" 1 || true
+    relay_start_again "$ONESHOT_GUARD_FILE" || relay_rc=1
   fi
   # compose run --rm cannot remove the container when compose itself was
   # killed; a stopped leftover would block the next one-shot and ./haven start.
   docker rm "$ONESHOT_CONTAINER" >/dev/null 2>&1 || true
 
+  # --- the report: best effort, a failed write changes nothing above ---
+  printf '\n' >&2 || true
+  warn "Received SIG$sig during the $ONESHOT_GUARD_WHAT — the one-shot container is stopped before the relay is started again." || true
+  if [[ "$blocked" == "1" ]]; then
+    warn "The one-shot container $ONESHOT_CONTAINER is still running; the relay is NOT started next to it (database lock)." || true
+    warn "Stop it with 'docker stop $ONESHOT_CONTAINER', then start the relay with './$SCRIPT_NAME start'." || true
+  elif [[ "$relay_rc" -ne 0 ]]; then
+    warn "The relay did not start again; it is NOT running. Check './$SCRIPT_NAME logs relay', then start it with './$SCRIPT_NAME start'." || true
+  fi
   if [[ -n "$ONESHOT_GUARD_PARTIAL" && ( -e "$ONESHOT_GUARD_PARTIAL" || -L "$ONESHOT_GUARD_PARTIAL" ) ]]; then
-    warn_plain "The incomplete file $ONESHOT_GUARD_PARTIAL is not a usable backup; delete it."
+    warn_plain "The incomplete file $ONESHOT_GUARD_PARTIAL is not a usable backup; delete it." || true
   fi
   if relay_container_running; then
-    info "The relay is running."
+    info "The relay is running." || true
   else
-    warn "The relay is NOT running. Start it with './$SCRIPT_NAME start'."
+    warn "The relay is NOT running. Start it with './$SCRIPT_NAME start'." || true
   fi
 
   # Back to the disposition from before the guard (default, or the TUI's own
@@ -2283,7 +2309,9 @@ oneshot_on_signal() {
   exit $((128 + $(kill -l "$sig")))
 }
 
-# ./haven start/restart: the relay must not run next to a one-shot container.
+# Every start path (CLI start/restart, the TUI menu, the restart after an .env
+# edit) passes start_services or restart_services, and both ask this first: the
+# relay must not run next to a one-shot container.
 oneshot_blocks_start() {
   if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
     warn "A one-shot container (backup, restore or import) exists: $ONESHOT_CONTAINER — the relay cannot share db/ with it."
@@ -2320,7 +2348,7 @@ run_import_once() {
   fi
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
-  info "Importing notes ($mode). This runs once and exits; it can take a while."
+  info "Importing notes ($mode). This runs once and exits; it can take a while." || true
   oneshot_run -f "$compose_file" run --rm --no-deps --name "$ONESHOT_CONTAINER" \
     -e HAVEN_IMPORT_FLAG=true relay || status=$?
 
@@ -2678,7 +2706,7 @@ backup_relay_db() {
   fi
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
-  info "Writing backups/$name ($mode)..."
+  info "Writing backups/$name ($mode)..." || true
   # umask 077 inside the container: the zip is a full copy of the database
   # (badger keeps db/<relay>/ at 0700), so it is created 0600 for whatever uid
   # the container runs as. --entrypoint sh keeps entrypoint.sh out, as before.
@@ -2808,7 +2836,7 @@ restore_relay_db() {
   fi
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
-  info "Restoring from backups/$name ($mode)..."
+  info "Restoring from backups/$name ($mode)..." || true
   oneshot_run -f "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
     -v "$BACKUP_DIR:/app/backups" --entrypoint /app/haven \
     relay restore "/app/backups/$name" || status=$?
@@ -2839,6 +2867,9 @@ start_services() {
 
   compose_file="$(compose_file_for "$mode")"
   require_compose_file "$compose_file"
+
+  # return, not die: in the TUI the caller shows the warnings in its own box
+  if oneshot_blocks_start; then return 1; fi
 
   prepare_start
 
@@ -2872,6 +2903,8 @@ stop_services() {
 
 restart_services() {
   local mode="$1"
+  # before the stop: a refused start must not leave the relay stopped
+  if oneshot_blocks_start; then return 1; fi
   stop_services "$mode"
   start_services "$mode"
 }
@@ -4264,6 +4297,19 @@ restart_after_env_change() {
     return
   fi
 
+  # Runs with errexit active inside the TUI: a refusal from restart_services
+  # would end the TUI, so the one-shot check comes first and is shown here.
+  local refusal=""
+  if refusal="$(oneshot_blocks_start 2>&1)"; then
+    if [[ "$TUI_ACTIVE" == "1" ]]; then
+      tui_message "Restart" ".env was saved; the restart to apply it is skipped."$'\n\n'"$refusal"
+    else
+      printf '%s\n' "$refusal"
+      warn ".env was saved; the restart to apply it is skipped."
+    fi
+    return 0
+  fi
+
   info "Restarting services ($mode) to apply .env changes..."
   restart_services "$mode"
 }
@@ -4406,7 +4452,6 @@ main() {
       ;;
     start)
       ensure_docker
-      if oneshot_blocks_start; then exit 1; fi
       start_services "$(resolve_mode "start")"
       ;;
     stop)
@@ -4415,7 +4460,6 @@ main() {
       ;;
     restart)
       ensure_docker
-      if oneshot_blocks_start; then exit 1; fi
       restart_services "$(resolve_mode "restart")"
       ;;
     logs)
