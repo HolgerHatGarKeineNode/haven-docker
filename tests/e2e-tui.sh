@@ -675,20 +675,20 @@ elif ! goto_item t11 "c Settings (.env)"; then
   bad "menu entry 'c Settings (.env)' not reachable"
 else
   tmx send-keys -t t11 Enter
-  wait_for t11 "TEST_SECRET_KEY = "
+  wait_for t11 "test secret key"
   out="$(capture t11)"
-  # the value cell is exactly the mask: up to the first blank after "= " — a
+  # the row's value cell (right-aligned after the label) is exactly the mask: a
   # mask that only APPENDS something (…1234abcd…) must not pass as "…1234"
-  row="$(printf '%s\n' "$out" | grep -m1 'TEST_SECRET_KEY = ')"
-  cell="${row#*TEST_SECRET_KEY = }"
-  cell="${cell%% *}"
+  row="$(left_cell "$(printf '%s\n' "$out" | grep -m1 'test secret key')")"
+  row="${row%"${row##*[! ]}"}"
+  cell="${row##* }"
   if [[ "$cell" == "…1234" && "$out" != *"abcdefgh1234"* ]]; then
     ok "env list masks sensitive values (…1234)"
   else
     bad "env list does not mask (value cell '$cell')"
   fi
   # open the key, then reveal
-  if goto_item t11 "TEST_SECRET_KEY"; then
+  if goto_item t11 "test secret key"; then
     tmx send-keys -t t11 Enter
     wait_for t11 "Reveal value"
     goto_item t11 "Reveal value"
@@ -919,29 +919,29 @@ else
 
   # status panel via Tab
   tmx send-keys -t t12 Tab
-  wait_for t12 "blossom/:" || true
+  wait_for t12 "Last backup" || true
   out="$(capture t12)"
   if [[ "$out" == *"│ Status "* && "$out" == *"running"* ]]; then
     ok "Tab switches to the status view (title + running container)"
   else
     bad "status view missing (title/running)"
   fi
-  if [[ "$out" == *"haven-relay: running up 2 hours"* && "$out" == *"haven-tor: exited"* ]]; then
+  if [[ "$out" == *"haven-relay: running, up 2 hours"* && "$out" == *"haven-tor: stopped"* ]]; then
     ok "status lists container states and uptime"
   else
     bad "container states missing in the status view"
   fi
-  if [[ "$out" == *"image: sha256:abcdef123456789…"* ]]; then
+  if [[ "$out" == *"Image        "*", sha256:abcdef123456"* ]]; then
     ok "status shows the short image digest"
   else
     bad "image digest missing in the status view"
   fi
   if [[ "$du_db" == "$du_blossom" ]]; then
     bad "du check has no resolving power: db/ and blossom/ both measure $du_db"
-  elif [[ "$out" == *"db/: $du_db "* && "$out" == *"blossom/: $du_blossom "* ]]; then
-    ok "status shows du -sh for db/ and blossom/ (db/: $du_db, blossom/: $du_blossom)"
+  elif [[ "$out" == *", db/ $du_db "* && "$out" == *"Media        blossom/ $du_blossom "* ]]; then
+    ok "status shows du -sh for db/ and blossom/ (db/ $du_db, blossom/ $du_blossom)"
   else
-    bad "directory sizes wrong or missing in the status view (want db/: $du_db blossom/: $du_blossom; got: $(printf '%s' "$out" | grep -o '\(db\|blossom\)/: [^ ]*' | tr '\n' ' '))"
+    bad "directory sizes wrong or missing in the status view (want db/ $du_db blossom/ $du_blossom; got: $(printf '%s' "$out" | grep -o '\(db\|blossom\)/ [^ ]*' | tr '\n' ' '))"
   fi
   send_settled t12 Tab
   if t12_tail_shown; then
@@ -1307,11 +1307,26 @@ tui_walk() { # <session>
     tmx send-keys -t "$s" Escape
     wait_absent "$s" "$text" || return 1
   done
-  for k in b e d '?' a o u; do
+  # the data flows, each left before anything runs: Back up at its confirm,
+  # the restore list and the switch overview with Esc
+  tmx send-keys -t "$s" b
+  wait_for "$s" "Back up now? The relay" || return 1
+  tmx send-keys -t "$s" Escape
+  wait_absent "$s" "Back up now? The relay" || return 1
+  for k in e d; do
     case "$k" in
-      b) text="To back up the database" ;;
-      e) text="To restore a backup" ;;
-      d) text="To move the data" ;;
+      e) text="backups/, newest first" ;;
+      d) text="On disk: " ;;
+    esac
+    send_settled "$s" "$k"
+    wait_for "$s" "$text" || return 1
+    send_settled "$s" Tab
+    send_settled "$s" Tab
+    send_settled "$s" Escape
+    wait_for "$s" "▸ s Start" || return 1
+  done
+  for k in '?' a o u; do
+    case "$k" in
       '?') text="Go to nth entry" ;;
       a) text="Relay image digest" ;;
       o) text="No onion address yet" ;;
@@ -1324,9 +1339,20 @@ tui_walk() { # <session>
   done
   send_settled "$s" c
   wait_for "$s" "Add setting" || return 1
-  goto_item "$s" "RELAY_URL" || return 1
+  goto_item "$s" "relay url" || return 1
+  wait_for "$s" "RELAY_URL" || return 1        # the details pane names the key
   send_settled "$s" Enter
   wait_for "$s" "Reveal value" || return 1
+  send_settled "$s" Escape
+  wait_for "$s" "Add setting" || return 1
+  send_settled "$s" Tab
+  send_settled "$s" Tab
+  tmx send-keys -t "$s" /
+  wait_for "$s" "Filter settings:" || return 1
+  tmx send-keys -t "$s" -l "limiter"
+  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter settings:" "limiter" || return 1
+  tmx send-keys -t "$s" Enter
+  wait_for "$s" '32 found' || return 1
   send_settled "$s" Escape
   wait_for "$s" "Add setting" || return 1
   send_settled "$s" Escape
@@ -1357,6 +1383,7 @@ tui_walk() { # <session>
 seed_jsons() { local e; for e in "$1"/*.example.json; do cp "$e" "${e/.example.json/.json}"; done; }
 new_sandbox t17
 seed_jsons "$SB"
+mkdir -m 700 "$SB/backups" && : > "$SB/backups/haven-backup-20260101-000000.zip"
 start_pane t17 120 30 "$SB" 'MOCK_LOG_COUNT=20 ./haven tui 2>@RIG@/stderr; echo $? > @RIG@/rc; sleep 30'
 if tui_walk t17; then
   if [[ -f "$SB/.rig/stderr" && ! -s "$SB/.rig/stderr" && "$(cat "$SB/.rig/rc")" == 0 ]]; then
@@ -1383,6 +1410,406 @@ else
   bad "control: the injected failing command left the stderr file empty — the stderr check has no resolving power"
 fi
 kill_pane t17c
+
+# --- 18-23: P6 — data flows over the real verbs, settings editor, prompt, leftovers ---
+# The flows run the REAL ./haven verbs as children of the TUI, with the scripted
+# mock on PATH: backups are real zips (MOCK_RUN_PAYLOAD_FILE), a restore writes
+# engine files into the sandbox db/ (MOCK_DB_DIR). Every state-changing docker
+# call of a flow sandbox is judged as an exact sequence (paths, the random
+# .partial suffix and time stamps normalized) and written to .rig/expected, which
+# the isolation proof at the end holds the sandbox to.
+FIX_ZIP="$WORK/good.zip"
+python3 -I - "$FIX_ZIP" <<'PY2'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for n in ("private", "chat", "outbox", "inbox", "blossom"):
+        z.writestr(n + ".jsonl", ("{\"id\":\"%s\"}\n" % n) * 400)
+PY2
+FLOW_ENV="MOCK_RUN_WRITES=1 MOCK_RUN_PAYLOAD_FILE=$FIX_ZIP MOCK_DB_DIR=@SB@/db"
+# state_calls <sandbox> — the state-changing calls of the mock, normalized
+state_calls() {
+  local sb="$1"
+  [[ -f "$sb/.rig/calls.log" ]] || return 0
+  grep -E '^(compose .* (stop|start|up|down|run|restart|rm|kill)( |$)|(stop|rm|kill) )' "$sb/.rig/calls.log" \
+    | grep -vF -- '--entrypoint cat relay /app/.env.example.upstream' \
+    | sed -e "s#$sb/#SB/#g" -e 's/\.partial-[0-9a-f]*/.partial-X/g' -e 's/20[0-9]\{6\}-[0-9]\{6\}/TS/g'
+}
+# flow_sandbox <name> [engine] — a sandbox with the JSON lists, a badger (or
+# lmdb) database of fake files, DOCKER_UID/GID set
+flow_sandbox() {
+  local n e="${2:-badger}"
+  new_sandbox "$1"
+  seed_jsons "$SB"
+  for n in private chat outbox inbox blossom; do
+    mkdir -p "$SB/db/$n"
+    if [[ "$e" == badger ]]; then : > "$SB/db/$n/MANIFEST"; else : > "$SB/db/$n/data.mdb"; fi
+  done
+  printf 'DOCKER_UID=%s\nDOCKER_GID=%s\n' "$(id -u)" "$(id -g)" >> "$SB/.env"
+  sed -i "s/^DB_ENGINE=.*/DB_ENGINE=\"$e\"/" "$SB/.env"
+}
+flow_pane() { # <session> <cols> <lines> <extra env> — the TUI with the flow mock knobs
+  local env="${FLOW_ENV//@SB@/$SB} $4"
+  start_pane "$1" "$2" "$3" "$SB" "$env MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr"
+}
+T_STOP="compose -f SB/docker-compose.tor.yml stop relay"
+T_START="compose -f SB/docker-compose.tor.yml start relay"
+T_UPR="compose -f SB/docker-compose.tor.yml up -d relay"
+T_RUN="compose -f SB/docker-compose.tor.yml run --rm --no-deps -T --name haven-relay-oneshot -v SB/backups:/app/backups"
+# shellcheck disable=SC2016  # the container's sh expands $1
+T_BK='--entrypoint sh relay -c umask 077; exec /app/haven backup "$1" sh /app/backups/'
+expect_calls() { # <session> <description> <expected lines...>
+  local s="$1" what="$2" got want
+  shift 2
+  want="$(printf '%s\n' "$@")"
+  [[ -n "$*" ]] || want=""
+  got="$(state_calls "${SBOF[$s]}")"
+  printf '%s\n' "$@" > "${SBOF[$s]}/.rig/expected"
+  if [[ "$got" == "$want" ]]; then
+    ok "$what"
+  else
+    bad "$what (got: $(tr '\n' '|' <<<"$got" | head -c 400))"
+  fi
+}
+
+section "18 back up and restore flows"
+flow_sandbox t18
+flow_pane t18 120 30 ""
+if ! wait_for t18 "▸ s Start"; then
+  bad "TUI did not start for the backup flow"
+else
+  send_settled t18 b
+  wait_for t18 "Back up now? The relay"
+  send_settled t18 Escape
+  if wait_absent t18 "Back up now? The relay" && [[ -z "$(state_calls "$SB")" ]]; then
+    ok "back up: cancelled at the confirm, no state-changing call"
+  else
+    bad "back up: cancel at the confirm left calls: $(state_calls "$SB" | tr '\n' '|')"
+  fi
+  send_settled t18 b
+  wait_for t18 "Back up now? The relay"
+  tmx send-keys -t t18 Enter
+  if wait_for t18 "Backup finished" && wait_for t18 "Backup written:"; then
+    zip="$(find "$SB/backups" -maxdepth 1 -name 'haven-backup-*.zip' -print -quit)"
+    if [[ -n "$zip" ]] && unzip -tq "$zip" >/dev/null 2>&1; then
+      ok "back up: the box shows the verb's result and a verified zip exists ($(basename "$zip"))"
+    else
+      bad "back up: no verified zip in backups/"
+    fi
+  else
+    bad "back up: no result box ($(capture t18 | tr '\n' '|' | head -c 200))"
+  fi
+  expect_calls t18 "back up: exactly the verb's sequence (stop, backup run, start)" \
+    "$T_STOP" "$T_RUN ${T_BK}haven-backup-TS.zip.partial-X" "$T_START"
+  send_settled t18 x
+  wait_for t18 "▸ s Start"
+  # restore: two backups, newest first; the older one is chosen
+  cp -p "$FIX_ZIP" "$SB/backups/haven-backup-20250101-000000.zip"; touch -d '3 days ago' "$SB/backups/haven-backup-20250101-000000.zip"
+  chmod 600 "$SB/backups/"*.zip
+  send_settled t18 e
+  wait_for t18 "backups/, newest first"
+  order="$(capture t18 | grep -oE 'haven-backup-[0-9-]+\.zip' | tr '\n' ' ')"
+  if [[ "$order" == "$(basename "$zip") haven-backup-20250101-000000.zip " ]]; then
+    ok "restore: the list shows backups/ newest first ($order)"
+  else
+    bad "restore: list order is '$order'"
+  fi
+  goto_item t18 "haven-backup-20250101-000000.zip"
+  send_settled t18 Enter
+  wait_for t18 "Restore haven-backup-20250101"
+  send_settled t18 Escape
+  if [[ "$(state_calls "$SB" | grep -c ' restore ')" == 0 ]]; then
+    ok "restore: cancelled at the TUI's confirm, the verb never ran"
+  else
+    bad "restore: the verb ran without the TUI's confirm"
+  fi
+  send_settled t18 Enter
+  wait_for t18 "Restore haven-backup-20250101"
+  tmx send-keys -t t18 Left Enter
+  wait_for t18 "Restore finished" || bad "restore: no result box"
+  expect_calls t18 "restore: the chosen file reaches the verb, after the backup's calls" \
+    "$T_STOP" "$T_RUN ${T_BK}haven-backup-TS.zip.partial-X" "$T_START" \
+    "$T_STOP" "$T_RUN --entrypoint /app/haven relay restore /app/backups/haven-backup-TS.zip" "$T_START"
+  if grep -qF -- 'restore /app/backups/haven-backup-20250101-000000.zip' "$SB/.rig/calls.log"; then
+    ok "restore: the run names exactly the chosen backup"
+  else
+    bad "restore: the run does not name the chosen backup"
+  fi
+fi
+kill_pane t18
+
+section "19 engine switch flow"
+flow_sandbox t19
+flow_pane t19 80 24 "MOCK_RUN_HOLD=1 MOCK_HOLD_AT=1 MOCK_HOLD_MAX=60"
+if ! wait_for t19 "▸ s Start"; then
+  bad "TUI did not start for the switch flow"
+else
+  send_settled t19 d
+  wait_for t19 "On disk: badger"
+  tmx send-keys -t t19 Enter   # opens a prompt: no render passes until it closes
+  wait_for t19 "Type lmdb:"
+  tmx send-keys -t t19 -l badger
+  poll_until "$WAIT_T" prompt_cell_is t19 "Type lmdb:" "badger"
+  tmx send-keys -t t19 Enter
+  if wait_for t19 "Cancelled: you typed" && [[ -z "$(state_calls "$SB")" ]]; then
+    ok "switch: a wrong typed name cancels, no state-changing call"
+  else
+    bad "switch: wrong typed name did not cancel cleanly"
+  fi
+  send_settled t19 x
+  wait_for t19 "On disk: badger"
+  tmx send-keys -t t19 Enter   # opens a prompt: no render passes until it closes
+  wait_for t19 "Type lmdb:"
+  tmx send-keys -t t19 -l lmdb
+  poll_until "$WAIT_T" prompt_cell_is t19 "Type lmdb:" "lmdb"
+  tmx send-keys -t t19 Enter
+  poll_until "$WAIT_T" test -e "$SB/.rig/started"
+  if wait_for t19 "▸ backup"; then
+    steps="$(left_rows t19 4 22 | grep -E '^ [✓▸] ' | sed 's/ *$//' | tr '\n' '|')"
+    if [[ "$steps" == " ✓ preflight| ✓ stop| ▸ backup|" ]]; then
+      ok "switch: held in step 3, the steps from the verb tick in order ($steps)"
+    else
+      bad "switch: steps on screen are '$steps'"
+    fi
+  else
+    bad "switch: the running step is not shown"
+  fi
+  if has_text t19 "Relay offline "; then ok "switch: the title row counts the relay's offline time"; else bad "switch: no offline counter in the title row"; fi
+  send_settled t19 Escape
+  send_settled t19 q
+  if has_text t19 "▸ backup" && tui_pid_found t19; then
+    ok "switch: Esc and q during the running child do nothing"
+  else
+    bad "switch: Esc/q changed the running flow"
+  fi
+  : > "$SB/.rig/release"
+  if wait_for t19 "Engine switched"; then
+    ok "switch: the success box appears"
+  else
+    bad "switch: no success box ($(capture t19 | tr '\n' '|' | head -c 200))"
+  fi
+  if grep -q '^DB_ENGINE="lmdb"' "$SB/.env" && [[ -e "$SB/db/private/data.mdb" ]]; then
+    ok "switch: .env and db/ are on lmdb"
+  else
+    bad "switch: .env/db not on lmdb"
+  fi
+  expect_calls t19 "switch: exactly the verb's sequence" \
+    "$T_STOP" "$T_RUN -e DB_ENGINE=badger ${T_BK}haven-pre-switch-lmdb-TS.zip.partial-X" \
+    "$T_RUN -e DB_ENGINE=lmdb --entrypoint /app/haven relay restore /app/backups/haven-pre-switch-lmdb-TS.zip" \
+    "$T_RUN -e DB_ENGINE=lmdb ${T_BK}haven-post-switch-lmdb-TS.zip.partial-X" "$T_UPR"
+fi
+kill_pane t19
+
+# injected restore failure: the 2nd one-shot run (the restore) fails
+flow_sandbox t19f
+flow_pane t19f 80 24 "MOCK_FAIL_AT=2"
+if wait_for t19f "▸ s Start"; then
+  send_settled t19f d
+  wait_for t19f "On disk: badger"
+  tmx send-keys -t t19f Enter
+  wait_for t19f "Type lmdb:"
+  tmx send-keys -t t19f -l lmdb
+  poll_until "$WAIT_T" prompt_cell_is t19f "Type lmdb:" "lmdb"
+  tmx send-keys -t t19f Enter
+  if wait_for t19f "Switch rolled back" && [[ "$(left_rows t19f 4 22 | tr -s ' \n' '  ')" == *"Step 'restore' failed; the switch was rolled back: db/ and DB_ENGINE are back on badger."* ]]; then
+    ok "switch: an injected restore failure names the step and the old engine"
+  else
+    bad "switch: rolled-back box wrong ($(capture t19f | tr '\n' '|' | head -c 240))"
+  fi
+  if grep -q '^DB_ENGINE="badger"' "$SB/.env" && [[ -e "$SB/db/private/MANIFEST" && ! -e "$SB/db/private/data.mdb" ]] \
+    && grep -qx haven-relay "$SB/.rig/running"; then
+    ok "switch: after the rollback .env and db/ agree on badger and the relay runs"
+  else
+    bad "switch: .env/db disagree after the rollback"
+  fi
+  expect_calls t19f "switch failure: the verb's sequence up to the restore, then the relay back" \
+    "$T_STOP" "$T_RUN -e DB_ENGINE=badger ${T_BK}haven-pre-switch-lmdb-TS.zip.partial-X" \
+    "$T_RUN -e DB_ENGINE=lmdb --entrypoint /app/haven relay restore /app/backups/haven-pre-switch-lmdb-TS.zip" "$T_UPR"
+else
+  bad "TUI did not start for the switch failure"
+fi
+kill_pane t19f
+
+# mixed directories: two --from entries; the chosen side reaches the verb
+flow_sandbox t19m lmdb
+: > "$SB/db/private/MANIFEST"
+flow_pane t19m 80 24 ""
+if wait_for t19m "▸ s Start"; then
+  send_settled t19m d
+  wait_for t19m "On disk: both engines"
+  if has_text t19m "From the badger side" && has_text t19m "From the lmdb side"; then
+    ok "switch: mixed directories offer the two --from choices"
+  else
+    bad "switch: the --from choices are missing"
+  fi
+  goto_item t19m "From the badger side"
+  tmx send-keys -t t19m Enter
+  wait_for t19m "Type lmdb:"
+  tmx send-keys -t t19m -l lmdb
+  poll_until "$WAIT_T" prompt_cell_is t19m "Type lmdb:" "lmdb"
+  tmx send-keys -t t19m Enter
+  wait_for t19m "Engine switched" || wait_for t19m "Switch" || true
+  if state_calls "$SB" | grep -qF -- "-e DB_ENGINE=badger ${T_BK}haven-pre-switch-lmdb-TS.zip.partial-X"; then
+    ok "switch: the chosen side (--from badger) reaches the verb: its backup reads badger"
+  else
+    bad "switch: --from badger did not reach the verb ($(state_calls "$SB" | tr '\n' '|' | head -c 200))"
+  fi
+  state_calls "$SB" > "$SB/.rig/expected"   # judged above by its backup line
+else
+  bad "TUI did not start for the mixed switch"
+fi
+kill_pane t19m
+
+# an interrupted switch: the undo entry runs --rollback (the verb refuses the
+# planted, unusable marker — its own refusal is what the box shows)
+flow_sandbox t19r
+printf 'not a marker\n' > "$SB/db/.switch-in-progress"
+flow_pane t19r 120 30 ""
+if wait_for t19r "▸ s Start" && wait_for t19r "n Undo interrupted switch"; then
+  ok "marker: the Data group leads with 'Undo interrupted switch'"
+  send_settled t19r n
+  wait_for t19r "Undo the interrupted switch?"
+  tmx send-keys -t t19r Left Enter
+  if wait_for t19r "Undo failed" && has_text t19r "not a marker this script can use"; then
+    ok "marker: the entry ran db-switch --rollback and shows the verb's refusal"
+  else
+    bad "marker: no rollback result ($(capture t19r | tr '\n' '|' | head -c 200))"
+  fi
+  expect_calls t19r "marker: the refused rollback changed nothing"
+else
+  bad "marker: no undo entry in the main menu"
+fi
+kill_pane t19r
+
+# Ctrl-C while the one-shot is held: the child's guard starts the relay again
+flow_sandbox t19c
+flow_pane t19c 80 24 "MOCK_RUN_HOLD=1 MOCK_HOLD_MAX=60"
+if wait_for t19c "▸ s Start"; then
+  send_settled t19c b
+  wait_for t19c "Back up now? The relay"
+  tmx send-keys -t t19c Enter
+  poll_until "$WAIT_T" test -e "$SB/.rig/started"
+  wait_for t19c "Backing up"
+  tmx send-keys -t t19c C-c
+  if wait_for t19c "Backup interrupted" && has_text t19c "Received SIGINT"; then
+    ok "Ctrl-C: the child's guard reported, the TUI shows it"
+  else
+    bad "Ctrl-C: no interrupted box ($(capture t19c | tr '\n' '|' | head -c 240))"
+  fi
+  if grep -qx haven-relay "$SB/.rig/running" && grep -qx 'stop -t 10 haven-relay-oneshot' "$SB/.rig/calls.log"; then
+    ok "Ctrl-C: the one-shot was stopped and the relay runs again (mock state)"
+  else
+    bad "Ctrl-C: relay not restarted or one-shot not stopped"
+  fi
+  send_settled t19c x
+  send_settled t19c Down
+  if wait_for t19c "▸ t Start with Tor" && tui_pid_found t19c; then
+    ok "Ctrl-C: the TUI stays usable afterwards"
+  else
+    bad "Ctrl-C: the TUI is not usable afterwards"
+  fi
+  state_calls "$SB" > "$SB/.rig/expected"   # judged above: stop, held run, the guard's restart
+else
+  bad "TUI did not start for the Ctrl-C check"
+fi
+kill_pane t19c
+
+section "20 settings editor, prompt, status"
+new_sandbox t20
+seed_jsons "$SB"
+CANARY="CANARY-7f3a9c-SECRET-VALUE-0042"
+sed -i "s/^S3_SECRET_KEY=.*/S3_SECRET_KEY=\"$CANARY\"/" "$SB/.env"
+printf 'ZZ_ONLY_HERE=1\n' >> "$SB/.env"
+env_hash_t20="$(sha256sum "$SB/.env" | cut -d' ' -f1)"
+start_pane t20 80 24 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui'
+NPUB="npub1utx00neqgqln72j22kej3ux7803c2k986henvvha4thuwfkper4s7r50e8"
+if wait_for t20 "▸ s Start"; then
+  send_settled t20 c
+  wait_for t20 "General"
+  if has_text t20 "│ Details" && has_text t20 "Private relay"; then
+    ok "settings: section rows and the details pane"
+  else
+    bad "settings: no sections or no details pane"
+  fi
+  goto_item t20 "secret key" 80
+  if wait_for t20 "S3_SECRET_KEY" && no_text t20 "CANARY"; then
+    ok "settings: the canary in S3_SECRET_KEY is shown neither in the list nor in the details pane"
+  else
+    bad "settings: canary visible or key not shown"
+  fi
+  send_settled t20 End
+  if wait_for t20 "Other" && has_text t20 "zz only here"; then
+    ok "settings: a key only in .env is listed under Other"
+  else
+    bad "settings: no Other section"
+  fi
+  tmx send-keys -t t20 /
+  wait_for t20 "Filter settings:"
+  tmx send-keys -t t20 -l zzz
+  poll_until "$WAIT_T" prompt_cell_is t20 "Filter settings:" "zzz"
+  tmx send-keys -t t20 Enter
+  if wait_for t20 'No setting matches "zzz".'; then ok "settings: /zzz shows the empty-state text"; else bad "settings: no empty state"; fi
+  send_settled t20 Escape
+  if wait_for t20 "Add setting" && has_text t20 "Settings (.env)"; then ok "settings: Esc clears the filter first"; else bad "settings: Esc did not clear the filter"; fi
+  if [[ "$(sha256sum "$SB/.env" | cut -d' ' -f1)" == "$env_hash_t20" ]]; then ok "settings: browsing and filtering leave .env byte-identical"; else bad "settings: .env changed"; fi
+  send_settled t20 Escape
+  wait_for t20 "▸ s Start"
+  send_settled t20 Tab
+  if wait_for t20 "Last backup  never" && no_text t20 "CANARY"; then
+    ok "status: 'never' without a backup, no canary in the status view"
+  else
+    bad "status: no 'never' line or canary visible"
+  fi
+  send_settled t20 Tab
+  # a 63-character npub typed into a value prompt reaches .env complete
+  send_settled t20 c
+  wait_for t20 "Add setting"
+  goto_item t20 "Add setting"
+  prompt_open t20 "New key"
+  tmx send-keys -t t20 -l "E2E_TEST_NPUB"
+  poll_until "$WAIT_T" prompt_cell_is t20 "New key:" "E2E_TEST_NPUB"
+  tmx send-keys -t t20 Enter
+  wait_for t20 "New value"
+  tmx send-keys -t t20 -l "$NPUB"
+  wait_for t20 "…"
+  tmx send-keys -t t20 Enter
+  if poll_until "$WAIT_T" grep -qx "E2E_TEST_NPUB=$NPUB" "$SB/.env"; then
+    ok "prompt: a 63-character npub typed at 80 columns is written to .env complete"
+  else
+    bad "prompt: the npub did not reach .env ($(grep E2E_TEST_NPUB "$SB/.env"))"
+  fi
+  # the restart after the write: plain mode (haven-tor is not running)
+  t20_up() { grep -qxF -- "compose -f $SB/docker-compose.yml up -d --build" "$SB/.rig/calls.log" 2>/dev/null; }
+  poll_until "$WAIT_T" t20_up && settle_after t20 "$(sync_n t20)"
+  expect_calls t20 "prompt: the .env write restarts the relay exactly (down, then up)" \
+    "compose -f SB/docker-compose.yml down --remove-orphans" "compose -f SB/docker-compose.yml up -d --build"
+else
+  bad "TUI did not start for the settings check"
+fi
+kill_pane t20
+
+section "21 leftovers"
+new_sandbox t21
+start_pane t21 80 24 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui'
+if wait_for t21 "▸ s Start"; then
+  send_settled t21 Escape
+  send_settled t21 Left
+  if tui_pid_found t21 && has_text t21 "▸ s Start"; then ok "Esc and ← in the main view leave the TUI running"; else bad "Esc/← quit the TUI"; fi
+  t21_pid="$(tui_pid t21)"
+  tmx send-keys -t t21 q
+  t21_gone() { ! kill -0 "$t21_pid" 2>/dev/null; }
+  if poll_until "$WAIT_T" t21_gone; then ok "q quits from the main view"; else bad "q did not quit"; fi
+fi
+kill_pane t21
+new_sandbox t21d
+SYNC=0 start_pane t21d 80 24 "$SB" 'TERM=dumb ./haven tui > @RIG@/out 2>&1; echo $? > @RIG@/rc; sleep 30'
+poll_until "$WAIT_T" test -s "$SB/.rig/rc"
+if [[ "$(cat "$SB/.rig/rc")" != 0 ]] && grep -q 'the TUI needs a terminal that can position the cursor' "$SB/.rig/out" \
+  && [[ "$(wc -l < "$SB/.rig/out")" -eq 1 ]]; then
+  ok "TERM=dumb: exit $(cat "$SB/.rig/rc") with one sentence naming the commands"
+else
+  bad "TERM=dumb: rc $(cat "$SB/.rig/rc"), output $(head -c 160 "$SB/.rig/out")"
+fi
+kill_pane t21d
 
 # docs must mention the new keys and the restore path
 if grep -q "Keyboard reference" "$ROOT_DIR/README.md" && grep -q "Backups and restore" "$ROOT_DIR/README.md"; then
@@ -1411,6 +1838,12 @@ for sb in "${SANDBOXES[@]}"; do
     # the restart of check 13 is judged THERE (exact sequence); here it is only the
     # allowance: its own down, its own up, and the read-only drift probe — exact lines
     out="$(unexpected_calls "$sb" "$T13_DOWN" "$T13_UP" "$T13_DRIFT")"
+  elif [[ -f "$sb/.rig/expected" ]]; then
+    # a flow sandbox: its state-changing calls were judged in its check as an
+    # exact sequence; here they must be exactly those, nothing else
+    out="$(diff <(state_calls "$sb") <(grep -v '^$' "$sb/.rig/expected") | grep '^[<>]' || true)"
+    [[ -z "$out" ]] || out="$(printf '%s\n' "$out"; unexpected_calls "$sb" | grep -vE '^(compose .* (stop|start|up|down|run|restart|rm|kill)( |$)|(stop|rm|kill) )' || true)"
+    [[ -n "$out" ]] || out="$(unexpected_calls "$sb" | grep -vE '^(compose .* (stop|start|up|down|run|restart|rm|kill)( |$)|(stop|rm|kill) )' || true)"
   elif [[ "$sb" == */sb-t16 ]]; then
     # the same allowance for the restart of check 16 (judged there, in order)
     out="$(unexpected_calls "$sb" "$T16_DOWN" "$T16_UP" "$T16_DRIFT")"
