@@ -19,7 +19,9 @@
 #                       that is non-zero, else 1
 #   MOCK_RUN_WRITES=1   a `run ... backup /app/backups/<f>` creates <f> on the
 #                       host side of the `-v <host>:/app/backups` mount
-#                       (content: $MOCK_RUN_PAYLOAD or "mock-backup")
+#                       (content: $MOCK_RUN_PAYLOAD or "mock-backup"; with
+#                       MOCK_RUN_PAYLOAD_FILE set, a copy of that file instead —
+#                       for binary payloads such as a real zip)
 #   MOCK_RUN_HOLD=1     `run` touches `started`, then polls up to MOCK_HOLD_MAX
 #                       seconds (default 10) for `release` before it continues
 #   HAVEN_CONTAINER_NAME  name that start/up/restart mark as running
@@ -146,7 +148,11 @@ mock_scripted() {
           fi
         done
         if [[ -n "$host" && -n "$target" ]]; then
-          printf '%s' "${MOCK_RUN_PAYLOAD:-mock-backup}" > "$host/${target#/app/backups/}"
+          if [[ -n "${MOCK_RUN_PAYLOAD_FILE:-}" ]]; then
+            cp -- "$MOCK_RUN_PAYLOAD_FILE" "$host/${target#/app/backups/}"
+          else
+            printf '%s' "${MOCK_RUN_PAYLOAD:-mock-backup}" > "$host/${target#/app/backups/}"
+          fi
         fi
       fi
       local rc="${MOCK_RUN_EXIT:-0}"

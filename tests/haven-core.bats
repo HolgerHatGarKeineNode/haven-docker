@@ -153,7 +153,7 @@ teardown() {
   [[ "$output" == "1" ]]
 }
 
-@test "backup_file: keeps only the 10 most recent backups" {
+@test "backup_config_file: keeps only the 10 most recent backups" {
   run bash -c '
     source haven
     set +e
@@ -164,7 +164,7 @@ teardown() {
     for ((i=1; i<=12; i++)); do
       cp "$f" "$(printf "%s.bak.20260101%02d0000" "$f" "$i")"
     done
-    backup_file "$f"
+    backup_config_file "$f"
     n=$(ls -1 "$f".bak.* 2>/dev/null | wc -l)
     rm -rf "$ROOT_DIR"
     echo "backups=$n"

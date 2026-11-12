@@ -12,7 +12,7 @@ setup() {
   TEST_DIR="$(mktemp -d)"
   export MOCK_DOCKER_STATE_DIR="$TEST_DIR/state"
   unset MOCK_STOP_FAILS MOCK_RUN_EXIT MOCK_FAIL_AT MOCK_RUN_WRITES MOCK_RUN_HOLD \
-    MOCK_HOLD_MAX MOCK_RUN_PAYLOAD HAVEN_CONTAINER_NAME
+    MOCK_HOLD_MAX MOCK_RUN_PAYLOAD MOCK_RUN_PAYLOAD_FILE HAVEN_CONTAINER_NAME
   mkdir -p "$MOCK_DOCKER_STATE_DIR"
 }
 
@@ -185,6 +185,15 @@ calls() { cat "$MOCK_DOCKER_STATE_DIR/calls.log" 2>/dev/null; }
   [ "$(cat "$TEST_DIR/backups/a.zip")" = "mock-backup" ]
   MOCK_RUN_PAYLOAD=custom MOCK_RUN_WRITES=1 run docker compose -f f.yml run --rm -v "$TEST_DIR/backups:/app/backups" --entrypoint /app/haven relay backup /app/backups/b.zip
   [ "$(cat "$TEST_DIR/backups/b.zip")" = "custom" ]
+}
+
+@test "scripted: MOCK_RUN_PAYLOAD_FILE writes a byte-identical copy of a binary file" {
+  mkdir -p "$TEST_DIR/backups"
+  printf 'PK\003\004\000\000binary\377' > "$TEST_DIR/payload.bin"
+  MOCK_RUN_PAYLOAD=ignored MOCK_RUN_PAYLOAD_FILE="$TEST_DIR/payload.bin" MOCK_RUN_WRITES=1 \
+    run docker compose -f f.yml run --rm -v "$TEST_DIR/backups:/app/backups" --entrypoint /app/haven relay backup /app/backups/c.zip
+  [ "$status" -eq 0 ]
+  cmp "$TEST_DIR/payload.bin" "$TEST_DIR/backups/c.zip"
 }
 
 @test "scripted: MOCK_RUN_WRITES=1 writes nothing for restore, without a mount, or outside /app/backups" {

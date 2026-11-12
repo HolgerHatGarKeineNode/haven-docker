@@ -145,6 +145,9 @@ LOG_SERVICE=""
 FOLLOW_LOGS=1
 BUILD_IMAGES=1
 COMMAND=""
+# backup/restore: the file argument and --yes
+DATA_FILE_ARG=""
+ASSUME_YES=0
 JSON_TOOL=""
 VALIDATION_ERROR=""
 VALIDATION_VALUE=""
@@ -219,6 +222,17 @@ COMPOSE_FILE_TOR="$ROOT_DIR/docker-compose.tor.yml"
 # can run against a differently named (or mocked) container.
 RELAY_CONTAINER="${HAVEN_CONTAINER_NAME:-haven-relay}"
 
+# backup/restore run the upstream binary in a one-shot container with this
+# fixed name, so a leftover from an aborted run is found instead of running as
+# a second writer next to the next one.
+ONESHOT_CONTAINER="${RELAY_CONTAINER}-oneshot"
+BACKUP_DIR="$ROOT_DIR/backups"
+# The five entries of an upstream backup zip, sorted with LC_ALL=C.
+BACKUP_ENTRIES=$'blossom.jsonl\nchat.jsonl\ninbox.jsonl\noutbox.jsonl\nprivate.jsonl'
+# Host unzip used to verify a backup; the image's own unzip is the fallback.
+# HAVEN_HOST_UNZIP is a test seam (unset: unzip from PATH).
+HOST_UNZIP="${HAVEN_HOST_UNZIP:-unzip}"
+
 # Optional test seam: with HAVEN_TUI_SYNC_FILE set, the TUI loop writes an
 # incrementing number to that file after every completed render pass (unset:
 # nothing is written). TUI_SYNC_COUNT is the last number written.
@@ -266,6 +280,8 @@ Commands:
   status              Show status
   onion               Show Tor onion hostname (if available)
   import              Import old notes once (stops the relay while it runs)
+  backup [file]       Back up the database to backups/ (verified zip; stops the relay while it runs)
+  restore <file>      Restore a backup from backups/ (adds missing events; stops the relay while it runs)
   env                 Edit .env (TUI)
   env-upgrade         Add missing vars from .env.example
   json                Open JSON list editor
@@ -280,12 +296,15 @@ Options:
   --no-follow          Logs: do not follow (no -f)
   --no-build           Start/Restart without --build
   --build              Start/Restart with --build (default)
+  -y, --yes            Restore: confirm restoring into a database that holds data
   -h, --help           Show this help
 
 Examples:
   $SCRIPT_NAME
   $SCRIPT_NAME start
   $SCRIPT_NAME import
+  $SCRIPT_NAME backup
+  $SCRIPT_NAME restore haven-backup-20260101-120000.zip
   $SCRIPT_NAME logs --service relay --tail 200
   $SCRIPT_NAME json
   $SCRIPT_NAME env
@@ -1129,7 +1148,7 @@ read_env_var() {
 
 # Timestamped backup before every config write, keeping the 10 most
 # recent (restore: cp <file>.bak.<timestamp> <file>, see README).
-backup_file() {
+backup_config_file() {
   local file="$1"
   [[ -f "$file" ]] || return 0
   local ts
@@ -1156,7 +1175,7 @@ set_env_var() {
   if [[ ! -f "$env_file" ]]; then
     touch "$env_file"
   else
-    backup_file "$env_file"
+    backup_config_file "$env_file"
   fi
 
   awk -v key="$key" -v value="$value" '
@@ -1602,7 +1621,7 @@ remove_env_var() {
   local env_file="$ROOT_DIR/.env"
   local tmp_file="$env_file.tmp"
   [[ -f "$env_file" ]] || return 1
-  backup_file "$env_file"
+  backup_config_file "$env_file"
   awk -v key="$key" '
     $0 ~ "^[ \t]*export[ \t]+" key "=" { next }
     $0 ~ "^" key "=" { next }
@@ -1702,7 +1721,7 @@ upgrade_env_file() {
     return 0
   fi
 
-  backup_file "$env_file"
+  backup_config_file "$env_file"
 
   awk '
     function extract_key(line,    tmp, ep, kp) {
@@ -1815,7 +1834,7 @@ PY
 json_write_tmp() {
   local path="$1"
   local tmp="$path.tmp"
-  backup_file "$path"
+  backup_config_file "$path"
   cat > "$tmp"
   mv "$tmp" "$path"
 }
@@ -2017,11 +2036,11 @@ ensure_data_dirs() {
   # Compose also accepts a user *name*; we cannot resolve that to a host uid, so
   # create the directories but say out loud that the check was skipped.
   if ! is_int "$container_uid" || ! is_int "$container_gid"; then
-    warn "DOCKER_UID/DOCKER_GID are not numeric (${container_uid}:${container_gid}) — skipping the ownership check for db/ and blossom/."
+    warn "DOCKER_UID/DOCKER_GID are not numeric (${container_uid}:${container_gid}) — skipping the ownership check for db/, blossom/ and backups/."
     check_owner=0
   fi
 
-  for dir in db blossom; do
+  for dir in db blossom backups; do
     path="$ROOT_DIR/$dir"
     if [[ -L "$path" && ! -e "$path" ]]; then
       die "$dir is a broken symlink. Point $path at an existing directory or remove it."
@@ -2095,6 +2114,38 @@ prepare_start() {
   warn_import_flag
 }
 
+# Every one-shot run of the upstream binary (import, backup, restore) needs the
+# relay down: badger and lmdb both take an exclusive lock on db/. Stop it only
+# when it runs, and verify that it is gone. Sets ONESHOT_RELAY_WAS_RUNNING (1/0)
+# for relay_restart_after_oneshot; returns 1 with a hint when the stop did not
+# take.
+ONESHOT_RELAY_WAS_RUNNING=0
+relay_stop_for_oneshot() {
+  local compose_file="$1" what="$2"
+  ONESHOT_RELAY_WAS_RUNNING=0
+  relay_container_running || return 0
+  ONESHOT_RELAY_WAS_RUNNING=1
+  info "Stopping the relay — the database allows a single writer."
+  dc "$compose_file" stop relay >/dev/null 2>&1 || true
+
+  # Verify rather than assume. If the stop did not take, the one-shot opens db/
+  # against a live relay and dies in badger with a lock panic that reads like
+  # a bug in the import (issue #12) — abort with the actual cause instead.
+  if relay_container_running; then
+    warn "The relay container is still running; the $what cannot open db/ while it holds the lock."
+    warn "Stop it manually ('./haven stop' or 'docker stop $RELAY_CONTAINER') and run the $what again."
+    return 1
+  fi
+  return 0
+}
+
+relay_restart_after_oneshot() {
+  local compose_file="$1" was_running="$2"
+  [[ "$was_running" == "1" ]] || return 0
+  info "Starting the relay again..."
+  dc "$compose_file" start relay >/dev/null 2>&1 || dc "$compose_file" up -d
+}
+
 # The note import is a separate one-shot run of the same binary, not something
 # the relay does while serving. Run it with `compose run`, which ignores the
 # service's restart policy — the flag-based path cannot, which is why leaving the
@@ -2112,34 +2163,380 @@ run_import_once() {
   ensure_example_jsons
   warn_import_flag
 
-  if relay_container_running; then
-    was_running=1
-    info "Stopping the relay — the database allows a single writer."
-    dc "$compose_file" stop relay >/dev/null 2>&1 || true
-
-    # Verify rather than assume. If the stop did not take, the import opens db/
-    # against a live relay and dies in badger with a lock panic that reads like
-    # a bug in the import (issue #12) — abort with the actual cause instead.
-    if relay_container_running; then
-      warn "The relay container is still running; the import cannot open db/ while it holds the lock."
-      warn "Stop it manually ('./haven stop' or 'docker stop $RELAY_CONTAINER') and run the import again."
-      return 1
-    fi
-  fi
+  relay_stop_for_oneshot "$compose_file" "import" || return 1
+  was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
   info "Importing notes ($mode). This runs once and exits; it can take a while."
   dc "$compose_file" run --rm --no-deps -e HAVEN_IMPORT_FLAG=true relay || status=$?
 
-  if [[ "$was_running" == "1" ]]; then
-    info "Starting the relay again..."
-    dc "$compose_file" start relay >/dev/null 2>&1 || dc "$compose_file" up -d
-  fi
+  relay_restart_after_oneshot "$compose_file" "$was_running"
 
   if [[ "$status" -ne 0 ]]; then
     warn "Import exited with status $status."
     return "$status"
   fi
   success "Import finished."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# backup / restore
+#
+# Both run the upstream binary one-shot with the backups/ directory mounted:
+#   compose run --rm --no-deps --name <relay>-oneshot -v backups:/app/backups
+#     --entrypoint /app/haven relay backup|restore /app/backups/<file>
+# --entrypoint bypasses entrypoint.sh, so no compose or image change is needed.
+# Measured on v1.2.2-6 (plan P1): the exit code of `backup` is not a success
+# signal (exit 0 with a truncated zip on a full disk), and a damaged zip can
+# leave a partially restored database. Every zip is therefore verified before
+# it is called a backup and before it is restored.
+# ---------------------------------------------------------------------------
+
+# backup_normalize_name <arg> — sets BACKUP_NAME to the plain file name inside
+# backups/, or warns and returns 1. A leading "backups/" (tab completion) is
+# accepted.
+BACKUP_NAME=""
+backup_normalize_name() {
+  local name="$1"
+  BACKUP_NAME=""
+  name="${name#./}"
+  name="${name#backups/}"
+  if [[ -z "$name" ]]; then
+    warn "No file name given."
+    return 1
+  fi
+  if [[ "$name" == /* ]]; then
+    warn "Absolute paths are not allowed: $1 — backups always live in backups/; give a file name only."
+    return 1
+  fi
+  if [[ "$name" == */* || "$name" == *..* ]]; then
+    warn "Not a plain file name: $1 — backups always live in backups/; '/' and '..' are not allowed."
+    return 1
+  fi
+  if [[ "$name" != ?*.zip ]]; then
+    warn "Backup file names must end in .zip: $1"
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+    warn "Backup file names may contain only letters, digits and . _ + - : $1"
+    return 1
+  fi
+  BACKUP_NAME="$name"
+}
+
+list_backups() {
+  local f found=0
+  for f in "$BACKUP_DIR"/*.zip; do
+    [[ -f "$f" ]] || continue
+    if [[ "$found" == "0" ]]; then
+      info "Backups in $BACKUP_DIR:"
+      found=1
+    fi
+    printf '  %s\n' "${f##*/}"
+  done
+  if [[ "$found" == "0" ]]; then
+    info "No backups found in $BACKUP_DIR (create one with './$SCRIPT_NAME backup')."
+  fi
+}
+
+# A one-shot container left over from an aborted run would be a second writer
+# on db/ (lmdb allows several), and compose would refuse the fixed name anyway.
+oneshot_leftover_check() {
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
+    warn "A one-shot container from an earlier run still exists: $ONESHOT_CONTAINER"
+    warn "Check it with 'docker logs $ONESHOT_CONTAINER', remove it with 'docker rm -f $ONESHOT_CONTAINER', then try again."
+    return 1
+  fi
+  return 0
+}
+
+# The container writes the zip, so backups/ must be writable by DOCKER_UID.
+# ensure_data_dirs has already compared the owner; this adds the mode bits.
+backup_dir_writable() {
+  local uid owner
+  uid="$(env_value_or_empty DOCKER_UID)"
+  [[ -n "$uid" ]] || uid="1000"
+  if ! is_int "$uid"; then
+    return 0   # ensure_data_dirs warned already; the verification still catches a missing file
+  fi
+  if [[ $((10#$uid)) -eq "$(id -u)" ]]; then
+    [[ -w "$BACKUP_DIR" && -x "$BACKUP_DIR" ]] && return 0
+  else
+    owner="$(path_owner_uid "$BACKUP_DIR")"
+    if is_int "$owner" && [[ $((10#$owner)) -eq $((10#$uid)) ]] \
+      && [[ -n "$(find -H "$BACKUP_DIR" -maxdepth 0 -perm -u+wx -print 2>/dev/null || true)" ]]; then
+      return 0
+    fi
+  fi
+  warn "backups/ is not writable for uid $uid, the user the container runs as. Fix with: chmod u+rwx $BACKUP_DIR"
+  return 1
+}
+
+# Free space in backups/ against the allocated size of db/ (du counts allocated
+# blocks, so a sparse lmdb file counts with what it really holds). A failed
+# measurement only warns: the verification after the backup still catches a
+# truncated zip.
+backup_space_check() {
+  local need free
+  need="$(du -skH "$ROOT_DIR/db" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+  free="$(df -Pk "$BACKUP_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  if ! is_int "$need" || ! is_int "$free"; then
+    warn "Could not measure the free space in backups/; continuing (the backup is verified afterwards)."
+    return 0
+  fi
+  if (( free < need )); then
+    warn "Not enough free space in backups/: ${free} KiB free, db/ holds ${need} KiB."
+    return 1
+  fi
+  return 0
+}
+
+db_has_data() {
+  [[ -n "$(find -H "$ROOT_DIR/db" -mindepth 1 ! -name .gitignore -print -quit 2>/dev/null || true)" ]]
+}
+
+# little-endian hex ("0500") to decimal
+zip_le_hex() {
+  local h="$1" out=""
+  while [[ -n "$h" ]]; do
+    out="${h:0:2}$out"
+    h="${h:2}"
+  done
+  printf '%d' "$((16#$out))"
+}
+
+# The end-of-central-directory record must close the file: busybox unzip -t
+# (the image's unzip) accepts a zip cut by one byte (measured on v1.2.2-6),
+# Info-ZIP does not. Upstream writes no zip comment, so the record is the last
+# 22 bytes and its offset + size land exactly on the file size.
+zip_tail_intact() {
+  local f="$1" size hex cd_size cd_off
+  size="$(stat -L -c %s "$f" 2>/dev/null || stat -L -f %z "$f" 2>/dev/null || true)"
+  is_int "$size" || return 1
+  (( size >= 22 )) || return 1
+  hex="$(tail -c 22 "$f" | od -An -v -tx1 | tr -d ' \n')"
+  [[ ${#hex} -eq 44 && "${hex:0:8}" == "504b0506" ]] || return 1
+  [[ "${hex:40:4}" == "0000" ]] || return 1
+  cd_size="$(zip_le_hex "${hex:24:8}")"
+  cd_off="$(zip_le_hex "${hex:32:8}")"
+  # ZIP64 (> 4 GiB or > 65535 entries) moves the real values elsewhere; leave
+  # that case to unzip -t.
+  if [[ "${hex:24:8}" == "ffffffff" || "${hex:32:8}" == "ffffffff" ]]; then
+    return 0
+  fi
+  (( cd_off + cd_size + 22 == size ))
+}
+
+# verify_backup_zip <compose_file> <path inside backups/>
+# 0 = intact and exactly the five expected entries; 1 = damaged (warned);
+# 2 = could not be verified (warned). Sets BACKUP_VERIFIED_BY.
+BACKUP_VERIFIED_BY=""
+verify_backup_zip() {
+  local compose_file="$1" f="$2" listing="" rc=0 entries
+  BACKUP_VERIFIED_BY=""
+  if [[ ! -s "$f" ]]; then
+    warn "${f##*/} is missing or empty."
+    return 1
+  fi
+  if ! zip_tail_intact "$f"; then
+    warn "${f##*/} is damaged: the end of the archive is missing or invalid (truncated file?)."
+    return 1
+  fi
+  if command -v "$HOST_UNZIP" >/dev/null 2>&1; then
+    BACKUP_VERIFIED_BY="host unzip"
+    if ! "$HOST_UNZIP" -t "$f" >/dev/null 2>&1; then
+      warn "${f##*/} is damaged: the archive integrity test (unzip -t) failed."
+      return 1
+    fi
+    listing="$("$HOST_UNZIP" -l "$f" 2>/dev/null)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      warn "${f##*/} is damaged: unzip cannot list it."
+      return 1
+    fi
+  else
+    # No unzip on the host: use the image's own (busybox) unzip one-shot.
+    # 99 = no unzip in the image, 98 = integrity test failed; anything else
+    # non-zero is docker/compose failing to run the check.
+    BACKUP_VERIFIED_BY="the image's unzip"
+    # shellcheck disable=SC2016  # $1 expands inside the container's sh, not here
+    listing="$(dc "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+      -v "$BACKUP_DIR:/app/backups" --entrypoint sh relay \
+      -c 'command -v unzip >/dev/null 2>&1 || exit 99; unzip -t "$1" >/dev/null 2>&1 || exit 98; unzip -l "$1"' \
+      sh "/app/backups/${f##*/}" 2>/dev/null)" || rc=$?
+    if [[ "$rc" -eq 98 ]]; then
+      warn "${f##*/} is damaged: the archive integrity test (unzip -t in the image) failed."
+      return 1
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      warn "${f##*/} could not be verified: there is no unzip on this host, and the check with the image's unzip did not run (status $rc)."
+      warn "Install unzip on the host (e.g. 'apt install unzip') and try again."
+      return 2
+    fi
+  fi
+  entries="$(printf '%s\n' "$listing" | awk 'NF == 4 && $1 ~ /^[0-9]+$/ {print $4}' | LC_ALL=C sort)"
+  if [[ "$entries" != "$BACKUP_ENTRIES" ]]; then
+    warn "${f##*/} is not a complete Haven backup: expected the entries ${BACKUP_ENTRIES//$'\n'/ }, found: ${entries//$'\n'/ }"
+    return 1
+  fi
+  return 0
+}
+
+human_size() {
+  awk -v b="$1" 'BEGIN {
+    split("bytes KiB MiB GiB TiB", u, " ")
+    i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]
+  }'
+}
+
+# backup_relay_db <mode> [file]
+backup_relay_db() {
+  local mode="$1" requested="$2"
+  local compose_file name target partial status=0 was_running vrc=0 size
+
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+
+  # --- preflight: nothing is stopped before all of this has passed ---
+  if [[ -n "$requested" ]]; then
+    backup_normalize_name "$requested" || return 1
+    name="$BACKUP_NAME"
+  else
+    name="haven-backup-$(date +%Y%m%d-%H%M%S).zip"
+  fi
+  target="$BACKUP_DIR/$name"
+  partial="$target.partial"
+
+  ensure_docker_uid
+  ensure_data_dirs
+  ensure_example_jsons
+  backup_dir_writable || return 1
+  if [[ -e "$target" || -L "$target" ]]; then
+    warn "backups/$name already exists; a backup never overwrites a file. Choose another name."
+    return 1
+  fi
+  if [[ -e "$partial" || -L "$partial" ]]; then
+    warn "backups/$name.partial is left over from an earlier, failed run. Remove it or choose another name."
+    return 1
+  fi
+  oneshot_leftover_check || return 1
+  backup_space_check || return 1
+
+  # --- run ---
+  relay_stop_for_oneshot "$compose_file" "backup" || return 1
+  was_running="$ONESHOT_RELAY_WAS_RUNNING"
+
+  info "Writing backups/$name ($mode)..."
+  dc "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+    -v "$BACKUP_DIR:/app/backups" --entrypoint /app/haven \
+    relay backup "/app/backups/$name.partial" || status=$?
+
+  # The relay comes back before the verification: it does not need db/ quiet.
+  relay_restart_after_oneshot "$compose_file" "$was_running"
+
+  if [[ "$status" -ne 0 ]]; then
+    warn "The backup exited with status $status; no backup was written."
+    if [[ -e "$partial" ]]; then
+      warn "The incomplete file is kept for inspection: $partial — it is not a usable backup; delete it when done."
+    fi
+    return 1
+  fi
+  if [[ ! -s "$partial" ]]; then
+    warn "The backup reported success but wrote no file; no backup was written."
+    return 1
+  fi
+
+  verify_backup_zip "$compose_file" "$partial" || vrc=$?
+  if [[ "$vrc" -ne 0 ]]; then
+    warn "No backup was written. The unverified file is kept for inspection: $partial — it is not a usable backup; delete it when done."
+    return 1
+  fi
+
+  if [[ -e "$target" ]]; then
+    warn "backups/$name appeared while the backup ran; the verified file stays as $partial."
+    return 1
+  fi
+  mv -n -- "$partial" "$target"
+  if [[ -e "$partial" || ! -f "$target" ]]; then
+    warn "Could not rename $partial to $name; the verified file stays as $partial."
+    return 1
+  fi
+
+  size="$(stat -L -c %s "$target" 2>/dev/null || stat -L -f %z "$target" 2>/dev/null || printf '?')"
+  success "Backup written: $target ($(human_size "$size"), five entries verified with $BACKUP_VERIFIED_BY)."
+  info "It does not contain the media files in blossom/, your .env or the JSON lists (relays_import.json, relays_blastr.json, blacklisted_npubs.json, whitelisted_npubs.json) — copy those separately."
+  return 0
+}
+
+# restore_relay_db <mode> <file>
+restore_relay_db() {
+  local mode="$1" requested="$2"
+  local compose_file name file status=0 was_running vrc=0
+
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+
+  # --- preflight: nothing is stopped before all of this has passed ---
+  if [[ -z "$requested" ]]; then
+    warn "Usage: ./$SCRIPT_NAME restore <file>  (a file in backups/)"
+    list_backups
+    return 1
+  fi
+  backup_normalize_name "$requested" || return 1
+  name="$BACKUP_NAME"
+  file="$BACKUP_DIR/$name"
+  if [[ ! -f "$file" ]]; then
+    warn "backups/$name not found."
+    list_backups
+    return 1
+  fi
+
+  ensure_docker_uid
+  ensure_data_dirs
+  ensure_example_jsons
+  oneshot_leftover_check || return 1
+
+  verify_backup_zip "$compose_file" "$file" || vrc=$?
+  if [[ "$vrc" -ne 0 ]]; then
+    warn "Nothing was restored; the relay was not touched."
+    return 1
+  fi
+  info "backups/$name verified with $BACKUP_VERIFIED_BY: intact, five entries."
+
+  if db_has_data; then
+    info "db/ already holds data. A restore adds the events from backups/$name that are missing; it never deletes or duplicates anything, and events that exist only in the database stay."
+    if [[ "$ASSUME_YES" == "1" ]]; then
+      :
+    elif [[ -t 0 ]]; then
+      if ! ask_yes_no "Restore into the existing database? [y/N] " "n"; then
+        info "Restore cancelled; nothing was changed."
+        return 1
+      fi
+    else
+      warn "No terminal to ask for confirmation. Run again with --yes to restore into the existing database."
+      return 1
+    fi
+  fi
+
+  # --- run ---
+  relay_stop_for_oneshot "$compose_file" "restore" || return 1
+  was_running="$ONESHOT_RELAY_WAS_RUNNING"
+
+  info "Restoring from backups/$name ($mode)..."
+  dc "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+    -v "$BACKUP_DIR:/app/backups" --entrypoint /app/haven \
+    relay restore "/app/backups/$name" || status=$?
+
+  relay_restart_after_oneshot "$compose_file" "$was_running"
+
+  if [[ "$status" -ne 0 ]]; then
+    warn "The restore exited with status $status. The database may now be partially restored."
+    warn "Running the same restore again is safe: it adds what is missing and skips what is already there."
+    return 1
+  fi
+  success "Restore finished: the events from backups/$name that were missing are now in the database; nothing was deleted or duplicated."
+  info "Media files are not part of a backup: list entries whose file is missing from blossom/ answer 404 until the files are copied back."
   return 0
 }
 
@@ -3648,8 +4045,12 @@ parse_args() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      start|stop|restart|logs|status|tui|help|import|onion|json|env|env-upgrade)
+      start|stop|restart|logs|status|tui|help|import|onion|json|env|env-upgrade|backup|restore)
         COMMAND="$1"
+        shift
+        ;;
+      -y|--yes)
+        ASSUME_YES=1
         shift
         ;;
       -t|--tor)
@@ -3691,7 +4092,12 @@ parse_args() {
         shift
         ;;
       *)
-        die "Unknown argument: $1"
+        if [[ ( "$COMMAND" == "backup" || "$COMMAND" == "restore" ) && -z "$DATA_FILE_ARG" && "$1" != -* ]]; then
+          DATA_FILE_ARG="$1"
+          shift
+        else
+          die "Unknown argument: $1"
+        fi
         ;;
     esac
   done
@@ -3747,6 +4153,14 @@ main() {
     import)
       ensure_docker
       run_import_once "$(resolve_mode "import")" || exit 1
+      ;;
+    backup)
+      ensure_docker
+      backup_relay_db "$(resolve_mode "backup")" "$DATA_FILE_ARG" || exit 1
+      ;;
+    restore)
+      ensure_docker
+      restore_relay_db "$(resolve_mode "restore")" "$DATA_FILE_ARG" || exit 1
       ;;
     env)
       menu_env_editor
