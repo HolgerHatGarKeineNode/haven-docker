@@ -34,7 +34,19 @@
 #   MOCK_RUN_HOLD=1     `run` touches `started`, then polls up to MOCK_HOLD_MAX
 #                       seconds (default 10) for `release` before it continues;
 #                       `docker stop|rm|kill <name>` touches `release` (the
-#                       one-shot container ends, so its held `run` returns)
+#                       one-shot container ends, so its held `run` returns) and
+#                       `docker stop|kill <name>` drops <name> from `running`
+#   MOCK_HOLD_AT=<n>    with MOCK_RUN_HOLD=1: hold only the n-th `run` (1-based)
+#   MOCK_PAYLOAD_AT=<n> with MOCK_RUN_WRITES=1: the n-th `run` writes a copy of
+#   MOCK_PAYLOAD_AT_FILE instead of the usual payload (a second backup that
+#                       differs from the first)
+#   MOCK_DB_DIR=<dir>   a `run ... restore ...` creates engine files in the five
+#                       database directories under <dir> (the host side of
+#                       ./db): data.mdb + lock.mdb for lmdb, MANIFEST +
+#                       000001.vlog + KEYREGISTRY for badger, the engine taken
+#                       from `-e DB_ENGINE=<e>` (none given: lmdb, as upstream).
+#                       Written before the exit status is applied, so a failing
+#                       restore leaves a partial database like the real one
 #   HAVEN_CONTAINER_NAME  name that start/up/restart mark as running
 #                         (default haven-relay)
 #   MOCK_LOG_COUNT=<n>  `compose logs` emits exactly n lines (MOCKLOG COUNTER=0 ..
@@ -95,6 +107,11 @@ mock_scripted() {
     compose) ;;
     stop|rm|kill)
       : > "$d/release"
+      if [[ "$1" != "rm" && -s "$d/running" ]]; then
+        local last="${*: -1}"
+        grep -vxF -- "$last" "$d/running" > "$d/running.tmp" || true
+        mv -f "$d/running.tmp" "$d/running"
+      fi
       exit 0
       ;;
     *) exit 0 ;;
@@ -144,7 +161,7 @@ mock_scripted() {
       [[ -f "$d/run-count" ]] && n="$(cat "$d/run-count")"
       n=$((n + 1))
       printf '%s' "$n" > "$d/run-count"
-      if [[ "${MOCK_RUN_HOLD:-0}" == "1" ]]; then
+      if [[ "${MOCK_RUN_HOLD:-0}" == "1" && ( -z "${MOCK_HOLD_AT:-}" || "$n" == "${MOCK_HOLD_AT:-}" ) ]]; then
         : > "$d/started"
         local waited=0 max="${MOCK_HOLD_MAX:-10}"
         while [[ ! -e "$d/release" ]] && (( $(awk "BEGIN{print ($waited < $max)}") )); do
@@ -172,12 +189,36 @@ mock_scripted() {
         if [[ -n "$host" && -n "$target" ]]; then
           (
             [[ -z "$um" ]] || umask "$um"
-            if [[ -n "${MOCK_RUN_PAYLOAD_FILE:-}" ]]; then
+            if [[ -n "${MOCK_PAYLOAD_AT:-}" && "$n" == "${MOCK_PAYLOAD_AT:-}" ]]; then
+              cp -- "$MOCK_PAYLOAD_AT_FILE" "$host/${target#/app/backups/}"
+            elif [[ -n "${MOCK_RUN_PAYLOAD_FILE:-}" ]]; then
               cp -- "$MOCK_RUN_PAYLOAD_FILE" "$host/${target#/app/backups/}"
             else
               printf '%s' "${MOCK_RUN_PAYLOAD:-mock-backup}" > "$host/${target#/app/backups/}"
             fi
           )
+        fi
+      fi
+      if [[ -n "${MOCK_DB_DIR:-}" ]]; then
+        local j engine="lmdb" is_restore=0 dbn
+        for ((j = 0; j < ${#args[@]}; j++)); do
+          [[ "${args[$j]}" == "restore" ]] && is_restore=1
+          if [[ "${args[$j]}" == "-e" && "${args[$((j + 1))]:-}" == DB_ENGINE=* ]]; then
+            engine="${args[$((j + 1))]#DB_ENGINE=}"
+          fi
+        done
+        if (( is_restore )); then
+          for dbn in private chat outbox inbox blossom; do
+            mkdir -p "$MOCK_DB_DIR/$dbn"
+            if [[ "$engine" == "badger" ]]; then
+              printf 'badger manifest %s %s\n' "$dbn" "$n" > "$MOCK_DB_DIR/$dbn/MANIFEST"
+              printf 'badger vlog %s %s\n' "$dbn" "$n" > "$MOCK_DB_DIR/$dbn/000001.vlog"
+              printf 'badger keys %s %s\n' "$dbn" "$n" > "$MOCK_DB_DIR/$dbn/KEYREGISTRY"
+            else
+              printf 'lmdb data %s %s\n' "$dbn" "$n" > "$MOCK_DB_DIR/$dbn/data.mdb"
+              printf 'lmdb lock %s %s\n' "$dbn" "$n" > "$MOCK_DB_DIR/$dbn/lock.mdb"
+            fi
+          done
         fi
       fi
       local rc="${MOCK_RUN_EXIT:-0}"
