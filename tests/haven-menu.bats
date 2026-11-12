@@ -32,7 +32,8 @@ in_haven() {
   '
 }
 
-# The specified menu: group names as "# <name>", entries as "<letter> <label>".
+# The specified menu: group names as "# <name>", entries as "<letter> <label>";
+# "# " (no name) is the blank row that sets Help / About / Quit apart.
 SPEC_MENU='# Relay
 s Start
 t Start with Tor
@@ -41,18 +42,19 @@ r Restart
 # Data
 b Back up now
 e Restore a backup
-d Switch database engine
+d Switch engine
 i Import notes
 # Configure
 c Settings (.env)
 l Access lists (JSON)
-u Update settings from template
+u Add missing settings
 o Onion address
+# 
 ? Help
 a About
 q Quit'
 
-@test "menu: 15 entries in the specified order, in three groups plus the ungrouped tail" {
+@test "menu: 15 entries in the specified order, in three groups plus the tail after a blank row" {
   run in_haven 'TUI_VIEW=main; tui_build_menu
     for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do
       if [[ "${MENU_IDS[$i]}" == group:* ]]; then echo "# ${MENU_LABELS[$i]}"; else echo "${MENU_KEYS[$i]} ${MENU_LABELS[$i]}"; fi
@@ -63,21 +65,34 @@ q Quit'
   [ "$(grep -vc '^# ' <<<"$output")" -eq 15 ]
 }
 
-@test "menu: state line, three group names and all 15 entries fit 80x24 without scrolling" {
+@test "menu: three group names with their state, a blank row and all 15 entries fit 80x24 without scrolling, no label cut" {
   run in_haven 'TUI_VIEW=main; tui_draw_frame 0; tui_render_left_menu; echo "OFFSET=$TUI_OFFSET" > "$SB/offset"'
   [ "$status" -eq 0 ]
   grep -qx 'OFFSET=0' "$TEST_DIR/offset"
   local screen label
   screen="$(printf '%s' "$output" | python3 -I "$EMU" 80 24 dump)"
   echo "$screen"
-  # content rows 4..22 (1-based) hold exactly: the state line, then the menu
+  # content rows 4..22 (1-based) hold exactly the menu: the relay state after
+  # "Relay", the engine after "Data", the blank row before Help — and no label
+  # is cut (no "..." / "…" anywhere in the pane)
   local rows
   rows="$(sed -n '4,22p' <<<"$screen" | sed -E 's/^│ ?//; s/│.*$//; s/ +$//; s/^▸ /  /')"
-  [ "$(sed -n 1p <<<"$rows")" == "○ Docker offline  badger" ]
   local want
-  # the one label wider than the 27-cell pane is cut by the menu's truncation
-  want="$(sed -E 's/^# (.*)/\1/; t; s/^/  /; s/Update settings from template/Update settings from.../' <<<"$SPEC_MENU")"
-  [[ "$(sed -n '2,19p' <<<"$rows")" == "$want" ]]
+  want="$(sed -E 's/^# $//; t; s/^# (.*)/\1/; t; s/^/  /' <<<"$SPEC_MENU" \
+    | sed -E 's/^Relay$/Relay  ○ Docker offline/; s/^Data$/Data  engine: badger/')"
+  [[ "$rows" == "$want" ]]
+  ! grep -qE '\.\.\.|…' <<<"$rows"
+}
+
+@test "menu: at 66x20 the visible entries all differ from each other" {
+  COLS=66 ROWS=20 run in_haven 'TUI_VIEW=main; tui_draw_frame 0; tui_render_left_menu'
+  [ "$status" -eq 0 ]
+  local rows
+  rows="$(printf '%s' "$output" | python3 -I "$EMU" 66 20 dump | sed -n '4,18p' \
+    | sed -E 's/^│ ?//; s/│.*$//; s/ +$//; s/^▸ /  /' | grep '^  ' | sed -E 's/^  . //; s/\.\.\.$//')"
+  echo "$rows"
+  [ "$(wc -l <<<"$rows")" -eq 12 ]
+  [ "$(sort -u <<<"$rows" | wc -l)" -eq 12 ]
 }
 
 @test "menu: no navigation key ever selects a group name" {
@@ -161,7 +176,7 @@ TRACE_STUBS='
 
 @test "menu: the data entries name their CLI command in one sentence" {
   run in_haven "$TRACE_STUBS"'
-    for l in "Back up now" "Restore a backup" "Switch database engine"; do
+    for l in "Back up now" "Restore a backup" "Switch engine"; do
       for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_LABELS[$i]}" == "$l" ]] && TUI_SEL=$i; done
       tui_handle_enter
     done'
@@ -169,34 +184,34 @@ TRACE_STUBS='
   echo "$output"
   [[ "$output" == "message[Back up now|To back up the database, run ./haven backup in a terminal.]
 message[Restore a backup|To restore a backup, run ./haven restore <file> in a terminal.]
-message[Switch database engine|To move the data to the other engine, run ./haven db-switch <badger|lmdb> in a terminal.]" ]]
+message[Switch engine|To move the data to the other engine, run ./haven db-switch <badger|lmdb> in a terminal.]" ]]
 }
 
-@test "menu: the state line drops whole fields from the right instead of cutting a word" {
+@test "menu: the relay state behind Relay drops whole fields from the right instead of cutting a word" {
   run in_haven '
     TUI_DOCKER_OK=1
     relay_container_running() { return 0; }
     resolve_mode() { printf tor; }
-    tui_state_line; echo "80: [$MENU_STATE] w=$LEFT_CONTENT_W"
-    LEFT_CONTENT_W=18; tui_state_line; echo "18: [$MENU_STATE]"
-    LEFT_CONTENT_W=12; tui_state_line; echo "12: [$MENU_STATE]"
+    tui_state_line; echo "80: [$MENU_STATE] [$MENU_ENGINE_NOTE] w=$LEFT_CONTENT_W"
+    LEFT_CONTENT_W=21; tui_state_line; echo "21: [$MENU_STATE]"
+    LEFT_CONTENT_W=20; tui_state_line; echo "20: [$MENU_STATE]"
     relay_container_running() { return 1; }; resolve_mode() { printf plain; }
-    LEFT_CONTENT_W=27; tui_state_line; echo "stopped: [$MENU_STATE]"
-    TUI_DOCKER_OK=0; tui_state_line; echo "offline: [$MENU_STATE]"'
+    LEFT_CONTENT_W=25; tui_state_line; echo "stopped: [$MENU_STATE]"
+    TUI_DOCKER_OK=0; tui_state_line; echo "offline: [$MENU_STATE] [$MENU_ENGINE_NOTE]"'
   [ "$status" -eq 0 ]
   echo "$output"
-  [[ "$output" == "80: [● Running  Tor  badger] w=27
-18: [● Running  Tor]
-12: [● Running]
-stopped: [○ Stopped  Plain  badger]
-offline: [○ Docker offline  badger]" ]]
+  [[ "$output" == "80: [● Running  Tor] [engine: badger] w=27
+21: [● Running  Tor]
+20: [● Running]
+stopped: [○ Stopped  Plain]
+offline: [○ Docker offline] [engine: badger]" ]]
 }
 
-@test "menu: the state line names the engine of the data on disk before .env" {
+@test "menu: the engine behind Data is the engine of the data on disk before .env" {
   mkdir -p "$TEST_DIR/db/private" && : > "$TEST_DIR/db/private/data.mdb"
-  run in_haven 'tui_state_line; echo "[$MENU_STATE]"'
+  run in_haven 'tui_state_line; echo "[$MENU_ENGINE_NOTE]"'
   [ "$status" -eq 0 ]
-  [[ "$output" == "[○ Docker offline  lmdb]" ]]
+  [[ "$output" == "[engine: lmdb]" ]]
 }
 
 @test "menu: rows 1-4 of the main view contain Haven at most once" {
@@ -206,4 +221,60 @@ offline: [○ Docker offline  badger]" ]]
   top="$(printf '%s' "$output" | python3 -I "$EMU" 80 24 dump | sed -n '1,5p')"
   echo "$top"
   [ "$(grep -o Haven <<<"$top" | wc -l)" -eq 1 ]
+}
+
+@test "menu: with Docker offline an action shows the Docker message and the TUI stays open" {
+  # each entry that needs the daemon: the message, then rc 0 (rc 1 ends the loop)
+  run in_haven '
+    TUI_ACTIVE=1
+    docker() { [[ "$1" == info ]] && return 1; echo "docker $*"; }
+    tui_message() { echo "message[$1|$2]"; }
+    tui_confirm() { echo "confirm[$1]"; return 1; }
+    TUI_VIEW=main; tui_build_menu
+    for key in s t x r i; do TUI_SEL=1; tui_handle_key "$key"; echo "$key rc=$?"; done'
+  echo "$output"
+  [ "$status" -eq 0 ]
+  local m="message[Docker|Docker daemon not reachable. Start Docker and try again.]"
+  [[ "$output" == "$m
+s rc=0
+$m
+t rc=0
+$m
+x rc=0
+$m
+r rc=0
+$m
+i rc=0" ]]
+}
+
+@test "settings: leaving the value prompt unchanged (Esc, empty Enter) writes nothing and restarts nothing" {
+  printf 'DB_ENGINE="badger"\nRELAY_PORT=3355\n' > "$TEST_DIR/.env"
+  run in_haven '
+    TUI_ACTIVE=1
+    set_env_var() { echo "write[$1=$2]"; }
+    restart_after_env_change() { echo "restart"; }
+    tui_prompt() { printf "%s" "$2"; }   # Esc and an empty Enter hand back the default
+    TUI_VIEW=env_item; CURRENT_ENV_KEY=RELAY_PORT; tui_build_menu
+    TUI_SEL=0; tui_handle_enter; echo "same rc=$?"
+    tui_prompt() { printf 4444; }       # a changed value is written and applied
+    TUI_SEL=0; tui_handle_enter; echo "changed rc=$?"'
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "same rc=0
+write[RELAY_PORT=4444]
+restart
+changed rc=0" ]]
+}
+
+@test "message box: a \\n written by the caller is a line break, not text" {
+  run in_haven 'LOG_LINES=(); tui_wait_key() { :; }; tui_message "Title" "one\n\ntwo"'
+  [ "$status" -eq 0 ]
+  local rows
+  rows="$(printf '%s' "$output" | python3 -I "$EMU" 80 24 dump | sed -n '4,8p' | sed -E 's/^│ ?//; s/│.*$//; s/ +$//')"
+  echo "$rows"
+  [[ "$rows" == "Title
+───────────────────────────
+one
+
+two" ]]
 }

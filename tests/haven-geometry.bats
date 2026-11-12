@@ -49,8 +49,9 @@ VIEW_access='TUI_VIEW=json_files; tui_render_left_menu; tui_render_right_logs'
 VIEW_status='TUI_VIEW=main; tui_render_left_menu; TUI_RIGHT_MODE=status; tui_render_right_status'
 VIEW_filter='TUI_VIEW=main; tui_render_left_menu; LOG_FILTER=COUNTER=1; LOG_SCROLL=3; tui_render_right_logs'
 # user data with wide characters in both titles: the painter itself must count cells
-VIEW_wide='TUI_LEFT_TITLE="Haven / Settings / 日本語の設定キー名前"; TUI_RIGHT_TITLE="Logs 日本語ログ 世界 │ 中文字符 漢字"; tui_draw_title_row'
-VIEWS=(main settings setting_key access status filter wide)
+VIEW_wide='TUI_LEFT_TITLE="Haven / Settings / 日本語の設定キー名前日本語の設定"; TUI_RIGHT_TITLE="Logs 日本語ログ 世界 │ 中文字符 漢字"; tui_draw_title_row'
+VIEW_list='TUI_VIEW=json_items; CURRENT_JSON_FILE=relays_import.json; tui_render_left_menu; tui_render_right_logs'
+VIEWS=(main settings setting_key access list status filter wide)
 
 # check_geometry <cols> <lines> <view> — empty output when the frame is right,
 # otherwise one line per broken fact
@@ -109,12 +110,19 @@ check_geometry() {
   [[ "$out" == "title │ Haven / Settings / RELAY_URL "* ]]
   out="$(paint 80 24 "$VIEW_access" | python3 -I "$EMU" 80 24 frame | grep '^title ')"
   [[ "$out" == "title │ Haven / Access lists "* ]]
+  # too wide for its field, the path gives up leading segments before a word
+  # is cut: the view you are in stays readable
+  out="$(paint 80 24 "$VIEW_list" | python3 -I "$EMU" 80 24 frame | grep '^title ')"
+  [[ "$out" == "title │ … / Import relays "*"│ Logs: relay"* ]]
+  out="$(paint 120 30 "$VIEW_list" | python3 -I "$EMU" 120 30 frame | grep '^title ')"
+  [[ "$out" == "title │ Haven / Access lists / Import relays "* ]]
   out="$(paint 80 24 "$VIEW_status" | python3 -I "$EMU" 80 24 frame | grep '^title ')"
-  [[ "$out" == *"│ ◉ Status "* ]]
-  # the wide left title is cut inside its 28-cell field (27 cells of text at
-  # most): 23 cells of text, "...", and the two cells 語 does not fit into
+  [[ "$out" == *"│ Status "* ]]
+  # the wide left title loses its leading segments, then its last segment is
+  # cut inside the 28-cell field (27 cells of text at most): "… / " (4 cells),
+  # ten wide characters (20), "..." and the blank before the divider
   out="$(paint 80 24 "$VIEW_wide" | python3 -I "$EMU" 80 24 frame | grep '^title ')"
-  [[ "$out" == "title │ Haven / Settings / 日本...  │ Logs 日本語ログ"* ]]
+  [[ "$out" == "title │ … / 日本語の設定キー名前... │ Logs 日本語ログ"* ]]
 }
 
 # ---------- glyph policy: no East Asian Wide/Fullwidth codepoint ----------

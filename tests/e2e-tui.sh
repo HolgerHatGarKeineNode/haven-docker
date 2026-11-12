@@ -294,9 +294,9 @@ elif ! goto_item t2 "c Settings (.env)"; then
   bad "menu entry 'c Settings (.env)' not reachable"
 else
   tmx send-keys -t t2 Enter                             # open env_list
-  wait_for t2 "Add variable"
-  goto_item t2 "Add variable"
-  tmx send-keys -t t2 Enter                             # "Add variable" opens tui_prompt ("New key: ")
+  wait_for t2 "Add setting"
+  goto_item t2 "Add setting"
+  tmx send-keys -t t2 Enter                             # "Add setting" opens tui_prompt ("New key: ")
   if ! wait_for t2 "New key"; then
     bad "prompt never opened before resize ($(capture t2 | tr '\n' '|' | head -c 160))"
   else
@@ -603,9 +603,9 @@ elif ! goto_item t9 "c Settings (.env)"; then
   bad "menu entry 'c Settings (.env)' not reachable"
 else
   tmx send-keys -t t9 Enter
-  wait_for t9 "Add variable"
-  goto_item t9 "Add variable"
-  if ! prompt_open t9 "New key"; then  # "Add variable" opens the "New key: " prompt
+  wait_for t9 "Add setting"
+  goto_item t9 "Add setting"
+  if ! prompt_open t9 "New key"; then  # "Add setting" opens the "New key: " prompt
     bad "key prompt did not open"
   else
     # paste 30 characters through bracketed paste
@@ -704,8 +704,8 @@ else
   tmx send-keys -t t11 x      # dismiss message
   wait_absent t11 "abcdefgh1234" 10 || true
   tmx send-keys -t t11 Escape # env_item -> env_list
-  wait_for t11 "Add variable"
-  goto_item t11 "Add variable"
+  wait_for t11 "Add setting"
+  goto_item t11 "Add setting"
   prompt_open t11 "New key"
   tmx send-keys -t t11 -l "RELAY_PORT"
   wait_for t11 "RELAY_PORT"
@@ -726,9 +726,9 @@ else
   fi
   # DB_ENGINE away from the engine of the data in db/ is refused at the prompt
   # and names the db-switch that moves the data (the sandbox db/ holds badger)
-  wait_for t11 "Add variable"
+  wait_for t11 "Add setting"
   send_settled t11 Home   # back to the top; goto_item only walks down
-  goto_item t11 "Add variable"
+  goto_item t11 "Add setting"
   prompt_open t11 "New key"
   tmx send-keys -t t11 -l "DB_ENGINE"
   wait_for t11 "DB_ENGINE"
@@ -788,8 +788,8 @@ t12_tail_shown() { [[ "$(t12_cells)" == "$(t12_tail_text)" ]]; }
 # the row.
 filter_prompt_is() { # <text>
   local row cell
-  row="$(capture t12 | grep -m1 'Filter (empty clears):')" || return 1
-  cell="${row#*Filter (empty clears):}"
+  row="$(capture t12 | grep -m1 'Filter logs:')" || return 1
+  cell="${row#*Filter logs:}"
   cell="${cell%%│*}"
   cell="${cell#"${cell%%[! ]*}"}"
   cell="${cell%"${cell##*[! ]}"}"
@@ -827,8 +827,8 @@ else
   page=$((T12_H - 1))
   lo=$((STREAM_N - T12_H - page))
   send_settled t12 PgUp
-  if has_text t12 "paused (PgDn: resume)"; then
-    ok "PgUp pauses the panel and shows the pause banner"
+  if has_text t12 "│ Paused"; then
+    ok "PgUp pauses the panel and names it in the panel title"
   else
     bad "PgUp did not show the pause banner"
   fi
@@ -847,7 +847,7 @@ else
   # the way back: from the clamped top four pages bring the live end back — had the
   # scroll position overshot the top, four PgDn would still be paused
   for _ in 1 2 3 4; do send_settled t12 PgDn; done
-  if has_text t12 "paused"; then
+  if has_text t12 "Paused"; then
     bad "PgDn did not resume the live view after four pages down from the top"
   elif t12_tail_shown; then
     ok "PgDn resumes the live view (exactly COUNTER=$((STREAM_N - T12_H))..$((STREAM_N - 1)) again)"
@@ -861,11 +861,11 @@ else
   if [[ "$want_n" != "21" ]]; then
     bad "filter fixture changed: expected 21 lines containing a 9 in the stream, found $want_n"
   elif ! t12_filter "9"; then
-    bad "filter prompt did not open, take the text or apply it (prompt row: $(capture t12 | grep -m1 'Filter (empty clears):' | head -c 80))"
+    bad "filter prompt did not open, take the text or apply it (prompt row: $(capture t12 | grep -m1 'Filter logs:' | head -c 80))"
   else
     # submitted: the prompt row is cleared and the menu row under it is back, with
     # no further key (two render passes after the Enter have run)
-    if poll_until "$WAIT_T" prompt_row_restored t12 "Filter (empty clears):"; then
+    if poll_until "$WAIT_T" prompt_row_restored t12 "Filter logs:"; then
       ok "a submitted prompt clears its row (the menu row is back)"
     else
       bad "a submitted prompt left its row painted ($(capture_n t12 | sed -n "$((T12_LINES - 2))p" | head -c 60))"
@@ -873,10 +873,10 @@ else
     cells="$(t12_cells)"
     banner="$(printf '%s\n' "$cells" | head -1)"
     shown="$(printf '%s\n' "$cells" | tail -n +2)"
-    if [[ "$banner" == "21 match(es) for '9' (/ resets)" ]]; then
-      ok "slash search shows the exact match count (21 match(es) for '9')"
+    if [[ "$banner" == "21 matching lines" ]]; then
+      ok "slash search shows the exact match count (21 matching lines)"
     else
-      bad "slash search banner is not '21 match(es) for '9' (/ resets)' (got: ${banner:0:60})"
+      bad "slash search banner is not '21 matching lines' (got: ${banner:0:60})"
     fi
     # kept: the stream's oldest (9) and newest (119) matches and everything between
     missing="$(LC_ALL=C comm -13 <(printf '%s\n' "$shown" | LC_ALL=C sort) <(printf '%s\n' "$want_lines" | LC_ALL=C sort) | tr '\n' ',')"
@@ -902,7 +902,7 @@ else
     # one match: the banner AND that line — the hit-count row must not eat the first line
     if ! t12_filter "COUNTER=77"; then
       bad "second filter prompt did not open or apply"
-    elif [[ "$(t12_cells)" == $'1 match(es) for \'COUNTER=77\' (/ resets)\nMOCKLOG COUNTER=77' ]]; then
+    elif [[ "$(t12_cells)" == $'1 matching line\nMOCKLOG COUNTER=77' ]]; then
       ok "one match: the banner and that one line are drawn (COUNTER=77)"
     else
       bad "one match is not banner + COUNTER=77 (got: $(t12_cells | tr '\n' '|' | head -c 120))"
@@ -921,7 +921,7 @@ else
   tmx send-keys -t t12 Tab
   wait_for t12 "blossom/:" || true
   out="$(capture t12)"
-  if [[ "$out" == *"Status"* && "$out" == *"running"* ]]; then
+  if [[ "$out" == *"│ Status "* && "$out" == *"running"* ]]; then
     ok "Tab switches to the status view (title + running container)"
   else
     bad "status view missing (title/running)"
@@ -1020,8 +1020,8 @@ else
   send_settled t13 Home   # back to the top; goto_item only walks down
   if goto_item t13 "c Settings (.env)"; then
     tmx send-keys -t t13 Enter
-    wait_for t13 "Add variable"
-    goto_item t13 "Add variable"
+    wait_for t13 "Add setting"
+    goto_item t13 "Add setting"
     tmx send-keys -t t13 Enter
     wait_for t13 "New key"
     tmx send-keys -t t13 -l "E2E_TEST_KEY"
@@ -1095,7 +1095,7 @@ geometry_walk() {
   local s="$1" c="$2" l="$3"
   geometry_case "$s" "$c" "$l" "main"
   send_settled "$s" c
-  if wait_for "$s" "Add variable"; then
+  if wait_for "$s" "Add setting"; then
     geometry_case "$s" "$c" "$l" "settings"
     if [[ "$c" == 80 ]]; then
       if [[ "$(capture "$s" | sed -n 2p)" == *"Settings"* ]]; then
@@ -1118,18 +1118,18 @@ geometry_walk() {
   send_settled "$s" Escape
   wait_for "$s" "▸ s Start"
   send_settled "$s" Tab
-  if wait_for "$s" "◉ Status"; then
+  if wait_for "$s" "│ Status "; then
     geometry_case "$s" "$c" "$l" "status"
   else
     bad "geometry ${c}x${l}: status view did not open"
   fi
   send_settled "$s" Tab
   tmx send-keys -t "$s" /
-  wait_for "$s" "Filter (empty clears):"
+  wait_for "$s" "Filter logs:"
   tmx send-keys -t "$s" -l "=1"
-  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter (empty clears):" "=1"
+  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter logs:" "=1"
   tmx send-keys -t "$s" Enter
-  if wait_for "$s" "match(es) for '=1'"; then
+  if wait_for "$s" "matching line"; then
     geometry_case "$s" "$c" "$l" "log filter"
   else
     bad "geometry ${c}x${l}: the log filter did not apply"
@@ -1154,12 +1154,20 @@ for size in 66x20 80x24 100x24 120x30 160x40; do
     else
       bad "rows 1-4 of the main view contain Haven $(grep -o Haven <<<"$top" | wc -l) times"
     fi
-    # the state line at 80 columns: whole words only, no ellipsis
+    # the relay state behind "Relay" at 80 columns: whole words only, no ellipsis
     state="$(left_rows "$s" 4 4)"
-    if [[ "$state" == *"●"* || "$state" == *"○"* ]] && [[ "$state" != *"..."* && "$state" != *"…"* ]]; then
-      ok "the state line at 80 columns is not cut ($(sed 's/ *$//' <<<"$state"))"
+    if [[ "$state" == " Relay  "*"●"* || "$state" == " Relay  "*"○"* ]] && [[ "$state" != *"..."* && "$state" != *"…"* ]]; then
+      ok "the relay state at 80 columns is not cut ($(sed 's/ *$//' <<<"$state"))"
     else
-      bad "the state line at 80 columns is cut or missing ('$state')"
+      bad "the relay state at 80 columns is cut or missing ('$state')"
+    fi
+    # no menu label is cut at 80 columns, and Help / About / Quit stand apart
+    # from Configure: the row above "? Help" is blank
+    body="$(left_rows "$s" 4 22)"
+    if ! grep -qE '\.\.\.|…' <<<"$body" && [[ "$(grep -B1 '? Help' <<<"$body" | head -1 | tr -d ' ')" == "" ]]; then
+      ok "no menu label is cut at 80x24 and a blank row sets Help / About / Quit apart"
+    else
+      bad "a menu label is cut at 80x24 or Help is not set apart ($(tr '\n' '|' <<<"$body" | head -c 200))"
     fi
     # the whole menu on one screen: the last entry is drawn, nothing scrolled
     if has_text "$s" "q Quit" && has_text "$s" "Relay" && has_text "$s" "s Start"; then
@@ -1239,8 +1247,8 @@ if ! wait_for t16 "▸ s Start"; then
   bad "TUI did not start for the restart dialog check"
 else
   send_settled t16 c
-  wait_for t16 "Add variable"
-  goto_item t16 "Add variable"
+  wait_for t16 "Add setting"
+  goto_item t16 "Add setting"
   prompt_open t16 "New key"
   tmx send-keys -t t16 -l "E2E_RESTART_KEY"
   poll_until "$WAIT_T" prompt_cell_is t16 "New key:" "E2E_RESTART_KEY"
@@ -1288,10 +1296,10 @@ tui_walk() { # <session>
   wait_for "$s" "▸ s Start" || return 1
   for k in s t x r i; do
     case "$k" in
-      s) text="Start services (Docker)?" ;;
-      t) text="Start services (Tor)?" ;;
-      x) text="Stop services (" ;;
-      r) text="Restart services (" ;;
+      s) text="Start the relay?" ;;
+      t) text="Start the relay with Tor?" ;;
+      x) text="Stop the relay (" ;;
+      r) text="Restart the relay (" ;;
       i) text="Import notes now?" ;;
     esac
     tmx send-keys -t "$s" "$k"
@@ -1304,10 +1312,10 @@ tui_walk() { # <session>
       b) text="To back up the database" ;;
       e) text="To restore a backup" ;;
       d) text="To move the data" ;;
-      '?') text="Quick help" ;;
+      '?') text="Go to nth entry" ;;
       a) text="Relay image digest" ;;
-      o) text="Onion Host" ;;
-      u) text="No missing variables" ;;
+      o) text="No onion address yet" ;;
+      u) text="Nothing to add" ;;
     esac
     tmx send-keys -t "$s" "$k"
     wait_for "$s" "$text" || return 1
@@ -1315,34 +1323,34 @@ tui_walk() { # <session>
     wait_absent "$s" "$text" || return 1
   done
   send_settled "$s" c
-  wait_for "$s" "Add variable" || return 1
+  wait_for "$s" "Add setting" || return 1
   goto_item "$s" "RELAY_URL" || return 1
   send_settled "$s" Enter
   wait_for "$s" "Reveal value" || return 1
   send_settled "$s" Escape
-  wait_for "$s" "Add variable" || return 1
+  wait_for "$s" "Add setting" || return 1
   send_settled "$s" Escape
   wait_for "$s" "▸ s Start" || return 1
   send_settled "$s" l
-  wait_for "$s" "Relays Import" || return 1
+  wait_for "$s" "Import relays" || return 1
   send_settled "$s" Enter
   wait_for "$s" "Add item" || return 1
   send_settled "$s" Escape
   send_settled "$s" Escape
   wait_for "$s" "▸ s Start" || return 1
   send_settled "$s" Tab
-  wait_for "$s" "◉ Status" || return 1
+  wait_for "$s" "│ Status " || return 1
   send_settled "$s" Tab
   tmx send-keys -t "$s" /
-  wait_for "$s" "Filter (empty clears):" || return 1
+  wait_for "$s" "Filter logs:" || return 1
   tmx send-keys -t "$s" -l "=1"
-  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter (empty clears):" "=1" || return 1
+  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter logs:" "=1" || return 1
   tmx send-keys -t "$s" Enter
-  wait_for "$s" "match(es) for '=1'" || return 1
+  wait_for "$s" "matching line" || return 1
   tmx send-keys -t "$s" /
-  wait_for "$s" "Filter (empty clears):" || return 1
+  wait_for "$s" "Filter logs:" || return 1
   tmx send-keys -t "$s" Enter
-  wait_absent "$s" "match(es) for" || return 1
+  wait_absent "$s" "matching line" || return 1
   tmx send-keys -t "$s" q
   poll_until "$WAIT_T" test -s "${SBOF[$s]}/.rig/rc"
 }

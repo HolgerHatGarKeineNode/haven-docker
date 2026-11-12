@@ -30,14 +30,14 @@ render() {
 @test "render: one match shows the banner and that one line" {
   run render 40 'COUNTER=7'
   [ "$status" -eq 0 ]
-  [[ "$output" == $'@4:1 match(es) for \'COUNTER=7\' (/ resets)\n@5:MOCKLOG COUNTER=7' ]]
+  [[ "$output" == $'@4:1 matching line\n@5:MOCKLOG COUNTER=7' ]]
 }
 
 @test "render: a filtered window starts with its first line, every matching line follows in order" {
   # COUNTER=7 matches 7 and 70-79: eleven lines, fewer than the 28 body rows
   run render 80 'COUNTER=7'
   [ "$status" -eq 0 ]
-  local want=$'@4:11 match(es) for \'COUNTER=7\' (/ resets)\n@5:MOCKLOG COUNTER=7'
+  local want=$'@4:11 matching lines\n@5:MOCKLOG COUNTER=7'
   local i row=6
   for i in 70 71 72 73 74 75 76 77 78 79; do
     want+=$'\n'"@$row:MOCKLOG COUNTER=$i"
@@ -50,7 +50,7 @@ render() {
   # 60 matches, 28 body rows under the banner: COUNTER=32..59
   run render 60 'COUNTER='
   [ "$status" -eq 0 ]
-  local want=$'@4:60 match(es) for \'COUNTER=\' (/ resets)'
+  local want=$'@4:60 matching lines'
   local i row=5
   for ((i = 32; i <= 59; i++)); do
     want+=$'\n'"@$row:MOCKLOG COUNTER=$i"
@@ -62,7 +62,7 @@ render() {
 @test "render: no match shows only the banner" {
   run render 40 'COUNTER=77'
   [ "$status" -eq 0 ]
-  [[ "$output" == $'@4:0 match(es) for \'COUNTER=77\' (/ resets)' ]]
+  [[ "$output" == $'@4:No matching lines' ]]
 }
 
 @test "render: without a filter the full 29-row tail is drawn and no banner" {
@@ -88,7 +88,7 @@ render() {
     [[ "$i" == 1 || "$i" == 1[0-9] || "$i" == 1[0-9][0-9] ]] && hits+=("$i")
   done
   [ "${#hits[@]}" -eq 31 ]
-  local banner=$'@4:31 match(es) for \'COUNTER=1\' (/ resets)'
+  local banner=$'@4:31 matching lines'
   local want row k
 
   run render 120 'COUNTER=1' 2
@@ -135,7 +135,7 @@ render_after_pgup() {
   # top stops one line short and COUNTER=0 is never drawn.
   run render_after_pgup 60 'COUNTER=' 10
   [ "$status" -eq 0 ]
-  local want=$'@4:60 match(es) for \'COUNTER=\' (/ resets)' i row=5
+  local want=$'@4:60 matching lines' i row=5
   for ((i = 0; i < 28; i++)); do
     want+=$'\n'"@$row:MOCKLOG COUNTER=$i"
     row=$((row + 1))
@@ -152,7 +152,7 @@ render_after_pgup() {
   for ((i = 0; i < 120; i++)); do
     [[ "$i" == 1 || "$i" == 1[0-9] || "$i" == 1[0-9][0-9] ]] && hits+=("$i")
   done
-  local want=$'@4:31 match(es) for \'COUNTER=1\' (/ resets)' row=5
+  local want=$'@4:31 matching lines' row=5
   for ((k = 0; k < 28; k++)); do
     want+=$'\n'"@$row:MOCKLOG COUNTER=${hits[$k]}"
     row=$((row + 1))

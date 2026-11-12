@@ -85,7 +85,9 @@ if [[ -t 1 ]]; then
     TUI_FG_TITLE="\033[38;5;15m"
     TUI_FG_SUBTITLE="\033[38;5;245m"
     TUI_FG_ACCENT="\033[38;5;75m"
-    TUI_FG_MENU="\033[38;5;252m"
+    # entries and log lines keep the terminal's own foreground: legible on a
+    # dark and on a light background alike (a fixed 252 is ~1.5:1 on white)
+    TUI_FG_MENU=""
     TUI_FG_MENU_DIM="\033[38;5;245m"
     TUI_FG_SEPARATOR="\033[38;5;240m"
     TUI_FG_SHORTCUT="\033[38;5;75m"
@@ -98,15 +100,19 @@ if [[ -t 1 ]]; then
     TUI_BG_CONFIRM_NO="\033[48;5;124m"
     TUI_FG_LOG_ERROR="\033[38;5;203m"
     TUI_FG_LOG_WARN="\033[38;5;221m"
-    TUI_FG_LOG_INFO="\033[38;5;250m"
+    TUI_FG_LOG_INFO=""
   else
+    # 16 colours: no hue reads on both a dark and a light background (xterm
+    # blue on black 2.2:1, white on white 1.3:1), so text keeps the terminal's
+    # foreground and stands out by weight; the shortcut letter is bold and
+    # underlined (the access-key convention), not coloured.
     TUI_FG_TITLE="\033[1;37m"
-    TUI_FG_SUBTITLE="\033[37m"
-    TUI_FG_ACCENT="\033[1;34m"
-    TUI_FG_MENU="\033[37m"
-    TUI_FG_MENU_DIM="\033[2;37m"
-    TUI_FG_SEPARATOR="\033[2;37m"
-    TUI_FG_SHORTCUT="\033[1;34m"
+    TUI_FG_SUBTITLE=""
+    TUI_FG_ACCENT="\033[1m"
+    TUI_FG_MENU=""
+    TUI_FG_MENU_DIM="\033[2m"
+    TUI_FG_SEPARATOR="\033[2m"
+    TUI_FG_SHORTCUT="\033[4m"
     TUI_FG_STATUS="\033[37m"
     TUI_FG_SELECTED="\033[1;37m"
     TUI_BG_TITLEBAR="\033[40m"
@@ -116,7 +122,7 @@ if [[ -t 1 ]]; then
     TUI_BG_CONFIRM_NO="\033[41m"
     TUI_FG_LOG_ERROR="\033[31m"
     TUI_FG_LOG_WARN="\033[33m"
-    TUI_FG_LOG_INFO="\033[37m"
+    TUI_FG_LOG_INFO=""
   fi
   if [[ "$TUI_NO_COLOR" != "1" ]]; then
     TUI_SHORTCUT_KEY="${TUI_FG_SHORTCUT}${TUI_BOLD}"
@@ -137,7 +143,7 @@ BOX_BT="┴"
 BOX_CROSS="┼"
 
 # Glyph policy: the TUI draws only ASCII, box drawing (U+2500-257F), the
-# braille spinner and these width-1 glyphs: ▸ ● ○ ✓ ✗ ↑ ↓ ← ⏎ … ◉ (the trigram U+2630 is on the
+# braille spinner and these width-1 glyphs: ▸ ● ○ ✓ ✗ ↑ ↓ ← → ⏎ … (the trigram U+2630 is on the
 # design list but is East Asian Wide since Unicode 16, so it is not used).
 # Nothing in this file may be East Asian Wide or Fullwidth
 # (tests/haven-geometry.bats scans it). Menu entries carry no icon: the
@@ -217,6 +223,10 @@ MENU_KEYS=()
 MENU_TITLE=""
 MENU_SUBTITLE=""
 MENU_STATE=""
+MENU_ENGINE_NOTE=""
+_NOTE=""
+# blanks between a group name and the state drawn after it
+TUI_GROUP_GAP="  "
 TUI_DOCKER_OK=0
 TUI_LAST_DOCKER_CHECK=0
 TUI_LAST_LOG_RESTART=0
@@ -270,8 +280,8 @@ JSON_FILES=(
 )
 
 JSON_LABELS=(
-  "Relays Import"
-  "Relays Blastr"
+  "Import relays"
+  "Blastr relays"
   "Blacklisted npubs"
   "Whitelisted npubs"
 )
@@ -593,7 +603,17 @@ tui_draw_title_row() {
   local right_w=$((TUI_COLS - LEFT_W - 3))
   local style="${TUI_BG_TITLEBAR}${TUI_BOLD}${TUI_FG_TITLE}"
   local left right
-  tui_truncate "$TUI_LEFT_TITLE" $((left_w - 1))
+  # The left title is a path ("Haven / Access lists / Import relays"): when it
+  # is too wide, leading segments give way to "…" before a word is cut, so the
+  # view you are in stays readable.
+  local path="$TUI_LEFT_TITLE" rest="$TUI_LEFT_TITLE"
+  tui_str_width "$path"
+  while (( _WIDTH > left_w - 1 )) && [[ "$rest" == *" / "* ]]; do
+    rest="${rest#*" / "}"
+    path="… / $rest"
+    tui_str_width "$path"
+  done
+  tui_truncate "$path" $((left_w - 1))
   tui_pad_to "$_TRUNC" "$left_w"
   left="$_PADDED"
   tui_truncate "$TUI_RIGHT_TITLE" $((right_w - 1))
@@ -606,24 +626,60 @@ tui_draw_title_row() {
     "$_BORDER_V"
 }
 
+# tui_footer_hints — _HINTS: the key hints of the bottom row, one "key|what"
+# per line, for what the keys do right now: a dialog's own keys while one is
+# open (TUI_FOOTER=message|confirm|prompt), else those of the current view and
+# right-pane mode (Esc goes back only below the main view; / filters only the
+# log pane; Tab names the pane it switches to).
+TUI_FOOTER=""
+_HINTS=""
+_HINTS_DRAWN=""
+tui_footer_hints() {
+  case "$TUI_FOOTER" in
+    message) _HINTS="Any key|Continue" ;;
+    confirm) _HINTS=$'←→|Choose\n⏎|Confirm\nEsc|Cancel' ;;
+    prompt) _HINTS=$'⏎|Confirm\nEsc|Cancel' ;;
+    *)
+      local tab="Status"
+      if [[ "$TUI_RIGHT_MODE" == "status" ]]; then tab="Logs"; fi
+      _HINTS=$'↑↓|Move\n⏎|Open'
+      if [[ "$TUI_VIEW" != "main" ]]; then _HINTS+=$'\nEsc|Back'; fi
+      _HINTS+=$'\nTab|'"$tab"
+      if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then _HINTS+=$'\n/|Filter'; fi
+      if [[ "$TUI_RIGHT_MODE" == "logs" ]] && (( LOG_SCROLL > 0 )); then _HINTS+=$'\nPgDn|Resume'; fi
+      if [[ "$TUI_VIEW" == "main" ]]; then _HINTS+=$'\n?|Help\nq|Quit'; fi
+      ;;
+  esac
+  return 0
+}
+
 tui_draw_status_bar() {
   local status_row=$((TUI_LINES - 1))
+  tui_footer_hints
+  _HINTS_DRAWN="$_HINTS|$TUI_COLS"
   # Fill entire row with statusbar background first
   tput cup "$status_row" 0
   printf "%b%-*s%b" "${TUI_BG_STATUSBAR}" "$TUI_COLS" "" "$CLR_RESET"
-  # Overlay hints text
+  # Overlay hints text: key in the shortcut style, what it does in the status
+  # style. A hint that would not fit is left off with all after it (they are
+  # in order of need), so the row never reaches the last column.
   tput cup "$status_row" 1
-  printf "%b %b↑↓%b%b Navigate  %b⏎%b%b Select  %b←%b%b Back  %bq%b%b Quit %b" \
-    "${TUI_BG_STATUSBAR}" \
-    "${TUI_FG_SHORTCUT}${TUI_BOLD}" "${CLR_RESET}${TUI_BG_STATUSBAR}${TUI_FG_STATUS}" \
-    "" \
-    "${TUI_FG_SHORTCUT}${TUI_BOLD}" "${CLR_RESET}${TUI_BG_STATUSBAR}${TUI_FG_STATUS}" \
-    "" \
-    "${TUI_FG_SHORTCUT}${TUI_BOLD}" "${CLR_RESET}${TUI_BG_STATUSBAR}${TUI_FG_STATUS}" \
-    "" \
-    "${TUI_FG_SHORTCUT}${TUI_BOLD}" "${CLR_RESET}${TUI_BG_STATUSBAR}${TUI_FG_STATUS}" \
-    "" \
-    "$CLR_RESET"
+  local hint key what out="" used=1
+  while IFS= read -r hint; do
+    key="${hint%%|*}" what="${hint#*|}"
+    tui_str_width " $key $what "
+    (( used + _WIDTH < TUI_COLS )) || break
+    used=$((used + _WIDTH))
+    out+=" ${TUI_FG_SHORTCUT}${TUI_BOLD}${key}${CLR_RESET}${TUI_BG_STATUSBAR}${TUI_FG_STATUS} ${what} "
+  done <<<"$_HINTS"
+  printf "%b%b%b" "${TUI_BG_STATUSBAR}" "$out" "$CLR_RESET"
+}
+
+# tui_refresh_status_bar — redraw the bottom row only when its hints changed
+# (view, right-pane mode, dialog, width); called after each pane render.
+tui_refresh_status_bar() {
+  tui_footer_hints
+  [[ "$_HINTS|$TUI_COLS" == "$_HINTS_DRAWN" ]] || tui_draw_status_bar
 }
 
 # Display width of a string: printable-ASCII fast path, otherwise count
@@ -791,11 +847,13 @@ tui_prompt() {
 
   # All display output goes to /dev/tty so it reaches the terminal
   # even when this function runs inside $() subshell capture
+  # The error row is the bottom border: it keeps its line until there is an
+  # error to show. The bottom row names the prompt's keys while it is open.
   {
     tput cup "$prompt_row" "$LEFT_X"
     printf "%-*s" "$LEFT_CONTENT_W" ""
-    tput cup "$err_row" "$LEFT_X"
-    printf "%-*s" "$LEFT_CONTENT_W" ""
+    TUI_FOOTER="prompt"
+    tui_draw_status_bar
     tput cup "$prompt_row" "$LEFT_X"
     printf "%b%s%b " "${TUI_FG_ACCENT}" "$prompt" "$CLR_RESET"
     tput cnorm
@@ -816,6 +874,14 @@ tui_prompt() {
         err_row=$((TUI_LINES - 2))
         max_input=$((LEFT_CONTENT_W - prompt_len - 2))
         (( max_input < 10 )) && max_input=10
+        # the whole screen follows the new size, not only the prompt row:
+        # frame, both panes, then the prompt on top (below)
+        if [[ "$TUI_TOO_SMALL" != "1" ]]; then
+          tui_draw_frame 1
+          tui_render_right_panel
+          TUI_NEED_MENU=1
+          tui_render_left_menu
+        fi
       fi
       tput cup "$prompt_row" "$LEFT_X"
       printf "%-*s" "$LEFT_CONTENT_W" ""
@@ -957,6 +1023,8 @@ tui_prompt() {
     printf "%-*s" "$LEFT_CONTENT_W" ""
     tput cup "$err_row" "$LEFT_X"
     printf "%b%s%b" "$TUI_FG_SEPARATOR" "$_HLINE_SEP" "$CLR_RESET"
+    TUI_FOOTER=""
+    tui_draw_status_bar
     tput civis
   } >/dev/tty
   printf "%s" "$input"
@@ -976,11 +1044,18 @@ tui_confirm() {
 
   # Fresh geometry — dialogs may open after the frame was last laid out.
   tui_update_layout
-  local row=$((LEFT_CONTENT_ROW + 2))
 
+  TUI_FOOTER="confirm"
   tui_draw_frame 1
   tui_render_right_panel
-  tui_print_left_styled "$LEFT_CONTENT_ROW" "${TUI_BOLD}${TUI_FG_ACCENT}" "$prompt"
+  # The question wraps at word boundaries ("\n" in it starts a new line); the
+  # buttons sit one blank row below its last line.
+  local qline qrows=0
+  while IFS= read -r qline; do
+    tui_print_left_styled $((LEFT_CONTENT_ROW + qrows)) "${TUI_BOLD}${TUI_FG_ACCENT}" "$qline"
+    qrows=$((qrows + 1))
+  done < <(printf '%s\n' "${prompt//\\n/$'\n'}" | fold -s -w "$LEFT_CONTENT_W")
+  local row=$((LEFT_CONTENT_ROW + qrows + 1))
 
   # May run inside a $() subshell with reset traps — re-arm SIGWINCH locally.
   trap 'TUI_NEED_RESIZE=1' SIGWINCH
@@ -989,7 +1064,7 @@ tui_confirm() {
     if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
       TUI_NEED_RESIZE=0
       tui_update_layout
-      row=$((LEFT_CONTENT_ROW + 2))
+      row=$((LEFT_CONTENT_ROW + qrows + 1))
     fi
     tput cup "$row" "$LEFT_X"
     printf "%-*s" "$LEFT_CONTENT_W" ""
@@ -1009,12 +1084,13 @@ tui_confirm() {
       left|up) selection=0 ;;
       right|down) selection=1 ;;
       enter)
+        TUI_FOOTER=""
         if [[ "$selection" -eq 0 ]]; then
           return 0
         fi
         return 1
         ;;
-      esc) return 1 ;;
+      esc) TUI_FOOTER=""; return 1 ;;
     esac
   done
 }
@@ -1023,10 +1099,14 @@ tui_message() {
   local title="$1"
   local text="$2"
   local row="$LEFT_CONTENT_ROW"
+  # callers write line breaks as "\n" inside double quotes, which bash keeps as
+  # backslash + n: turn them into real ones, or they show up as text
+  text="${text//\\n/$'\n'}"
 
   # Fresh geometry — messages may open after the frame was last laid out.
   tui_update_layout
 
+  TUI_FOOTER="message"
   tui_draw_frame 1
   tui_render_right_panel
 
@@ -1048,9 +1128,9 @@ tui_message() {
     row=$((row + 1))
   done < <(printf "%s\n" "$text" | fold -s -w "$LEFT_CONTENT_W")
 
-  # Dim footer
-  tui_print_left_styled $((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT - 1)) "$TUI_DIM" "Press any key to continue."
+  # "Any key: continue" is the bottom row's hint (TUI_FOOTER=message)
   tui_wait_key
+  TUI_FOOTER=""
 }
 
 info() {
@@ -4859,7 +4939,9 @@ tui_ensure_log_stream() {
 }
 
 tui_render_right_panel() {
-  # Mode switch: logs (default) or the status view. Tab toggles.
+  # Mode switch: logs (default) or the status view. Tab toggles (and with it
+  # the Tab and / hints of the bottom row).
+  tui_refresh_status_bar
   if [[ "$TUI_RIGHT_MODE" == "status" ]]; then
     tui_render_right_status
     return
@@ -4868,12 +4950,8 @@ tui_render_right_panel() {
 }
 
 tui_render_right_status() {
-  local spinner=""
-  if [[ "$FOLLOW_LOGS" == "1" && -n "$LOG_PID" ]]; then
-    local frame_idx=$((_SPINNER_TICK % ${#SPINNER_FRAMES[@]}))
-    spinner=" ${SPINNER_FRAMES[$frame_idx]}"
-  fi
-  TUI_RIGHT_TITLE="◉ Status${spinner}"
+  # plain like the log title; the log stream's spinner belongs to the log view
+  TUI_RIGHT_TITLE="Status"
   tui_draw_title_row
 
   # Docker queries are throttled and cached (like tui_update_docker_status):
@@ -4902,7 +4980,7 @@ tui_render_right_status() {
 tui_collect_status() {
   TUI_STATUS_CACHE=()
   if ! docker info >/dev/null 2>&1; then
-    TUI_STATUS_CACHE=("Docker: offline" "" "Tab switches back to the log view.")
+    TUI_STATUS_CACHE=("Docker is offline.")
     return
   fi
 
@@ -4950,10 +5028,10 @@ tui_render_right_logs() {
   fi
   TUI_RIGHT_TITLE="Logs: ${LOG_SERVICE:-all}${spinner} │ Tail: ${TAIL_COUNT}"
   if [[ -n "$LOG_FILTER" ]]; then
-    TUI_RIGHT_TITLE="Logs${spinner} │ filter '$LOG_FILTER'"
+    TUI_RIGHT_TITLE="Logs: ${LOG_SERVICE:-all}${spinner} │ Filter: $LOG_FILTER"
   fi
   if (( LOG_SCROLL > 0 )); then
-    TUI_RIGHT_TITLE="${TUI_RIGHT_TITLE} │ paused (PgDn: resume)"
+    TUI_RIGHT_TITLE="${TUI_RIGHT_TITLE} │ Paused"   # the bottom row names PgDn
   fi
   tui_draw_title_row
 
@@ -4972,7 +5050,11 @@ tui_render_right_logs() {
   # Filter hit count goes on the first content row so it stays visible
   local hitline=""
   if [[ -n "$LOG_FILTER" ]]; then
-    hitline="${_VIEW_MATCHES} match(es) for '$LOG_FILTER' (/ resets)"
+    case "$_VIEW_MATCHES" in
+      0) hitline="No matching lines" ;;
+      1) hitline="1 matching line" ;;
+      *) hitline="${_VIEW_MATCHES} matching lines" ;;
+    esac
   fi
 
   local row idx line line_color
@@ -4996,6 +5078,7 @@ tui_render_right_logs() {
       fi
     elif [[ "$total" -eq 0 && "$row" -eq 0 ]]; then
       line="Waiting for logs..."
+      [[ "$TUI_DOCKER_OK" == "1" ]] || line="Docker is offline: no logs."
       line_color="${TUI_DIM}${TUI_ITALIC}"
     fi
     tui_truncate "$line" "$RIGHT_CONTENT_W"
@@ -5037,28 +5120,22 @@ print_header() {
 
 show_help_screen() {
   local text
+  # A key table that fits the left pane at the minimum size (25 cells x 13
+  # rows at 66x20): each entry's letter is on the menu itself.
   text=$(cat <<'HELP'
-Quick help
+↑↓ j k    Move
+Enter     Open
+Letter    Open its entry
+1-9       Go to nth entry
+g G       First, last
+Esc ←     Back, or quit
+q         Quit
+Tab       Logs or status
+PgUp PgDn Scroll logs
+/         Filter logs
 
-Keys: arrows or j/k move, g/G or Home/End jump, 1-9 pick the nth entry,
-Enter opens it; the letter in front of a main menu entry opens it directly.
-Esc or Left goes back, q quits from the main view. Tab switches the right
-panel between logs and status; PgUp/PgDn scroll the logs, / filters them.
-
-- Start (s) / Start with Tor (t): prepares missing *.json files, then starts
-  Docker; Tor uses docker-compose.tor.yml and shows the onion address.
-- Back up (b), Restore (e), Switch engine (d): run ./haven backup,
-  ./haven restore <file>, ./haven db-switch <badger|lmdb> in a terminal.
-- Settings (c): edit .env values; saving restarts running containers.
-- Access lists (l): edit the relay and npub lists in the JSON files.
-
-JSON files
-- relays_import.json: list of relays to import from
-- relays_blastr.json: list of relays for blastr
-- blacklisted_npubs.json: npubs to block
-- whitelisted_npubs.json: npubs allowed (if whitelist mode)
-
-Tip: If a .example.json exists, the start flow will offer to copy it.
+Saving a setting restarts
+a running relay.
 HELP
 )
 
@@ -5130,10 +5207,15 @@ tui_state_engine() {
   esac
 }
 
-# tui_state_line — MENU_STATE for the main view: relay state, mode, engine,
-# each a word ("● Running  Tor  badger"). When the line is wider than the left
-# pane, whole fields are dropped from the right; a word is never cut.
+# tui_state_line — the state of the main view, written into the group names it
+# belongs to: MENU_STATE is the relay's ("● Running  Tor", shown after "Relay"),
+# MENU_ENGINE_NOTE the data's ("engine: badger", shown after "Data"). When the
+# relay state does not fit behind its group name, whole fields are dropped from
+# the right; a word is never cut.
 tui_state_line() {
+  tui_state_engine
+  MENU_ENGINE_NOTE="engine: $_ENGINE_WORD"
+  local budget=$((LEFT_CONTENT_W - ${#TUI_GROUP_GAP} - 5))   # 5 = width of "Relay"
   local -a fields=()
   if [[ "$TUI_DOCKER_OK" -ne 1 ]]; then
     fields+=("○ Docker offline")
@@ -5149,8 +5231,6 @@ tui_state_line() {
       fields+=("Plain")
     fi
   fi
-  tui_state_engine
-  fields+=("$_ENGINE_WORD")
 
   local n=${#fields[@]} i line
   while (( n > 1 )); do
@@ -5159,13 +5239,23 @@ tui_state_line() {
       line+="  ${fields[$i]}"
     done
     tui_str_width "$line"
-    (( _WIDTH <= LEFT_CONTENT_W )) && break
+    (( _WIDTH <= budget )) && break
     n=$((n - 1))
   done
   if (( n == 1 )); then
     line="${fields[0]}"
   fi
   MENU_STATE="$line"
+}
+
+# tui_group_note <menu id> — _NOTE: the state drawn after a group name in the
+# main view (relay state after "Relay", engine after "Data"), else empty.
+tui_group_note() {
+  case "$1" in
+    group:relay) _NOTE="$MENU_STATE" ;;
+    group:data) _NOTE="$MENU_ENGINE_NOTE" ;;
+    *) _NOTE="" ;;
+  esac
 }
 
 # tui_menu_selectable <index> — true for an entry the selection may rest on
@@ -5226,29 +5316,32 @@ tui_build_menu() {
     main)
       TUI_LEFT_TITLE="Haven"
       tui_state_line
+      # The state lives in the group names (tui_group_note); the blank row
+      # (group:gap, never selected) sets Help / About / Quit apart from
+      # Configure. 19 rows: all of it fits the 19 content rows at 80x24.
       MENU_IDS=(group:relay start_plain start_tor stop restart
         group:data backup restore db_switch import
         group:configure env json env_upgrade onion
-        help about quit)
+        group:gap help about quit)
       MENU_LABELS=("Relay" "Start" "Start with Tor" "Stop" "Restart"
-        "Data" "Back up now" "Restore a backup" "Switch database engine" "Import notes"
-        "Configure" "Settings (.env)" "Access lists (JSON)" "Update settings from template" "Onion address"
-        "Help" "About" "Quit")
+        "Data" "Back up now" "Restore a backup" "Switch engine" "Import notes"
+        "Configure" "Settings (.env)" "Access lists (JSON)" "Add missing settings" "Onion address"
+        "" "Help" "About" "Quit")
       MENU_KEYS=("" s t x r
         "" b e d i
         "" c l u o
-        "?" a q)
+        "" "?" a q)
       ;;
     logs)
       TUI_LEFT_TITLE="Haven / Logs"
-      MENU_TITLE="Logs Settings"
+      MENU_TITLE="Log settings"
       MENU_SUBTITLE="Service: ${LOG_SERVICE:-all} │ Tail: ${TAIL_COUNT} │ Follow: $([[ "$FOLLOW_LOGS" == "1" ]] && echo on || echo off)"
       MENU_IDS=(service tail follow back)
       MENU_LABELS=("Select service" "Tail lines" "Toggle follow" "Back")
       ;;
     logs_service)
       TUI_LEFT_TITLE="Haven / Logs / Service"
-      MENU_TITLE="Log Services"
+      MENU_TITLE="Log services"
       MENU_SUBTITLE="Choose which service to stream."
       MENU_IDS=(all)
       MENU_LABELS=("All services")
@@ -5268,9 +5361,9 @@ tui_build_menu() {
     env_list)
       TUI_LEFT_TITLE="Haven / Settings"
       MENU_TITLE="Settings (.env)"
-      MENU_SUBTITLE="Select a variable"
+      MENU_SUBTITLE="Select a setting"
       MENU_IDS=(add)
-      MENU_LABELS=("Add variable")
+      MENU_LABELS=("Add setting")
       local key
       local value
       while IFS= read -r key; do
@@ -5289,10 +5382,10 @@ tui_build_menu() {
       ;;
     env_item)
       TUI_LEFT_TITLE="Haven / Settings / $CURRENT_ENV_KEY"
-      MENU_TITLE=".env: $CURRENT_ENV_KEY"
-      MENU_SUBTITLE="Edit or remove this variable."
+      MENU_TITLE="$CURRENT_ENV_KEY"
+      MENU_SUBTITLE="Edit, reveal or remove."
       MENU_IDS=(edit reveal remove back)
-      MENU_LABELS=("Edit value" "Reveal value" "Remove variable" "Back")
+      MENU_LABELS=("Edit value" "Reveal value" "Remove setting" "Back")
       ;;
     json_files)
       TUI_LEFT_TITLE="Haven / Access lists"
@@ -5304,14 +5397,14 @@ tui_build_menu() {
         file="${JSON_FILES[$i]}"
         label="${JSON_LABELS[$i]}"
         MENU_IDS+=("$file")
-        MENU_LABELS+=("$label ($file)")
+        MENU_LABELS+=("$label")
       done
       MENU_IDS+=(back)
       MENU_LABELS+=("Back")
       ;;
     json_items)
       TUI_LEFT_TITLE="Haven / Access lists / $(json_label_for "$CURRENT_JSON_FILE")"
-      MENU_TITLE="JSON: $CURRENT_JSON_FILE"
+      MENU_TITLE="$CURRENT_JSON_FILE"
       MENU_SUBTITLE="Edit list items"
       MENU_IDS=(add clear)
       MENU_LABELS=("Add item" "Clear list")
@@ -5319,7 +5412,7 @@ tui_build_menu() {
       local output=""
       if ! output="$(json_list_items "$path" 2>/dev/null)"; then
         MENU_IDS=(back)
-        MENU_LABELS=("Invalid JSON (back)")
+        MENU_LABELS=("Not valid JSON: back")
       else
         local idx=0
         local item
@@ -5349,16 +5442,10 @@ tui_render_left_menu() {
     TUI_NEED_MENU=0
   fi
 
-  # Row 1 names the current view (the path); it changes with the view.
+  # Row 1 names the current view (the path); it changes with the view, and
+  # so do the key hints of the bottom row.
   tui_draw_title_row
-
-  # State line (main view): bold, the state is a word
-  if [[ -n "$MENU_STATE" ]]; then
-    tui_truncate "$MENU_STATE" "$LEFT_CONTENT_W"
-    tui_print_left_styled "$row" "$TUI_BOLD" "$_TRUNC"
-    row=$((row + 1))
-    visible_rows=$((visible_rows - 1))
-  fi
+  tui_refresh_status_bar
 
   # Bold accent title
   if [[ -n "$MENU_TITLE" ]]; then
@@ -5431,9 +5518,18 @@ tui_render_left_menu() {
     if [[ -z "$label" ]]; then
       printf "%-*s" "$LEFT_CONTENT_W" ""
     elif [[ "$menu_id" == group:* ]]; then
-      # group name: dim, in the marker column, never selected
-      tui_pad_to "$_TRUNC" "$LEFT_CONTENT_W"
-      printf "%b%s%b" "$TUI_FG_MENU_DIM" "$_PADDED" "$CLR_RESET"
+      # group name: dim, in the marker column, never selected; the state it
+      # carries (tui_group_note) follows in bold — the state is a word
+      tui_group_note "$menu_id"
+      if [[ -n "$_NOTE" ]]; then
+        tui_str_width "${label}${TUI_GROUP_GAP}"
+        tui_pad_to "$_NOTE" $((LEFT_CONTENT_W - _WIDTH))
+        printf "%b%s%b%s%b%s%b" "$TUI_FG_MENU_DIM" "$label" "$CLR_RESET" \
+          "$TUI_GROUP_GAP" "$TUI_BOLD" "$_PADDED" "$CLR_RESET"
+      else
+        tui_pad_to "$_TRUNC" "$LEFT_CONTENT_W"
+        printf "%b%s%b" "$TUI_FG_MENU_DIM" "$_PADDED" "$CLR_RESET"
+      fi
     elif [[ "$idx" -eq "$TUI_SEL" ]]; then
       tui_menu_icon selected
       if [[ -n "$key" ]]; then
@@ -5524,7 +5620,7 @@ tui_about() {
   tui_message "About" "haven-docker CLI version: $version
 Relay image digest: $digest
 Upstream: Haven, a High Availability Vault for Events on Nostr.
-Backups: every .env/JSON edit writes a timestamped .bak.<ts> next to the file (10 most recent are kept)."
+Settings history: every edit of .env or a list keeps the previous file as <name>.bak.<time> (the 10 most recent)."
 }
 
 tui_handle_enter() {
@@ -5534,30 +5630,30 @@ tui_handle_enter() {
     main)
       case "$id" in
         start_plain)
-          tui_require_docker || return
-          if tui_confirm "Start services (Docker)?" "y"; then
+          tui_require_docker || return 0
+          if tui_confirm "Start the relay?" "y"; then
             tui_run_action "Start" start_services "plain"
           fi
           ;;
         start_tor)
-          tui_require_docker || return
-          if tui_confirm "Start services (Tor)?" "y"; then
+          tui_require_docker || return 0
+          if tui_confirm "Start the relay with Tor?" "y"; then
             tui_run_action "Start" start_services "tor"
           fi
           ;;
         stop)
-          tui_require_docker || return
+          tui_require_docker || return 0
           local mode_stop
           mode_stop="$(resolve_mode "stop")"
-          if tui_confirm "Stop services ($mode_stop)?" "y"; then
+          if tui_confirm "Stop the relay (${mode_stop^})?" "y"; then
             tui_run_action "Stop" stop_services "$mode_stop"
           fi
           ;;
         restart)
-          tui_require_docker || return
+          tui_require_docker || return 0
           local mode_restart
           mode_restart="$(resolve_mode "restart")"
-          if tui_confirm "Restart services ($mode_restart)?" "y"; then
+          if tui_confirm "Restart the relay (${mode_restart^})?" "y"; then
             tui_run_action "Restart" restart_services "$mode_restart"
           fi
           ;;
@@ -5565,7 +5661,7 @@ tui_handle_enter() {
           tui_set_view "logs"
           ;;
         status)
-          tui_require_docker || return
+          tui_require_docker || return 0
           local mode_status
           local compose_file
           mode_status="$(resolve_mode "status")"
@@ -5575,14 +5671,14 @@ tui_handle_enter() {
           ;;
         env)
           if ! ensure_env_file; then
-            tui_message ".env" ".env missing."
+            tui_message "Settings" ".env is missing and could not be created."
             return
           fi
           tui_set_view "env_list"
           ;;
         json)
           if ! detect_json_tool; then
-            tui_message "JSON Editor" "jq or python3 is required for JSON editing."
+            tui_message "Access lists" "Editing the lists needs jq or python3."
             return
           fi
           tui_set_view "json_files"
@@ -5594,7 +5690,7 @@ tui_handle_enter() {
           if [[ -f "$onion_host_file" ]]; then
             onion_text="$(cat "$onion_host_file")"
           else
-            onion_text="Hostname not found. Tor may still be initializing."
+            onion_text="No onion address yet. Start the relay with Tor; the address appears once Tor is up."
           fi
           if [[ -f "$onion_torrc" ]]; then
             onion_text="$onion_text
@@ -5602,11 +5698,11 @@ tui_handle_enter() {
 torrc:
 $(cat "$onion_torrc")"
           fi
-          tui_message "Onion Host" "$onion_text"
+          tui_message "Onion address" "$onion_text"
           ;;
         import)
-          tui_require_docker || return
-          if tui_confirm "Import notes now? The relay stops for it." "y"; then
+          tui_require_docker || return 0
+          if tui_confirm "Import notes now? The relay stops while it runs." "y"; then
             # The import streams for minutes; suspend the TUI so it is visible.
             tui_cleanup
             printf "\n"
@@ -5627,17 +5723,17 @@ $(cat "$onion_torrc")"
           tui_message "Restore a backup" "To restore a backup, run ./$SCRIPT_NAME restore <file> in a terminal."
           ;;
         db_switch)
-          tui_message "Switch database engine" "To move the data to the other engine, run ./$SCRIPT_NAME db-switch <badger|lmdb> in a terminal."
+          tui_message "Switch engine" "To move the data to the other engine, run ./$SCRIPT_NAME db-switch <badger|lmdb> in a terminal."
           ;;
         env_upgrade)
           if [[ ! -f "$ROOT_DIR/.env.example" ]]; then
-            tui_message "Upgrade .env" ".env.example not found."
+            tui_message "Add missing settings" ".env.example not found."
             return
           fi
           if [[ ! -f "$ROOT_DIR/.env" ]]; then
-            if tui_confirm "No .env found. Create from .env.example?" "y"; then
+            if tui_confirm "No .env yet. Create it from .env.example?" "y"; then
               cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
-              tui_message "Upgrade .env" ".env created from .env.example.\n\nPlease edit your .env and then\nrestart services."
+              tui_message "Add missing settings" ".env created from .env.example. Edit your settings, then restart the relay."
             fi
             return
           fi
@@ -5649,7 +5745,7 @@ $(cat "$onion_torrc")"
             upgrade_count="${upgrade_count// /}"
           fi
           if [[ "$upgrade_count" -eq 0 ]]; then
-            tui_message "Upgrade .env" "No missing variables found.\nYour .env is up to date."
+            tui_message "Add missing settings" "Nothing to add: .env has every setting of .env.example."
             return
           fi
           local upgrade_preview=""
@@ -5657,12 +5753,16 @@ $(cat "$onion_torrc")"
           if [[ "$upgrade_count" -gt 10 ]]; then
             upgrade_preview="$upgrade_preview\n... and $((upgrade_count - 10)) more"
           fi
-          tui_message "Missing Variables" "$upgrade_count variable(s) found:\n\n$upgrade_preview"
-          if tui_confirm "Add to .env?" "y"; then
+          local upgrade_what="$upgrade_count settings are"
+          [[ "$upgrade_count" -eq 1 ]] && upgrade_what="1 setting is"
+          tui_message "Add missing settings" "$upgrade_what missing from .env:\n\n$upgrade_preview"
+          if tui_confirm "Add them to .env?" "y"; then
             upgrade_env_file
             local upgrade_note=""
             [[ -z "$UPGRADE_ENV_NOTE" ]] || upgrade_note="\n\n$UPGRADE_ENV_NOTE"
-            tui_message "Upgrade .env" "$upgrade_count variable(s) added.\n\nPlease review and edit your\n.env file, then restart\nservices.$upgrade_note"
+            local upgrade_done="$upgrade_count settings added."
+            [[ "$upgrade_count" -eq 1 ]] && upgrade_done="1 setting added."
+            tui_message "Add missing settings" "$upgrade_done Review them in Settings, then restart the relay.$upgrade_note"
           fi
           ;;
         help)
@@ -5683,7 +5783,7 @@ $(cat "$onion_torrc")"
           ;;
         tail)
           local new_tail
-          new_tail="$(tui_prompt "Tail lines: " "$TAIL_COUNT")"
+          new_tail="$(tui_prompt "Tail lines:" "$TAIL_COUNT")"
           if [[ "$new_tail" =~ ^[0-9]+$ ]]; then
             TAIL_COUNT="$new_tail"
             if [[ "$FOLLOW_LOGS" == "1" ]]; then
@@ -5693,7 +5793,7 @@ $(cat "$onion_torrc")"
             fi
             TUI_NEED_RIGHT=1
           else
-            tui_message "Logs" "Tail must be a number."
+            tui_message "Logs" "Tail lines must be a number."
           fi
           ;;
         follow)
@@ -5731,12 +5831,12 @@ $(cat "$onion_torrc")"
         add)
           local new_key
           local new_value
-          new_key="$(tui_prompt "New key: " "" _validate_prompt_new_key)"
+          new_key="$(tui_prompt "New key:" "" _validate_prompt_new_key)"
           if [[ -z "$new_key" ]]; then
             return
           fi
           PROMPT_ENV_KEY="$new_key"
-          new_value="$(tui_prompt "New value: " "" _validate_prompt_env_value)"
+          new_value="$(tui_prompt "New value:" "" _validate_prompt_env_value)"
           if [[ -z "$new_value" ]]; then
             return
           fi
@@ -5762,9 +5862,11 @@ $(cat "$onion_torrc")"
           local new_value=""
           current="$(read_env_var "$CURRENT_ENV_KEY" 2>/dev/null || true)"
           PROMPT_ENV_KEY="$CURRENT_ENV_KEY"
-          new_value="$(tui_prompt "New value (blank to keep): " "$current" _validate_prompt_env_value)"
-          if [[ -z "$new_value" ]]; then
-            return
+          new_value="$(tui_prompt "New value:" "$current" _validate_prompt_env_value)"
+          # Esc, Ctrl-C and an empty Enter hand back the current value: nothing
+          # changed, so nothing is written and the relay is not restarted
+          if [[ -z "$new_value" || "$new_value" == "$current" ]]; then
+            return 0
           fi
           tui_engine_unknown_note "$CURRENT_ENV_KEY"
           set_env_var "$CURRENT_ENV_KEY" "$new_value"
@@ -5803,7 +5905,7 @@ $(cat "$onion_torrc")"
       else
         CURRENT_JSON_FILE="$id"
         if ! ensure_json_array_file "$CURRENT_JSON_FILE"; then
-          tui_message "JSON Editor" "File missing or invalid."
+          tui_message "Access lists" "$CURRENT_JSON_FILE is missing or not valid JSON."
           return
         fi
         tui_set_view "json_items"
@@ -5813,13 +5915,11 @@ $(cat "$onion_torrc")"
       case "$id" in
         add)
           local new_item
-          new_item="$(tui_prompt "Add item: " "")"
-          if [[ -z "$new_item" ]]; then
-            tui_message "JSON Editor" "Item is empty."
-            return
-          fi
+          new_item="$(tui_prompt "Add item:" "")"
+          # empty: cancelled (Esc) or nothing typed — nothing to add, nothing to say
+          [[ -n "$new_item" ]] || return 0
           if ! validate_json_item "$CURRENT_JSON_FILE" "$new_item"; then
-            tui_message "JSON Editor" "$VALIDATION_ERROR"
+            tui_message "Access lists" "$VALIDATION_ERROR"
             return
           fi
           local item_to_add="$VALIDATION_VALUE"
@@ -5834,13 +5934,13 @@ $(cat "$onion_torrc")"
             fi
           done <<<"$RUN_OUTPUT"
           if [[ "$duplicate" == "1" ]]; then
-            tui_message "JSON Editor" "Item already exists."
+            tui_message "Access lists" "Already on the list."
             return
           fi
           json_add_item "$path" "$item_to_add"
           ;;
         clear)
-          if tui_confirm "Clear entire list?" "n"; then
+          if tui_confirm "Remove every item from the list?" "n"; then
             json_clear "$ROOT_DIR/$CURRENT_JSON_FILE"
           fi
           ;;
@@ -5934,7 +6034,7 @@ tui_handle_key() {
       # an empty Enter must clear the filter instead of re-applying it.
       if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then
         local new_filter
-        new_filter="$(tui_prompt "Filter (empty clears): " "")"
+        new_filter="$(tui_prompt "Filter logs:" "")"
         LOG_FILTER="$new_filter"
         LOG_SCROLL=0
         TUI_NEED_RIGHT=1

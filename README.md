@@ -269,16 +269,19 @@ The interactive TUI (`./haven` without arguments) understands:
 | `g` / `G`, `Home` / `End` | Jump to the first / last menu entry |
 | `1`–`9` | Select the nth menu entry directly (Enter opens it) |
 | `Enter` | Open the selected entry |
-| Letter in front of an entry | Open that main menu entry directly: `s` Start, `t` Start with Tor, `x` Stop, `r` Restart, `b` Back up now, `e` Restore a backup, `d` Switch database engine, `i` Import notes, `c` Settings (.env), `l` Access lists (JSON), `u` Update settings from template, `o` Onion address, `?` Help, `a` About, `q` Quit |
-| `←` / `Esc` | Go back one view |
+| Letter in front of an entry | Open that main menu entry directly: `s` Start, `t` Start with Tor, `x` Stop, `r` Restart, `b` Back up now, `e` Restore a backup, `d` Switch engine, `i` Import notes, `c` Settings (.env), `l` Access lists (JSON), `u` Add missing settings, `o` Onion address, `?` Help, `a` About, `q` Quit |
+| `←` / `Esc` | Go back one view; from the main view, quit |
 | `q` | Back one view; from the main view, quit |
 | `Tab` | Switch the right panel between the log view and the status view |
-| `PgUp` / `PgDn` | Scroll the log panel backwards / forwards; a `paused` banner marks the scroll position and new lines keep buffering |
-| `/` | Live filter for the log panel (case-insensitive substring) — the match count shows on the first panel row, an empty Enter clears the filter |
+| `PgUp` / `PgDn` | Scroll the log panel backwards / forwards; `Paused` in the panel title marks the scroll position and new lines keep buffering |
+| `/` | Live filter for the log panel (case-insensitive substring) — the number of matching lines shows on the first panel row, an empty Enter clears the filter |
+| Bottom row | Names the keys that work in the current view or dialog |
 
 The TUI honours [`NO_COLOR`](https://no-color.org): with `NO_COLOR` set to any
 value, or `TERM=dumb`, it draws without colours; the selection keeps its `▸`
-marker in reverse video and shortcut letters are underlined.
+marker in reverse video and shortcut letters are underlined. In a 16-colour
+terminal text keeps the terminal's own colour and shortcut letters are bold and
+underlined, so a light background reads as well as a dark one.
 
 Inside an input prompt:
 
