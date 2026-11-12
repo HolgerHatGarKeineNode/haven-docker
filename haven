@@ -220,6 +220,13 @@ MENU_LABELS=()
 # Shortcut letter per entry (main view; "" = none). Ids "group:<name>" are
 # group names: drawn, never selectable.
 MENU_KEYS=()
+# Settings list: the value drawn right-aligned and dim after a key row's label
+# ("" = none), and the cells the fitted label may take.
+MENU_VALUES=()
+MENU_LABEL_W=()
+SETTINGS_SHOWN=0
+# The right pane's mode before the settings editor switched it to details.
+TUI_RIGHT_PREV="logs"
 MENU_TITLE=""
 MENU_SUBTITLE=""
 MENU_STATE=""
@@ -482,7 +489,8 @@ tui_read_key() {
   # 150 ms poll: keys register within one tick (< 300 ms e2e-measured),
   # and the idle loop burns ~3x less CPU than the old 50 ms polling.
   if ! IFS= read -rsn1 -t 0.15 _KEY; then
-    return 1
+    # a timeout that fired right after a byte arrived still hands it over
+    [[ -n "$_KEY" ]] || return 1
   fi
 
   if [[ "$_KEY" == $'\x03' ]]; then
@@ -637,15 +645,26 @@ _HINTS_DRAWN=""
 tui_footer_hints() {
   case "$TUI_FOOTER" in
     message) _HINTS="Any key|Continue" ;;
+    message-scroll) _HINTS=$'↑↓|Scroll\nOther key|Continue' ;;
     confirm) _HINTS=$'←→|Choose\n⏎|Confirm\nEsc|Cancel' ;;
     prompt) _HINTS=$'⏎|Confirm\nEsc|Cancel' ;;
+    task) _HINTS=$'Ctrl-C|Stop it (the relay is started again)' ;;
     *)
-      local tab="Status"
+      local tab="Status" settings=0
+      tui_view_has_details && settings=1
       if [[ "$TUI_RIGHT_MODE" == "status" ]]; then tab="Logs"; fi
+      if (( settings )); then
+        tab="Logs"
+        [[ "$TUI_RIGHT_MODE" == "logs" ]] && tab="Details"
+      fi
       _HINTS=$'↑↓|Move\n⏎|Open'
-      if [[ "$TUI_VIEW" != "main" ]]; then _HINTS+=$'\nEsc|Back'; fi
+      if [[ "$TUI_VIEW" == env_list && -n "$SETTINGS_FILTER" ]]; then
+        _HINTS+=$'\nEsc|Clear filter'
+      elif [[ "$TUI_VIEW" != "main" ]]; then
+        _HINTS+=$'\nEsc|Back'
+      fi
       _HINTS+=$'\nTab|'"$tab"
-      if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then _HINTS+=$'\n/|Filter'; fi
+      if [[ "$TUI_VIEW" == env_list ]] || { [[ "$TUI_RIGHT_MODE" == "logs" ]] && ! tui_view_has_details; }; then _HINTS+=$'\n/|Filter'; fi
       if [[ "$TUI_RIGHT_MODE" == "logs" ]] && (( LOG_SCROLL > 0 )); then _HINTS+=$'\nPgDn|Resume'; fi
       if [[ "$TUI_VIEW" == "main" ]]; then _HINTS+=$'\n?|Help\nq|Quit'; fi
       ;;
@@ -825,22 +844,223 @@ _validate_prompt_env_value() {
   return 0
 }
 
+# --- prompt input -------------------------------------------------------------
+# The text of an open prompt can be longer than its field: the field shows a
+# window onto it that follows the cursor, with "…" in the first or last cell
+# where text is hidden. The editing state is global so the key handling
+# (tui_prompt_edit) and the window (tui_prompt_window) can be driven without a
+# terminal; tui_prompt itself reads /dev/tty.
+PROMPT_MAX=4096          # characters a prompt accepts (an npub is 63)
+PI_TEXT=""               # the input
+PI_CUR=0                 # cursor, in characters (0 .. length)
+PI_VIEW=0                # first character shown in the field
+_PI_ASCII=1              # 1: every character is one cell, _PI_P is not used
+_PI_P=()                 # prefix sums of the cell widths: _PI_P[i] = cells of PI_TEXT[0:i]
+_PI_SHOWN=""             # what the field shows between the markers
+_PI_LMARK=0              # 1: "…" in the first cell (text hidden on the left)
+_PI_RMARK=0              # 1: "…" in the last cell (text hidden on the right)
+_PI_CURCOL=0             # cursor column, in cells from the start of the field
+
+# tui_char_width <char> — _CW: cells of one character (the wide blocks of
+# tui_str_width count 2).
+tui_char_width() {
+  local cp
+  printf -v cp '%d' "'$1"
+  if (( (cp>=0x1100 && cp<=0x115F) || (cp>=0x2E80 && cp<=0xA4CF) ||
+        (cp>=0xAC00 && cp<=0xD7A3) || (cp>=0xF900 && cp<=0xFAFF) ||
+        (cp>=0xFE30 && cp<=0xFE6F) || (cp>=0xFF00 && cp<=0xFF60) ||
+        (cp>=0xFFE0 && cp<=0xFFE6) || (cp>=0x1F300 && cp<=0x1F64F) ||
+        (cp>=0x1F900 && cp<=0x1F9FF) || (cp>=0x20000 && cp<=0x3FFFD) )); then
+    _CW=2
+  else
+    _CW=1
+  fi
+}
+
+# tui_prompt_widths — recompute the cell widths after PI_TEXT changed.
+tui_prompt_widths() {
+  local ascii_re='^[ -~]*$' i n=${#PI_TEXT} sum=0
+  if [[ "$PI_TEXT" =~ $ascii_re ]]; then
+    _PI_ASCII=1
+    _PI_P=()
+    return 0
+  fi
+  _PI_ASCII=0
+  _PI_P=(0)
+  for ((i = 0; i < n; i++)); do
+    tui_char_width "${PI_TEXT:i:1}"
+    sum=$((sum + _CW))
+    _PI_P[i + 1]=$sum
+  done
+}
+
+# _pi_cells <from> <to> — _N: cells of PI_TEXT[from:to]
+_pi_cells() {
+  if [[ "$_PI_ASCII" == "1" ]]; then
+    _N=$(($2 - $1))
+  else
+    _N=$((_PI_P[$2] - _PI_P[$1]))
+  fi
+}
+
+# _pi_fits <view> <field cells> — true when a window starting at <view> shows
+# the cursor; _PI_TAIL=1 when it also shows the whole rest of the text.
+_pi_fits() {
+  local v="$1" f="$2" n=${#PI_TEXT} left=0 cw=1 end_cell=0
+  (( v <= PI_CUR )) || return 1
+  (( v > 0 )) && left=1
+  (( PI_CUR == n )) && end_cell=1
+  _pi_cells "$v" "$n"
+  if (( left + _N + end_cell <= f )); then
+    _PI_TAIL=1
+    return 0
+  fi
+  _PI_TAIL=0
+  if (( PI_CUR < n )); then
+    _pi_cells "$PI_CUR" $((PI_CUR + 1))
+    cw=$_N
+  fi
+  _pi_cells "$v" "$PI_CUR"
+  (( left + _N + cw + 1 <= f ))
+}
+
+# tui_prompt_window <field cells> — move PI_VIEW so the cursor is inside the
+# field, then fill _PI_SHOWN, _PI_LMARK, _PI_RMARK and _PI_CURCOL. The window
+# moves only as far as the cursor needs; when the whole rest of the text fits
+# it is pulled back, so no cell stays empty while text is hidden on the left.
+tui_prompt_window() {
+  local f="$1" n=${#PI_TEXT} e budget
+  (( f < 4 )) && f=4
+  (( PI_VIEW > PI_CUR )) && PI_VIEW=$PI_CUR
+  (( PI_VIEW < 0 )) && PI_VIEW=0
+  while ! _pi_fits "$PI_VIEW" "$f"; do
+    PI_VIEW=$((PI_VIEW + 1))
+  done
+  while (( PI_VIEW > 0 )) && _pi_fits $((PI_VIEW - 1)) "$f" && [[ "$_PI_TAIL" == "1" ]]; do
+    PI_VIEW=$((PI_VIEW - 1))
+  done
+  _pi_fits "$PI_VIEW" "$f" || true
+  _PI_LMARK=0
+  _PI_RMARK=0
+  (( PI_VIEW > 0 )) && _PI_LMARK=1
+  (( _PI_TAIL == 1 )) || _PI_RMARK=1
+  budget=$((f - _PI_LMARK - _PI_RMARK))
+  e=$PI_VIEW
+  while (( e < n )); do
+    _pi_cells "$PI_VIEW" $((e + 1))
+    (( _N <= budget )) || break
+    e=$((e + 1))
+  done
+  _PI_SHOWN="${PI_TEXT:PI_VIEW:e - PI_VIEW}"
+  _pi_cells "$PI_VIEW" "$PI_CUR"
+  _PI_CURCOL=$((_PI_LMARK + _N))
+}
+
+# tui_prompt_edit <action> [<text>] — one editing step on PI_TEXT/PI_CUR:
+# left right home end backspace delete clear (Ctrl-U) word (Ctrl-W) insert.
+tui_prompt_edit() {
+  local before room
+  case "$1" in
+    left) (( PI_CUR > 0 )) && PI_CUR=$((PI_CUR - 1)) ;;
+    right) (( PI_CUR < ${#PI_TEXT} )) && PI_CUR=$((PI_CUR + 1)) ;;
+    home) PI_CUR=0 ;;
+    end) PI_CUR=${#PI_TEXT} ;;
+    backspace)
+      if (( PI_CUR > 0 )); then
+        PI_TEXT="${PI_TEXT:0:PI_CUR - 1}${PI_TEXT:PI_CUR}"
+        PI_CUR=$((PI_CUR - 1))
+      fi
+      ;;
+    delete)
+      (( PI_CUR < ${#PI_TEXT} )) && PI_TEXT="${PI_TEXT:0:PI_CUR}${PI_TEXT:PI_CUR + 1}"
+      ;;
+    clear) PI_TEXT="" PI_CUR=0 ;;
+    word)
+      before="${PI_TEXT:0:PI_CUR}"
+      if [[ "$before" =~ ^(.*)[[:space:]]+[^[:space:]]+$ ]]; then
+        before="${BASH_REMATCH[1]}"
+      else
+        before=""
+      fi
+      PI_TEXT="$before${PI_TEXT:PI_CUR}"
+      PI_CUR=${#before}
+      ;;
+    insert)
+      room=$((PROMPT_MAX - ${#PI_TEXT}))
+      (( room > 0 )) || return 0
+      before="${2:0:room}"
+      PI_TEXT="${PI_TEXT:0:PI_CUR}$before${PI_TEXT:PI_CUR}"
+      PI_CUR=$((PI_CUR + ${#before}))
+      ;;
+  esac
+  case "$1" in
+    backspace|delete|clear|word|insert) tui_prompt_widths ;;
+  esac
+  return 0
+}
+
+# tui_prompt_read <timeout> — _PCH: one character from /dev/tty, read byte by
+# byte (C locale) and put together from its UTF-8 bytes; "" for Enter. rc 1
+# when nothing arrived. A read whose timeout fires right after it got a byte
+# reports a timeout with the byte in hand: that byte counts, or a character
+# arriving at that moment would lose its first byte.
+tui_prompt_read() {
+  local b="" rc=0 code need=0 i
+  _PCH=""
+  LC_ALL=C IFS= read -rsn1 -t "$1" b </dev/tty || rc=$?
+  if [[ -z "$b" ]]; then
+    (( rc == 0 )) && return 0   # the line delimiter: Enter
+    return 1
+  fi
+  _PCH="$b"
+  LC_ALL=C printf -v code '%d' "'$b"
+  (( code < 0 )) && code=$((code + 256))
+  if (( code >= 0xF0 && code <= 0xF7 )); then need=3
+  elif (( code >= 0xE0 )) && (( code <= 0xEF )); then need=2
+  elif (( code >= 0xC0 )) && (( code <= 0xDF )); then need=1
+  fi
+  for ((i = 0; i < need; i++)); do
+    b=""
+    LC_ALL=C IFS= read -rsn1 -t 0.05 b </dev/tty || true
+    [[ -n "$b" ]] || break
+    _PCH+="$b"
+  done
+  return 0
+}
+
+# tui_prompt_draw <row> <label> — the prompt row: label, then the field window
+# (markers dim), padded to the pane; the terminal cursor ends on the input cursor.
+tui_prompt_draw() {
+  local row="$1" label="$2" label_w field_x f pad
+  tui_str_width "$label"
+  label_w=$_WIDTH
+  field_x=$((LEFT_X + label_w + 1))
+  f=$((LEFT_CONTENT_W - label_w - 1))
+  (( f < 4 )) && f=4
+  tui_prompt_window "$f"
+  tput cup "$row" "$LEFT_X"
+  printf "%b%s%b " "${TUI_FG_ACCENT}" "$label" "$CLR_RESET"
+  (( _PI_LMARK )) && printf "%b…%b" "${TUI_DIM}${TUI_FG_MENU_DIM}" "$CLR_RESET"
+  printf "%s" "$_PI_SHOWN"
+  _pi_cells "$PI_VIEW" $((PI_VIEW + ${#_PI_SHOWN}))
+  pad=$((f - _PI_LMARK - _PI_RMARK - _N))
+  (( pad > 0 )) && printf "%*s" "$pad" ""
+  (( _PI_RMARK )) && printf "%b…%b" "${TUI_DIM}${TUI_FG_MENU_DIM}" "$CLR_RESET"
+  tput cup "$row" "$((field_x + _PI_CURCOL))"
+}
+
 tui_prompt() {
   local prompt="$1"
   local default="$2"
   local validator="${3:-}"
-  local input=""
-  local cursor=0
-  local ch=""
-  local code=0
-  local prompt_len=${#prompt}
+  local ch="" code=0 i
 
   # Refresh the geometry: prompts may open after the frame was last laid out.
   tui_update_layout
   local prompt_row=$((TUI_LINES - 3))
   local err_row=$((TUI_LINES - 2))
-  local max_input=$((LEFT_CONTENT_W - prompt_len - 2))
-  (( max_input < 10 )) && max_input=10
+  PI_TEXT="" PI_CUR=0 PI_VIEW=0
+  tui_prompt_widths
 
   # Flush any pending input
   while IFS= read -rsn1 -t 0.01 _ </dev/tty; do :; done
@@ -854,8 +1074,6 @@ tui_prompt() {
     printf "%-*s" "$LEFT_CONTENT_W" ""
     TUI_FOOTER="prompt"
     tui_draw_status_bar
-    tput cup "$prompt_row" "$LEFT_X"
-    printf "%b%s%b " "${TUI_FG_ACCENT}" "$prompt" "$CLR_RESET"
     tput cnorm
   } >/dev/tty
 
@@ -864,16 +1082,13 @@ tui_prompt() {
   trap 'TUI_NEED_RESIZE=1' SIGWINCH
 
   while true; do
-    # Redraw prompt line and cursor at the current geometry. Also used after
-    # edits: full line redraw, then place the cursor behind input[0:cursor].
+    # Redraw prompt line and cursor at the current geometry.
     {
       if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
         TUI_NEED_RESIZE=0
         tui_update_layout
         prompt_row=$((TUI_LINES - 3))
         err_row=$((TUI_LINES - 2))
-        max_input=$((LEFT_CONTENT_W - prompt_len - 2))
-        (( max_input < 10 )) && max_input=10
         # the whole screen follows the new size, not only the prompt row:
         # frame, both panes, then the prompt on top (below)
         if [[ "$TUI_TOO_SMALL" != "1" ]]; then
@@ -883,67 +1098,69 @@ tui_prompt() {
           tui_render_left_menu
         fi
       fi
-      tput cup "$prompt_row" "$LEFT_X"
-      printf "%-*s" "$LEFT_CONTENT_W" ""
-      tput cup "$prompt_row" "$LEFT_X"
-      printf "%b%s%b " "${TUI_FG_ACCENT}" "$prompt" "$CLR_RESET"
-      printf "%s" "$input"
-      local w=0
-      tui_str_width "${input:0:$cursor}"
-      w=$_WIDTH
-      tput cup "$prompt_row" "$((LEFT_X + prompt_len + 1 + w))"
+      tui_prompt_draw "$prompt_row" "$prompt"
     } >/dev/tty
 
-    IFS= read -rsn1 -t 0.1 ch </dev/tty || continue
+    tui_prompt_read 0.1 || continue
+    ch="$_PCH"
 
-    # ESC: cancel, cursor keys, or bracketed paste
+    # ESC: cancel, cursor keys, or bracketed paste. The bytes after ESC are
+    # collected up to a finalizer, as in tui_read_key, so ESC[1~ and ESC[4~
+    # (Home/End on some terminals) leave no "~" behind.
     if [[ "$ch" == $'\x1b' ]]; then
-      local seq=""
-      IFS= read -rsn2 -t 0.01 seq || true
+      local seq="" b=""
+      for i in 1 2 3 4 5; do
+        b=""
+        IFS= read -rsn1 -t 0.01 b </dev/tty || [[ -n "$b" ]] || break
+        seq+="$b"
+        [[ "$i" == 1 && ( "$b" == "O" || "$b" == "[" ) ]] && continue
+        [[ "$b" =~ [a-zA-Z~] ]] && break
+      done
       case "$seq" in
-        "[D") (( cursor > 0 )) && cursor=$((cursor - 1)) ;;
-        "[C") (( cursor < ${#input} )) && cursor=$((cursor + 1)) ;;
-        "[H") cursor=0 ;;
-        "[F") cursor=${#input} ;;
-        "[3~") (( cursor < ${#input} )) && input="${input:0:$cursor}${input:$((cursor + 1))}" ;;
-        "[2")
-          # Bracketed paste: ESC[200~ <payload> ESC[201~ — insert the payload
-          # at the cursor instead of cancelling.
-          local rest=""
-          IFS= read -rsn3 -t 0.05 rest || true
-          if [[ "$rest" == "00~" ]]; then
-            local pch="" closer=""
-            while IFS= read -rsn1 -t 1 pch; do
-              if [[ "$pch" == $'\x1b' ]]; then
-                IFS= read -rsn5 -t 0.05 closer || true
-                [[ "$closer" == "[201~" ]] && break
-                continue
-              fi
-              (( ${#input} < max_input )) || break
-              input="${input:0:$cursor}$pch${input:$cursor}"
-              cursor=$((cursor + 1))
-            done
-          fi
+        "[D"|"OD") tui_prompt_edit left ;;
+        "[C"|"OC") tui_prompt_edit right ;;
+        "[H"|"OH"|"[1~"|"[7~") tui_prompt_edit home ;;
+        "[F"|"OF"|"[4~"|"[8~") tui_prompt_edit end ;;
+        "[3~") tui_prompt_edit delete ;;
+        "[200~")
+          # Bracketed paste: ESC[200~ <payload> ESC[201~ — the payload is
+          # inserted at the cursor, up to PROMPT_MAX characters in all; line
+          # breaks and other control characters are dropped.
+          local pch="" closer="" paste=""
+          while tui_prompt_read 1; do
+            pch="$_PCH"
+            if [[ "$pch" == $'\x1b' ]]; then
+              IFS= read -rsn5 -t 0.05 closer </dev/tty || true
+              [[ "$closer" == "[201~" ]] && break
+              continue
+            fi
+            [[ -n "$pch" ]] || continue
+            printf -v code '%d' "'$pch"
+            (( code >= 32 && code != 127 )) || continue
+            paste+="$pch"
+          done
+          tui_prompt_edit insert "$paste"
           ;;
-        *)
+        "")
           # Bare ESC (nothing followed): cancel with the default.
-          input="$default"
+          PI_TEXT="$default"
           break
           ;;
+        *) : ;;   # another sequence: ignored, never inserted
       esac
       continue
     fi
 
     # Enter → confirm (validate inline when a validator is set)
     if [[ -z "$ch" || "$ch" == $'\n' || "$ch" == $'\r' ]]; then
-      if [[ -z "$input" && -n "$default" ]]; then
-        input="$default"
+      if [[ -z "$PI_TEXT" && -n "$default" ]]; then
+        PI_TEXT="$default"
       fi
-      if [[ -n "$validator" && -n "$input" ]]; then
+      if [[ -n "$validator" && -n "$PI_TEXT" ]]; then
         VALIDATION_ERROR=""
         PROMPT_RESULT=""
-        if "$validator" "$input"; then
-          [[ -n "$PROMPT_RESULT" ]] && input="$PROMPT_RESULT"
+        if "$validator" "$PI_TEXT"; then
+          [[ -n "$PROMPT_RESULT" ]] && PI_TEXT="$PROMPT_RESULT"
           break
         fi
         {
@@ -957,61 +1174,21 @@ tui_prompt() {
       break
     fi
 
-    # Backspace (0x7f or 0x08): delete before the cursor
-    if [[ "$ch" == $'\x7f' || "$ch" == $'\x08' ]]; then
-      if (( cursor > 0 )); then
-        input="${input:0:$((cursor - 1))}${input:$cursor}"
-        cursor=$((cursor - 1))
-      fi
-      continue
-    fi
+    case "$ch" in
+      $'\x7f'|$'\x08') tui_prompt_edit backspace; continue ;;   # Backspace
+      $'\x03') PI_TEXT="$default"; break ;;                      # Ctrl-C (no isig)
+      $'\x01') tui_prompt_edit home; continue ;;                 # Ctrl-A
+      $'\x05') tui_prompt_edit end; continue ;;                  # Ctrl-E
+      $'\x15') tui_prompt_edit clear; continue ;;                # Ctrl-U
+      $'\x17') tui_prompt_edit word; continue ;;                 # Ctrl-W
+    esac
 
-    # Ctrl-C → cancel with the default
-    if [[ "$ch" == $'\x03' ]]; then
-      input="$default"
-      break
-    fi
-
-    # Ctrl-A / Ctrl-E: line start / end (readline convention)
-    if [[ "$ch" == $'\x01' ]]; then
-      cursor=0
-      continue
-    fi
-    if [[ "$ch" == $'\x05' ]]; then
-      cursor=${#input}
-      continue
-    fi
-
-    # Ctrl-U: clear the whole line
-    if [[ "$ch" == $'\x15' ]]; then
-      input=""
-      cursor=0
-      continue
-    fi
-
-    # Ctrl-W: delete the word before the cursor
-    if [[ "$ch" == $'\x17' ]]; then
-      local before="${input:0:$cursor}"
-      if [[ "$before" =~ ^(.*)[[:space:]]+[^[:space:]]+$ ]]; then
-        before="${BASH_REMATCH[1]}"
-      else
-        before=""
-      fi
-      input="$before${input:$cursor}"
-      cursor=${#before}
-      continue
-    fi
-
-    # Append printable character at the cursor (UTF-8 bytes pass through
-    # and combine once complete)
+    # A printable character at the cursor (a UTF-8 character arrives whole)
     printf -v code '%d' "'$ch"
     if (( code < 32 )); then
       continue
     fi
-    if (( ${#input} < max_input )); then
-      input="${input:0:$cursor}$ch${input:$cursor}"
-      cursor=$((cursor + 1))
-    fi
+    tui_prompt_edit insert "$ch"
   done
 
   # Cancelled or submitted: clear the label row — a finished prompt must not
@@ -1027,7 +1204,7 @@ tui_prompt() {
     tui_draw_status_bar
     tput civis
   } >/dev/tty
-  printf "%s" "$input"
+  printf "%s" "$PI_TEXT"
 }
 
 tui_confirm() {
@@ -1118,18 +1295,39 @@ tui_message() {
   tui_print_left_styled "$row" "$TUI_FG_SEPARATOR" "$_HLINE_SEP"
   row=$((row + 1))
 
-  # Body text
-  local line
-  while IFS= read -r line; do
-    if [[ "$row" -ge $((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT)) ]]; then
-      break
-    fi
-    tui_print_left "$row" "$line"
-    row=$((row + 1))
-  done < <(printf "%s\n" "$text" | fold -s -w "$LEFT_CONTENT_W")
-
-  # "Any key: continue" is the bottom row's hint (TUI_FOOTER=message)
-  tui_wait_key
+  # Body text; a text taller than the pane scrolls with ↑↓ (the last row of
+  # the page then says how many lines are hidden below), any other key
+  # continues
+  local line top=0 i body_h n
+  local -a body=()
+  while IFS= read -r line; do body+=("$line"); done < <(printf "%s\n" "$text" | fold -s -w "$LEFT_CONTENT_W")
+  n=${#body[@]}
+  body_h=$((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT - row))
+  if (( n > body_h )); then
+    TUI_FOOTER="message-scroll"
+    tui_draw_status_bar
+  fi
+  while :; do
+    for ((i = 0; i < body_h; i++)); do
+      line=""
+      (( top + i < n )) && line="${body[$((top + i))]}"
+      if (( n > body_h && i == body_h - 1 && top + body_h < n )); then
+        tui_print_left_styled $((row + i)) "${TUI_DIM}${TUI_ITALIC}" "↓ $((n - top - body_h + 1)) more lines"
+      else
+        tui_print_left $((row + i)) "$line"
+      fi
+    done
+    (( n > body_h )) || { tui_wait_key; break; }
+    tui_read_key || continue
+    case "$_KEY" in
+      down|j) (( top + body_h < n )) && top=$((top + 1)) ;;
+      up|k) (( top > 0 )) && top=$((top - 1)) ;;
+      pgdn) top=$((top + body_h - 1)); (( top > n - body_h )) && top=$((n - body_h)) ;;
+      pgup) top=$((top - body_h + 1)); (( top < 0 )) && top=0 ;;
+      unknown|paste) : ;;
+      *) break ;;
+    esac
+  done
   TUI_FOOTER=""
 }
 
@@ -1712,6 +1910,36 @@ validate_env_value() {
   esac
 
   return 0
+}
+
+# env_rule_text <key> — _RULE: what validate_env_value checks for <key>, in
+# words, for the settings editor's details pane; empty when it checks nothing
+# beyond the quoting every value needs. Keep in step with validate_env_value.
+env_rule_text() {
+  case "$1" in
+    *_NPUB) _RULE="An npub (npub1…), all lower or all upper case." ;;
+    RELAY_URL) _RULE="A host name or URL without spaces." ;;
+    RELAY_PORT) _RULE="A port number, 1 to 65535." ;;
+    RELAY_BIND_ADDRESS) _RULE="An IPv4 or IPv6 address, or empty." ;;
+    DB_ENGINE) _RULE="badger or lmdb, and only the engine of the data in db/ (to move the data: ./$SCRIPT_NAME db-switch)." ;;
+    LMDB_MAPSIZE) _RULE="A whole number, 0 or more." ;;
+    BLOSSOM_PATH) _RULE="Not empty." ;;
+    *_ICON) _RULE="An http:// or https:// URL, or empty." ;;
+    *_ALLOW_EMPTY_FILTERS|*_ALLOW_COMPLEX_FILTERS) _RULE="true or false." ;;
+    WOT_REFRESH_INTERVAL) _RULE="A number followed by s, m, h or d, e.g. 24h." ;;
+    BACKUP_INTERVAL_HOURS) _RULE="A whole number, 0 or more." ;;
+    *_TOKENS_PER_INTERVAL|*_INTERVAL|*_MAX_TOKENS|*_INTERVAL_SECONDS|*_TIMEOUT_SECONDS|*_DEPTH|*_MINIMUM_FOLLOWERS)
+      _RULE="A whole number, 0 or more." ;;
+    IMPORT_START_DATE) _RULE="A date as YYYY-MM-DD." ;;
+    IMPORT_SEED_RELAYS_FILE|BLASTR_RELAYS_FILE) _RULE="A .json file name; the file must exist." ;;
+    WHITELISTED_NPUBS_FILE|BLACKLISTED_NPUBS_FILE) _RULE="A .json file name that exists, or empty." ;;
+    BACKUP_PROVIDER) _RULE="s3, none or empty." ;;
+    S3_ACCESS_KEY_ID|S3_SECRET_KEY|S3_REGION) _RULE="Not empty when BACKUP_PROVIDER is s3." ;;
+    S3_ENDPOINT) _RULE="A host or URL; not empty when BACKUP_PROVIDER is s3." ;;
+    S3_BUCKET_NAME) _RULE="3 to 63 characters: lower-case letters, digits, dot, dash; not empty when BACKUP_PROVIDER is s3." ;;
+    HAVEN_LOG_LEVEL) _RULE="DEBUG, INFO, WARNING or ERROR." ;;
+    *) _RULE="" ;;
+  esac
 }
 
 ask_yes_no() {
@@ -4889,7 +5117,7 @@ drain_log_stream() {
     log_append "$_SANITIZED"
     updated=1
   done
-  if [[ "$updated" -eq 1 ]]; then
+  if [[ "$updated" -eq 1 && "$TUI_RIGHT_MODE" != details ]]; then
     TUI_NEED_RIGHT=1
   fi
 }
@@ -4939,14 +5167,129 @@ tui_ensure_log_stream() {
 }
 
 tui_render_right_panel() {
-  # Mode switch: logs (default) or the status view. Tab toggles (and with it
-  # the Tab and / hints of the bottom row).
+  # Mode switch: logs (default), the status view, the details of the selected
+  # setting (settings editor) or the output of a running data task. Tab
+  # toggles (and with it the Tab and / hints of the bottom row).
   tui_refresh_status_bar
-  if [[ "$TUI_RIGHT_MODE" == "status" ]]; then
-    tui_render_right_status
-    return
+  case "$TUI_RIGHT_MODE" in
+    status) tui_render_right_status ;;
+    details) tui_render_right_details ;;
+    task) tui_render_right_task ;;
+    *) tui_render_right_logs ;;
+  esac
+}
+
+# tui_wrap_key <key> <cells> — the key name on as many lines as it needs,
+# broken after an underscore where possible, never cut.
+tui_wrap_key() {
+  local rest="$1" w="$2" line="" part
+  while [[ -n "$rest" ]]; do
+    if [[ "$rest" == *_* ]]; then part="${rest%%_*}_"; else part="$rest"; fi
+    rest="${rest:${#part}}"
+    if (( ${#line} + ${#part} <= w )); then
+      line+="$part"
+      continue
+    fi
+    [[ -n "$line" ]] && printf '%s\n' "$line"
+    line=""
+    while (( ${#part} > w )); do
+      printf '%s\n' "${part:0:w}"
+      part="${part:w}"
+    done
+    line="$part"
+  done
+  [[ -n "$line" ]] && printf '%s\n' "$line"
+  return 0
+}
+
+# tui_setting_details — DETAIL_LINES: what the details pane shows for the
+# selected entry of the settings list (or the key of the setting view), wrapped
+# to the pane: the full key name, its description, the example value of
+# .env.example, the rule the editor checks, the current value (masked like the
+# list for sensitive keys). DETAIL_BOLD: how many leading lines are the key.
+DETAIL_LINES=()
+DETAIL_BOLD=0
+tui_setting_details() {
+  local id="" key="" w="$RIGHT_CONTENT_W" v line
+  DETAIL_LINES=()
+  DETAIL_BOLD=0
+  if [[ "$TUI_VIEW" == "env_item" ]]; then
+    key="$CURRENT_ENV_KEY"
+  elif (( ${#MENU_IDS[@]} > 0 && TUI_SEL < ${#MENU_IDS[@]} )); then
+    id="${MENU_IDS[$TUI_SEL]}"
+    [[ "$id" == key:* ]] && key="${id#key:}"
   fi
-  tui_render_right_logs
+  if [[ -z "$key" ]]; then
+    case "$id" in
+      add) v="Adds a line to .env: you type the key, then its value. Saving restarts a running relay." ;;
+      back) v="Back to the main menu." ;;
+      group:*) v="No setting matches the filter." ;;
+      *) v="" ;;
+    esac
+    while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | fold -s -w "$w")
+    return 0
+  fi
+  env_example_load
+  while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(tui_wrap_key "$key" "$w")
+  DETAIL_BOLD=${#DETAIL_LINES[@]}
+  DETAIL_LINES+=("")
+  if [[ -n "${EX_DESC[$key]:-}" ]]; then
+    v="${EX_DESC[$key]}"
+  elif [[ -n "${EX_SEC[$key]+x}" ]]; then
+    v="No description in .env.example."
+  else
+    v="Not in .env.example: Haven does not document this setting."
+  fi
+  while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | fold -s -w "$w")
+  DETAIL_LINES+=("")
+  if [[ -n "${EX_SEC[$key]+x}" ]]; then
+    v="Example: ${EX_EXAMPLE[$key]}"
+    [[ "${EX_COMMENTED[$key]:-0}" == "1" ]] && v+=" (commented out in .env.example)"
+    while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | fold -s -w "$w")
+  fi
+  env_rule_text "$key"
+  if [[ -n "$_RULE" ]]; then
+    while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf 'Rule: %s\n' "$_RULE" | fold -s -w "$w")
+  fi
+  v="$(read_env_var "$key" 2>/dev/null | head -n 1 || true)"
+  if env_key_is_sensitive "$key"; then
+    mask_env_value "$v"
+    v="$_MASKED (hidden; Enter, then Reveal value shows it)"
+  fi
+  [[ -n "$v" ]] || v="(empty)"
+  while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf 'Current: %s\n' "$v" | fold -s -w "$w")
+}
+
+tui_render_right_details() {
+  TUI_RIGHT_TITLE="Details"
+  tui_draw_title_row
+  # the right pane is drawn before the left one: the list it describes may
+  # not be built (or its selection clamped) yet
+  if [[ "$TUI_NEED_MENU" -eq 1 ]]; then
+    tui_build_menu
+    TUI_NEED_MENU=0
+  fi
+  tui_clamp_sel
+  if [[ "$TUI_VIEW" == restore_list || "$TUI_VIEW" == switch ]]; then
+    tui_flow_details
+  else
+    tui_setting_details
+  fi
+  local row line style n=${#DETAIL_LINES[@]}
+  for ((row = 0; row < RIGHT_CONTENT_HEIGHT; row++)); do
+    line="" style=""
+    if (( row < n )); then
+      line="${DETAIL_LINES[$row]}"
+      (( row < DETAIL_BOLD )) && style="${TUI_BOLD}${TUI_FG_ACCENT}"
+    fi
+    if (( row == RIGHT_CONTENT_HEIGHT - 1 && n > RIGHT_CONTENT_HEIGHT )); then
+      line="… (more: a taller terminal shows it)"
+      style="${TUI_DIM}${TUI_ITALIC}"
+    fi
+    tui_truncate "$line" "$RIGHT_CONTENT_W"
+    tui_pad_to "$_TRUNC" "$RIGHT_CONTENT_W"
+    printf '\033[%d;%dH%b%s%b' "$((RIGHT_CONTENT_ROW + row + 1))" "$((RIGHT_X + 1))" "$style" "$_PADDED" "$CLR_RESET"
+  done
 }
 
 tui_render_right_status() {
@@ -4964,59 +5307,138 @@ tui_render_right_status() {
     TUI_STATUS_TS="$now"
   fi
 
-  local row=0 idx line
+  # "label|value|style" per field: the label in its own column, the value
+  # wrapped beside it (continuation rows indented), the style for the value
+  local -a rows=() styles=()
+  local entry label value style vw=$((RIGHT_CONTENT_W - 13)) first part
+  (( vw < 8 )) && vw=8
+  for entry in "${TUI_STATUS_CACHE[@]+"${TUI_STATUS_CACHE[@]}"}"; do
+    label="${entry%%|*}" value="${entry#*|}" style=""
+    if [[ "$value" == *"|"* ]]; then style="${value##*|}"; value="${value%|*}"; fi
+    first=1
+    while IFS= read -r part; do
+      if (( first )); then
+        rows+=("$(printf '%-12s %s' "$label" "$part")")
+      else
+        rows+=("$(printf '%-12s %s' "" "$part")")
+      fi
+      styles+=("$style")
+      first=0
+    done < <(printf '%s\n' "$value" | fold -s -w "$vw")
+  done
+  local row line st
   for ((row=0; row<RIGHT_CONTENT_HEIGHT; row++)); do
-    line=""
-    if (( row < ${#TUI_STATUS_CACHE[@]} )); then
-      line="${TUI_STATUS_CACHE[$row]}"
+    line="" st=""
+    if (( row < ${#rows[@]} )); then
+      line="${rows[$row]}"
+      st="${styles[$row]}"
     fi
     tui_truncate "$line" "$RIGHT_CONTENT_W"
-    printf '\033[%d;%dH' "$((RIGHT_CONTENT_ROW + row + 1))" "$((RIGHT_X + 1))"
     tui_pad_to "$_TRUNC" "$RIGHT_CONTENT_W"
-    printf "%s" "$_PADDED"
+    printf '\033[%d;%dH' "$((RIGHT_CONTENT_ROW + row + 1))" "$((RIGHT_X + 1))"
+    case "$st" in
+      warn) printf "%b%s%b" "$TUI_FG_LOG_WARN" "$_PADDED" "$CLR_RESET" ;;
+      *) printf "%s" "$_PADDED" ;;
+    esac
   done
 }
 
+# tui_collect_status — TUI_STATUS_CACHE: the status view's fields, one
+# "label|value[|style]" each, in this order: relay state with uptime, mode,
+# relay URL (and the onion host on Tor), the engine on disk with the size of
+# db/, media (blossom/), the newest backup, image tag and digest, then one line
+# per container. Every state is a word; called throttled (every 5 s at most).
 tui_collect_status() {
+  local name status relay="" mode url onion="" state dsize engine envs tag digest="" f
+  local -a containers=()
   TUI_STATUS_CACHE=()
-  if ! docker info >/dev/null 2>&1; then
-    TUI_STATUS_CACHE=("Docker is offline.")
-    return
-  fi
-
-  local name status state uptime digest
-  while IFS='|' read -r name status; do
-    [[ -n "$name" ]] || continue
-    state="exited"
-    uptime="-"
-    if [[ "$status" == Up* ]]; then
-      state="running"
-      uptime="${status#Up }"
-      uptime="${uptime%%(*}"
-      uptime="up ${uptime}"
-    fi
-    TUI_STATUS_CACHE+=("$name: $state ${uptime}")
-  done < <(docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null | grep -E "^haven-|^${RELAY_CONTAINER}[|]" || true)
-  if (( ${#TUI_STATUS_CACHE[@]} == 0 )); then
-    TUI_STATUS_CACHE+=("no haven containers")
-  fi
-
-  digest="$(docker inspect --format '{{.Image}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
-  if [[ "$digest" == sha256:* ]]; then
-    TUI_STATUS_CACHE+=("image: ${digest:0:22}…")
+  if docker info >/dev/null 2>&1; then
+    while IFS='|' read -r name status; do
+      [[ -n "$name" ]] || continue
+      if [[ "$status" == Up* ]]; then
+        state="${status#Up }"
+        state="running, up ${state%% (*}"
+      else
+        state="stopped"
+      fi
+      containers+=("$name: $state")
+      if [[ "$name" == "$RELAY_CONTAINER" ]]; then
+        if [[ "$status" == Up* ]]; then relay="● Running, ${state#running, }"; else relay="○ Stopped"; fi
+      fi
+    done < <(docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null | grep -E "^haven-|^${RELAY_CONTAINER}[|]" || true)
+    [[ -n "$relay" ]] || relay="○ Not created yet (never started)"
+    digest="$(docker inspect --format '{{.Image}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
   else
-    TUI_STATUS_CACHE+=("image: -")
+    relay="○ Unknown: Docker is offline"
+  fi
+  TUI_STATUS_CACHE+=("Relay|$relay")
+
+  mode="$(resolve_mode "status" 2>/dev/null || printf plain)"
+  if [[ "$mode" == "tor" ]]; then
+    TUI_STATUS_CACHE+=("Mode|Tor")
+    [[ -r "$ROOT_DIR/tor/data/haven/hostname" ]] && onion="$(head -n 1 "$ROOT_DIR/tor/data/haven/hostname" 2>/dev/null)"
+  else
+    TUI_STATUS_CACHE+=("Mode|Docker")
+  fi
+  url="$(env_value_or_empty RELAY_URL)"
+  if [[ -n "$url" ]]; then url="wss://${url#wss://}"; else url="not set (RELAY_URL in .env)"; fi
+  [[ -z "$onion" ]] || url+="; onion: $(printable_text "$onion")"
+  TUI_STATUS_CACHE+=("URL|$(printable_text "$url")")
+
+  dsize="$(du -sh "$ROOT_DIR/db" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$dsize" ]] || dsize="unknown"
+  db_disk_engine
+  envs="$(env_engine_state)"
+  case "$DISK_ENGINE" in
+    badger|lmdb)
+      engine="$DISK_ENGINE"
+      if [[ "$envs" != "$DISK_ENGINE" && ( "$envs" == badger || "$envs" == lmdb ) ]]; then
+        engine="$DISK_ENGINE on disk, but .env names $envs"
+      fi
+      ;;
+    mixed) engine="files of both engines in db/ ($DISK_BAD)" ;;
+    split) engine="the directories in db/ disagree ($DISK_REPORT)" ;;
+    unknown) engine="cannot tell: $DISK_BAD unreadable or of neither engine" ;;
+    *) engine="no data yet (.env: $envs)" ;;
+  esac
+  TUI_STATUS_CACHE+=("Database|$engine, db/ $dsize")
+
+  if [[ -d "$ROOT_DIR/blossom" ]]; then
+    dsize="$(du -sh "$ROOT_DIR/blossom" 2>/dev/null | awk '{print $1}')"
+    TUI_STATUS_CACHE+=("Media|blossom/ ${dsize:-unknown}")
+  else
+    TUI_STATUS_CACHE+=("Media|blossom/ does not exist")
   fi
 
-  local dsize
-  for d in db blossom; do
-    if [[ -d "$ROOT_DIR/$d" ]]; then
-      dsize="$(du -sh "$ROOT_DIR/$d" 2>/dev/null | awk '{print $1}')"
-      TUI_STATUS_CACHE+=("$d/: ${dsize:--}")
-    else
-      TUI_STATUS_CACHE+=("$d/: (missing)")
-    fi
-  done
+  tui_flow_backups_list
+  if [[ -n "$FLOW_LIST_ERR" ]]; then
+    TUI_STATUS_CACHE+=("Last backup|backups/ cannot be read|warn")
+  elif (( ${#FLOW_FILES[@]} )); then
+    f="${FLOW_FILES[0]}"
+    tui_flow_age "${FLOW_FILE_TIME[$f]}"
+    TUI_STATUS_CACHE+=("Last backup|$f, $_AGE")
+  else
+    TUI_STATUS_CACHE+=("Last backup|never|warn")
+  fi
+
+  tag="-"
+  if [[ -f "$ROOT_DIR/docker-compose.yml" ]]; then
+    tag="$(grep -m1 'image:.*haven-docker' "$ROOT_DIR/docker-compose.yml" | sed -E 's/.*haven-docker:([^[:space:]]+).*/\1/')"
+    [[ -n "$tag" ]] || tag="-"
+  fi
+  if [[ "$digest" == sha256:* ]]; then
+    TUI_STATUS_CACHE+=("Image|$tag, ${digest:0:19}")
+  else
+    TUI_STATUS_CACHE+=("Image|$tag, no running image")
+  fi
+
+  if (( ${#containers[@]} )); then
+    for f in "${containers[@]}"; do TUI_STATUS_CACHE+=("Container|$f"); done
+  elif docker info >/dev/null 2>&1; then
+    TUI_STATUS_CACHE+=("Container|none")
+  else
+    TUI_STATUS_CACHE+=("Container|unknown: Docker is offline")
+  fi
 }
 
 tui_render_right_logs() {
@@ -5128,11 +5550,14 @@ Enter     Open
 Letter    Open its entry
 1-9       Go to nth entry
 g G       First, last
-Esc ←     Back, or quit
-q         Quit
-Tab       Logs or status
+Esc ←     Back
+q Q       Back; quit in
+          the main view
+Ctrl-C    Quit
+Tab       Switch right pane
 PgUp PgDn Scroll logs
-/         Filter logs
+/         Filter logs or
+          settings
 
 Saving a setting restarts
 a running relay.
@@ -5169,7 +5594,28 @@ tui_update_docker_status() {
   fi
 }
 
+# tui_view_has_details [view] — true for the views whose right pane is a
+# context pane (Tab: details <-> logs): the settings editor, the restore list
+# and the engine switch overview.
+tui_view_has_details() {
+  case "${1:-$TUI_VIEW}" in
+    env_list|env_item|restore_list|switch) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 tui_set_view() {
+  # A view with a context pane shows the details of the selected entry on the
+  # right; leaving it gives the pane back the mode it had before.
+  if tui_view_has_details "$1"; then
+    if ! tui_view_has_details "$TUI_VIEW"; then
+      TUI_RIGHT_PREV="$TUI_RIGHT_MODE"
+      TUI_RIGHT_MODE="details"
+    fi
+  elif tui_view_has_details "$TUI_VIEW"; then
+    [[ "$TUI_RIGHT_MODE" == details ]] && TUI_RIGHT_MODE="$TUI_RIGHT_PREV"
+  fi
+  [[ "$1" == env_list || "$1" == env_item ]] || SETTINGS_FILTER=""
   TUI_VIEW="$1"
   TUI_SEL=0
   TUI_OFFSET=0
@@ -5266,6 +5712,18 @@ tui_menu_selectable() {
   [[ "${MENU_IDS[$idx]}" != group:* ]]
 }
 
+# tui_clamp_sel — the selection inside the list and never on a group name:
+# forward first, else backward (a list of group rows only keeps it in range).
+tui_clamp_sel() {
+  local count=${#MENU_IDS[@]}
+  (( TUI_SEL < 0 )) && TUI_SEL=0
+  (( count > 0 && TUI_SEL >= count )) && TUI_SEL=$((count - 1))
+  if (( count > 0 )) && ! tui_menu_selectable "$TUI_SEL"; then
+    tui_sel_step "$TUI_SEL" 1 || tui_sel_step "$TUI_SEL" -1 || true
+  fi
+  return 0
+}
+
 # tui_sel_step <from> <step> — move the selection from <from> in direction
 # <step> (+1/-1) to the next selectable entry; false (selection unchanged)
 # when there is none.
@@ -5304,10 +5762,331 @@ env_key_is_sensitive() {
   esac
 }
 
+# --- settings editor: structure and descriptions from .env.example ----------
+# .env.example is the one source: "## <name>" opens a section (keys above the
+# first one belong to "General"), the "# " comment lines directly above a key
+# are its description, a trailing "# comment" is appended to it. A bare "#" or
+# a blank line ends a description that has no key yet. "# KEY=value" documents
+# a key that is commented out (DOCKER_UID): it places that key, when it is in
+# .env, in its section. Loaded again only when the file changed.
+EX_SECTIONS=()
+EX_KEYS=()               # the keys of .env.example in file order (commented ones too)
+declare -A EX_SEC=()     # key -> index in EX_SECTIONS
+declare -A EX_DESC=()    # key -> description
+declare -A EX_EXAMPLE=() # key -> value as written (without a trailing comment)
+declare -A EX_COMMENTED=() # key -> 1 when the line is commented out
+EX_STAMP=""
+env_example_load() {
+  local f="$ROOT_DIR/.env.example" stamp kind a b c d
+  stamp="$(stat -c '%Y %s' "$f" 2>/dev/null || stat -f '%m %z' "$f" 2>/dev/null || printf 'none')"
+  [[ "$stamp" == "$EX_STAMP" ]] && return 0
+  EX_STAMP="$stamp"
+  EX_SECTIONS=() EX_KEYS=() EX_SEC=() EX_DESC=() EX_EXAMPLE=() EX_COMMENTED=()
+  [[ -f "$f" ]] || return 0
+  while IFS=$'\t' read -r kind a b c d; do
+    case "$kind" in
+      S) EX_SECTIONS+=("$a") ;;
+      K)
+        if (( ${#EX_SECTIONS[@]} == 0 )); then EX_SECTIONS+=("General"); fi
+        [[ -n "${EX_SEC[$a]+x}" ]] && continue
+        EX_KEYS+=("$a")
+        EX_SEC[$a]=$(( ${#EX_SECTIONS[@]} - 1 ))
+        EX_COMMENTED[$a]="$b"
+        EX_EXAMPLE[$a]="$c"
+        EX_DESC[$a]="$d"
+        ;;
+    esac
+  done < <(awk '
+    function value_part(v,    i, c, q, out, rest) {
+      q = ""; out = ""; TRAIL = ""
+      for (i = 1; i <= length(v); i++) {
+        c = substr(v, i, 1)
+        if (c == "\"" || c == "\047") { if (q == c) q = ""; else if (q == "") q = c }
+        if (c == "#" && q == "") { TRAIL = substr(v, i + 1); break }
+        out = out c
+      }
+      sub(/[ \t]+$/, "", out); sub(/^[ \t]+/, "", TRAIL); sub(/[ \t]+$/, "", TRAIL)
+      gsub(/\t/, " ", out); gsub(/\t/, " ", TRAIL)
+      return out
+    }
+    function key_line(line, commented,    ep, key, val, desc) {
+      ep = index(line, "=")
+      key = substr(line, 1, ep - 1)
+      val = value_part(substr(line, ep + 1))
+      desc = pending
+      if (TRAIL != "") desc = (desc == "" ? TRAIL : desc " " TRAIL)
+      printf "K\t%s\t%d\t%s\t%s\n", key, commented, val, desc
+      pending = ""
+    }
+    /^## / { name = substr($0, 4); sub(/[ \t]+$/, "", name); print "S\t" name; pending = ""; next }
+    /^#[ \t]*$/ { pending = ""; next }
+    /^# ?[A-Za-z_][A-Za-z0-9_]*=/ { line = $0; sub(/^# ?/, "", line); key_line(line, 1); next }
+    /^#/ { t = $0; sub(/^#[ \t]?/, "", t); gsub(/\t/, " ", t); pending = (pending == "" ? t : pending " " t); next }
+    /^[ \t]*$/ { pending = ""; next }
+    {
+      line = $0; sub(/^[ \t]*/, "", line); sub(/^export[ \t]+/, "", line)
+      ep = index(line, "=")
+      if (ep > 0 && substr(line, 1, ep - 1) ~ /^[A-Za-z_][A-Za-z0-9_]*$/) key_line(line, 0)
+      else pending = ""
+    }
+  ' "$f")
+}
+
+# env_values_load — ENV_ORDER (keys of .env in file order, as list_env_keys
+# reads them) and ENV_VALUE (key -> raw value of its first line, as
+# read_env_var reads it), in one pass.
+ENV_ORDER=()
+declare -A ENV_VALUE=()
+env_values_load() {
+  local key value
+  ENV_ORDER=() ENV_VALUE=()
+  [[ -f "$ROOT_DIR/.env" ]] || return 0
+  while IFS=$'\t' read -r key value; do
+    [[ -n "${ENV_VALUE[$key]+x}" ]] && continue
+    ENV_ORDER+=("$key")
+    ENV_VALUE[$key]="$value"
+  done < <(awk '
+    function strip_inline(v,    i, c, quote, out) {
+      quote = ""; out = ""
+      for (i = 1; i <= length(v); i++) {
+        c = substr(v, i, 1)
+        if (c == "\"" || c == "\047") { if (quote == c) quote = ""; else if (quote == "") quote = c }
+        if (c == "#" && quote == "") break
+        out = out c
+      }
+      sub(/[ \t]+$/, "", out)
+      gsub(/\t/, " ", out)
+      return out
+    }
+    /^[ \t]*#/ { next }
+    /^[ \t]*$/ { next }
+    /^[ \t]*export[ \t]+[A-Za-z_][A-Za-z0-9_]*=/ {
+      line = $0; sub(/^[ \t]*export[ \t]+/, "", line)
+      ep = index(line, "="); print substr(line, 1, ep - 1) "\t" strip_inline(substr(line, ep + 1)); next
+    }
+    /^[A-Za-z_][A-Za-z0-9_]*=/ {
+      ep = index($0, "="); print substr($0, 1, ep - 1) "\t" strip_inline(substr($0, ep + 1))
+    }
+  ' "$ROOT_DIR/.env")
+}
+
+# env_section_prefix <key...> — _PREFIX: the longest prefix ending in "_" that
+# all keys share and that leaves every key a word; empty for a single key.
+env_section_prefix() {
+  local p="$1" k
+  _PREFIX=""
+  (( $# > 1 )) || return 0
+  for k in "${@:2}"; do
+    while [[ -n "$p" && "$k" != "$p"* ]]; do p="${p%?}"; done
+  done
+  [[ "$p" == *_* ]] || return 0
+  p="${p%_*}_"
+  for k in "$@"; do
+    [[ ${#k} -gt ${#p} ]] || return 0
+  done
+  _PREFIX="$p"
+}
+
+# env_label_base <key> <prefix> — _LABEL: the key without the section prefix
+# and without the _LIMITER infix, lower case, words apart.
+env_label_base() {
+  local k="${1#"$2"}"
+  k="${k//_LIMITER_/_}"
+  k="${k%_LIMITER}"
+  k="${k,,}"
+  _LABEL="${k//_/ }"
+}
+
+# env_labels — SET_LABEL (key -> label) for every key of .env.example and of
+# .env: the base label; where two keys get the same one (four relays share
+# their setting names), the first word of the section prefix leads ("chat
+# name"); a key only in .env keeps its whole name.
+declare -A SET_LABEL=()
+env_labels() {
+  local i k
+  local -A base=() qual=() uses=()
+  local -a keys=()
+  SET_LABEL=()
+  for ((i = 0; i < ${#EX_SECTIONS[@]}; i++)); do
+    keys=()
+    for k in "${EX_KEYS[@]}"; do
+      [[ "${EX_SEC[$k]}" == "$i" ]] && keys+=("$k")
+    done
+    (( ${#keys[@]} )) || continue
+    env_section_prefix "${keys[@]}"
+    for k in "${keys[@]}"; do
+      env_label_base "$k" "$_PREFIX"
+      base[$k]="$_LABEL"
+      qual[$k]="${_PREFIX%%_*}"
+      qual[$k]="${qual[$k],,}"
+    done
+  done
+  for k in "${ENV_ORDER[@]}"; do
+    [[ -n "${base[$k]+x}" ]] && continue
+    env_label_base "$k" ""
+    base[$k]="$_LABEL"
+    qual[$k]=""
+  done
+  for k in "${!base[@]}"; do
+    uses[${base[$k]}]=$(( ${uses[${base[$k]}]:-0} + 1 ))
+  done
+  for k in "${!base[@]}"; do
+    if (( uses[${base[$k]}] > 1 )) && [[ -n "${qual[$k]}" ]]; then
+      SET_LABEL[$k]="${qual[$k]} ${base[$k]}"
+    else
+      SET_LABEL[$k]="${base[$k]}"
+    fi
+  done
+}
+
+# tui_truncate_middle <text> <cells> <head cells> — _TRUNC: <text> cut in the
+# middle to <cells>: the first <head cells>, "…", then as much of the end as
+# fits, so the end of a setting name (what tells similar names apart) survives.
+tui_truncate_middle() {
+  local s="$1" limit="$2" head="$3" n i out_h="" out_t="" w=0 tail_budget
+  n=${#s}
+  tui_str_width "$s"
+  if (( _WIDTH <= limit )); then
+    _TRUNC="$s"
+    return 0
+  fi
+  (( head > limit - 2 )) && head=$((limit - 2))
+  (( head < 0 )) && head=0
+  for ((i = 0; i < n; i++)); do
+    tui_char_width "${s:i:1}"
+    (( w + _CW <= head )) || break
+    out_h+="${s:i:1}"
+    w=$((w + _CW))
+  done
+  tail_budget=$((limit - w - 1))
+  w=0
+  for ((i = n - 1; i >= 0; i--)); do
+    tui_char_width "${s:i:1}"
+    (( w + _CW <= tail_budget )) || break
+    out_t="${s:i:1}$out_t"
+    w=$((w + _CW))
+  done
+  _TRUNC="${out_h}…${out_t}"
+}
+
+# settings_match <key> — true when the settings filter is empty or found,
+# case-insensitive, in the key name or its description.
+SETTINGS_FILTER=""
+settings_match() {
+  [[ -z "$SETTINGS_FILTER" ]] && return 0
+  local f="${SETTINGS_FILTER,,}" k="${1,,}" d="${EX_DESC[$1]:-}"
+  [[ "$k" == *"$f"* || "${d,,}" == *"$f"* ]]
+}
+
+# settings_rows — the settings list into MENU_IDS / MENU_LABELS / MENU_VALUES:
+# "Add setting", then per section one group row and its keys (in the order of
+# .env.example), the keys only in .env under "Other", then "Back". With a
+# filter only matching keys and their section rows, or the empty-state text.
+# Labels and values are fitted to the pane here (tui_fit_setting_rows).
+settings_rows() {
+  local i k v n=0
+  local -a other=()
+  env_example_load
+  env_values_load
+  env_labels
+  if [[ -z "$SETTINGS_FILTER" ]]; then
+    MENU_IDS+=(add) MENU_LABELS+=("Add setting") MENU_VALUES+=("")
+  fi
+  for ((i = 0; i < ${#EX_SECTIONS[@]}; i++)); do
+    local -a here=()
+    for k in "${EX_KEYS[@]}"; do
+      [[ "${EX_SEC[$k]}" == "$i" && -n "${ENV_VALUE[$k]+x}" ]] || continue
+      settings_match "$k" && here+=("$k")
+    done
+    (( ${#here[@]} )) || continue
+    MENU_IDS+=("group:sec:$i") MENU_LABELS+=("${EX_SECTIONS[$i]}") MENU_VALUES+=("")
+    for k in "${here[@]}"; do
+      v="${ENV_VALUE[$k]}"
+      if env_key_is_sensitive "$k"; then mask_env_value "$v"; v="$_MASKED"; fi
+      MENU_IDS+=("key:$k") MENU_LABELS+=("${SET_LABEL[$k]}") MENU_VALUES+=("$v")
+      n=$((n + 1))
+    done
+  done
+  for k in "${ENV_ORDER[@]}"; do
+    [[ -n "${EX_SEC[$k]+x}" ]] && continue
+    settings_match "$k" && other+=("$k")
+  done
+  if (( ${#other[@]} )); then
+    MENU_IDS+=("group:sec:other") MENU_LABELS+=("Other") MENU_VALUES+=("")
+    for k in "${other[@]}"; do
+      v="${ENV_VALUE[$k]}"
+      if env_key_is_sensitive "$k"; then mask_env_value "$v"; v="$_MASKED"; fi
+      MENU_IDS+=("key:$k") MENU_LABELS+=("${SET_LABEL[$k]}") MENU_VALUES+=("$v")
+      n=$((n + 1))
+    done
+  fi
+  SETTINGS_SHOWN=$n
+  if [[ -n "$SETTINGS_FILTER" ]] && (( n == 0 )); then
+    local line j=0
+    while IFS= read -r line; do
+      MENU_IDS+=("group:empty:$j") MENU_LABELS+=("$line") MENU_VALUES+=("")
+      j=$((j + 1))
+    done < <(printf 'No setting matches "%s". Esc clears the filter.\n' "$SETTINGS_FILTER" | fold -s -w "$LEFT_CONTENT_W")
+  fi
+  if [[ -z "$SETTINGS_FILTER" ]]; then
+    MENU_IDS+=(back) MENU_LABELS+=("Back") MENU_VALUES+=("")
+  fi
+  tui_fit_setting_rows
+}
+
+# tui_fit_setting_rows — fit every key row into the pane: the value right-aligned
+# (cut at the end to a third of the row), the label cut in the middle to the rest.
+# Where two rows would still read the same, the cut of the later one moves until
+# it differs (more of the start, then less), so no two rows look alike.
+tui_fit_setting_rows() {
+  local i j h avail vw lw v try text
+  local -A seen=()
+  local -a full=()
+  avail=$((LEFT_CONTENT_W - 2))
+  for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do
+    full[i]="${MENU_LABELS[$i]}"
+    [[ "${MENU_IDS[$i]}" == key:* || "${MENU_IDS[$i]}" == file:* ]] || continue
+    v="${MENU_VALUES[$i]}"
+    if [[ -n "$v" ]]; then
+      tui_str_width "$v"
+      vw=$_WIDTH
+      if (( vw > avail / 3 )); then
+        tui_truncate "$v" $((avail / 3))
+        v="${_TRUNC%...}…"
+        tui_str_width "$v"
+        vw=$_WIDTH
+      fi
+      MENU_VALUES[i]="$v"
+      lw=$((avail - vw - 1))
+    else
+      lw=$avail
+    fi
+    MENU_LABEL_W[i]=$lw
+  done
+  for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do
+    if [[ "${MENU_IDS[$i]}" != key:* && "${MENU_IDS[$i]}" != file:* ]]; then
+      seen["${MENU_LABELS[$i]}"]=1
+      continue
+    fi
+    lw=${MENU_LABEL_W[$i]}
+    h=$(( (lw - 1) / 3 ))
+    text=""
+    for try in "$h" $(seq $((h + 1)) $((lw - 2))) $(seq $((h - 1)) -1 0); do
+      tui_truncate_middle "${full[$i]}" "$lw" "$try"
+      text="$_TRUNC|${MENU_VALUES[$i]}"
+      [[ -z "${seen[$text]+x}" ]] && break
+    done
+    seen["$text"]=1
+    MENU_LABELS[i]="$_TRUNC"
+  done
+}
+
 tui_build_menu() {
   MENU_IDS=()
   MENU_LABELS=()
   MENU_KEYS=()
+  MENU_VALUES=()
+  MENU_LABEL_W=()
   MENU_TITLE=""
   MENU_SUBTITLE=""
   MENU_STATE=""
@@ -5331,6 +6110,43 @@ tui_build_menu() {
         "" b e d i
         "" c l u o
         "" "?" a q)
+      # an interrupted engine switch: its undo leads the Data group
+      if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+        MENU_IDS=("${MENU_IDS[@]:0:6}" switch_rollback "${MENU_IDS[@]:6}")
+        MENU_LABELS=("${MENU_LABELS[@]:0:6}" "Undo interrupted switch" "${MENU_LABELS[@]:6}")
+        MENU_KEYS=("${MENU_KEYS[@]:0:6}" n "${MENU_KEYS[@]:6}")
+      fi
+      ;;
+    restore_list)
+      TUI_LEFT_TITLE="Haven / Restore a backup"
+      MENU_TITLE="Restore a backup"
+      MENU_SUBTITLE="backups/, newest first"
+      local fname
+      for fname in "${FLOW_FILES[@]+"${FLOW_FILES[@]}"}"; do
+        tui_flow_short_size "${FLOW_FILE_SIZE[$fname]:-0}"
+        local short="$_SHORT"
+        tui_flow_age "${FLOW_FILE_TIME[$fname]:-0}" short
+        MENU_IDS+=("file:$fname") MENU_LABELS+=("$fname") MENU_VALUES+=("$short $_AGE")
+      done
+      MENU_IDS+=(back) MENU_LABELS+=("Back") MENU_VALUES+=("")
+      tui_fit_setting_rows
+      ;;
+    switch)
+      TUI_LEFT_TITLE="Haven / Switch engine"
+      MENU_TITLE="Switch engine"
+      MENU_SUBTITLE="The old files are kept"
+      MENU_IDS=(group:i1 group:i2 group:i3 group:i4 group:i5 group:i6)
+      MENU_LABELS=("On disk: $FLOW_FOUND" "Target: $FLOW_TARGET" "Size of db/: $FLOW_DB_SIZE"
+        "Free space: $FLOW_FREE" "Last backup: $FLOW_BACKUP_AGE" "")
+      if [[ "$FLOW_MIXED" == "1" ]]; then
+        MENU_IDS+=(from:badger from:lmdb)
+        MENU_LABELS+=("Carry over the badger side" "Carry over the lmdb side")
+      else
+        MENU_IDS+=(switch)
+        MENU_LABELS+=("Switch to $FLOW_TARGET")
+      fi
+      MENU_IDS+=(back)
+      MENU_LABELS+=("Back")
       ;;
     logs)
       TUI_LEFT_TITLE="Haven / Logs"
@@ -5361,24 +6177,12 @@ tui_build_menu() {
     env_list)
       TUI_LEFT_TITLE="Haven / Settings"
       MENU_TITLE="Settings (.env)"
-      MENU_SUBTITLE="Select a setting"
-      MENU_IDS=(add)
-      MENU_LABELS=("Add setting")
-      local key
-      local value
-      while IFS= read -r key; do
-        [[ -n "$key" ]] || continue
-        value=""
-        value="$(read_env_var "$key" 2>/dev/null || true)"
-        if env_key_is_sensitive "$key"; then
-          mask_env_value "$value"
-          value="$_MASKED"
-        fi
-        MENU_IDS+=("key:$key")
-        MENU_LABELS+=("$key = $value")
-      done < <(list_env_keys)
-      MENU_IDS+=(back)
-      MENU_LABELS+=("Back")
+      settings_rows
+      if [[ -n "$SETTINGS_FILTER" ]]; then
+        MENU_SUBTITLE="Filter \"$SETTINGS_FILTER\": $SETTINGS_SHOWN found"
+      else
+        MENU_SUBTITLE="Select a setting"
+      fi
       ;;
     env_item)
       TUI_LEFT_TITLE="Haven / Settings / $CURRENT_ENV_KEY"
@@ -5476,16 +6280,7 @@ tui_render_left_menu() {
     return
   fi
 
-  if [[ "$TUI_SEL" -lt 0 ]]; then
-    TUI_SEL=0
-  fi
-  if [[ "$TUI_SEL" -ge "$count" ]]; then
-    TUI_SEL=$((count - 1))
-  fi
-  # The selection never rests on a group name: forward first, else backward.
-  if ! tui_menu_selectable "$TUI_SEL"; then
-    tui_sel_step "$TUI_SEL" 1 || tui_sel_step "$TUI_SEL" -1 || true
-  fi
+  tui_clamp_sel
 
   if [[ "$TUI_SEL" -lt "$TUI_OFFSET" ]]; then
     TUI_OFFSET="$TUI_SEL"
@@ -5527,8 +6322,27 @@ tui_render_left_menu() {
         printf "%b%s%b%s%b%s%b" "$TUI_FG_MENU_DIM" "$label" "$CLR_RESET" \
           "$TUI_GROUP_GAP" "$TUI_BOLD" "$_PADDED" "$CLR_RESET"
       else
+        # a group row starts in the marker column: it has the whole width
+        tui_truncate "$label" "$LEFT_CONTENT_W"
         tui_pad_to "$_TRUNC" "$LEFT_CONTENT_W"
         printf "%b%s%b" "$TUI_FG_MENU_DIM" "$_PADDED" "$CLR_RESET"
+      fi
+    elif [[ -n "${MENU_VALUES[$idx]:-}" ]]; then
+      # settings row: label (fitted by tui_fit_setting_rows), value right-aligned
+      local value="${MENU_VALUES[$idx]}" gap
+      tui_str_width "$label"
+      gap=$_WIDTH
+      tui_str_width "$value"
+      gap=$((LEFT_CONTENT_W - 2 - gap - _WIDTH))
+      (( gap < 1 )) && gap=1
+      if [[ "$idx" -eq "$TUI_SEL" ]]; then
+        tui_menu_icon selected
+        tui_pad_to "${_ICON}${label}$(printf '%*s' "$gap" '')${value}" "$LEFT_CONTENT_W"
+        printf "%b%s%b" "${TUI_BOLD}${TUI_FG_SELECTED}${TUI_BG_SELECTED}" "$_PADDED" "$CLR_RESET"
+      else
+        tui_menu_icon
+        printf "%s%b%s%b%*s%b%s%b" "$_ICON" "$TUI_FG_MENU" "$label" "$CLR_RESET" "$gap" "" \
+          "${TUI_DIM}${TUI_FG_MENU_DIM}" "$value" "$CLR_RESET"
       fi
     elif [[ "$idx" -eq "$TUI_SEL" ]]; then
       tui_menu_icon selected
@@ -5560,13 +6374,21 @@ tui_render_left_menu() {
 
 tui_handle_back() {
   case "$TUI_VIEW" in
-    main) return 1 ;;
+    main) return 0 ;;   # Esc and ← in the main view do nothing: q quits
     logs) tui_set_view "main" ;;
     logs_service) tui_set_view "logs" ;;
-    env_list) tui_set_view "main" ;;
+    env_list)
+      if [[ -n "$SETTINGS_FILTER" ]]; then
+        # Esc clears an active filter before it leaves the view
+        settings_set_filter ""
+      else
+        tui_set_view "main"
+      fi
+      ;;
     env_item) tui_set_view "env_list" ;;
     json_files) tui_set_view "main" ;;
     json_items) tui_set_view "json_files" ;;
+    restore_list|switch) tui_set_view "main" ;;
     *) tui_set_view "main" ;;
   esac
   return 0
@@ -5598,6 +6420,459 @@ tui_run_action() {
     tui_refresh_logs_view
   fi
 }
+
+# --- guided data flows --------------------------------------------------------
+# Back up, restore and engine switch in the TUI are thin layers over the CLI
+# verbs: the TUI picks what to run, asks, then runs `./haven <verb> ...` as a
+# child process and shows its output; every check, the docker calls and the
+# relay handling stay in the verb. Everything from here to tui_flow_end has
+# no docker or compose call of its own (tests/haven-flows.bats greps for one).
+TASK_PID=""
+TASK_FD=""
+TASK_DIR=""
+TASK_KIND=""
+TASK_HEAD=""            # first line of the task pane ("Backing up…")
+TASK_T0=0
+TASK_RC=0
+TASK_INT=0
+TASK_RESULT=""          # from "::result <ok|rolled-back|failed>"
+TASK_STEP=0             # from "::step <n>/<total> <name>"
+TASK_STEP_TOTAL=0
+TASK_STEPS=()           # step names as the verb printed them, by number
+TASK_LINES=()           # the verb's output, protocol lines included
+TASK_CARRY=""           # a line the verb has not finished yet
+TUI_TASK_ACTIVE=0
+
+# tui_flow_elapsed — _ELAPSED: "<m>m <ss>s" since the task started
+tui_flow_elapsed() {
+  local now e
+  printf -v now '%(%s)T' -1
+  e=$((now - TASK_T0))
+  (( e < 0 )) && e=0
+  printf -v _ELAPSED '%dm %02ds' $((e / 60)) $((e % 60))
+}
+
+# tui_flow_take <line> — one line of the verb's output into TASK_LINES, the
+# protocol lines into the step list and the result.
+tui_flow_take() {
+  local line="$1" n
+  log_sanitize_line "$line"
+  line="$_SANITIZED"
+  TASK_LINES+=("$line")
+  if [[ "$line" =~ ^::step\ ([0-9]+)/([0-9]+)\ (.+)$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    TASK_STEP="$n"
+    TASK_STEP_TOTAL="${BASH_REMATCH[2]}"
+    TASK_STEPS[n]="${BASH_REMATCH[3]}"
+  elif [[ "$line" =~ ^::result\ (.+)$ ]]; then
+    TASK_RESULT="${BASH_REMATCH[1]}"
+  fi
+}
+
+# tui_flow_drain — read what the verb wrote since the last call (a line it has
+# not finished stays in TASK_CARRY); 0 when something arrived.
+tui_flow_drain() {
+  local line got=1
+  [[ -n "$TASK_FD" ]] || return 1
+  while :; do
+    line=""
+    if IFS= read -r line <&"$TASK_FD"; then
+      tui_flow_take "$TASK_CARRY$line"
+      TASK_CARRY=""
+      got=0
+    else
+      # end of what is written so far; a partial line waits for its rest
+      TASK_CARRY+="$line"
+      break
+    fi
+  done
+  return "$got"
+}
+
+tui_render_left_task() {
+  local row="$LEFT_CONTENT_ROW" i end line
+  local -a lines=() styles=()
+  tui_flow_elapsed
+  lines+=("$TASK_HEAD") styles+=("${TUI_BOLD}${TUI_FG_ACCENT}")
+  if [[ "$TASK_KIND" == switch || "$TASK_KIND" == rollback ]]; then
+    if (( TASK_STEP_TOTAL > 0 )); then
+      lines+=("Step $TASK_STEP of $TASK_STEP_TOTAL · $_ELAPSED") styles+=("$TUI_FG_SUBTITLE")
+    else
+      lines+=("$_ELAPSED") styles+=("$TUI_FG_SUBTITLE")
+    fi
+    lines+=("$_HLINE_SEP") styles+=("$TUI_FG_SEPARATOR")
+    for ((i = 1; i <= TASK_STEP_TOTAL; i++)); do
+      [[ -n "${TASK_STEPS[$i]:-}" ]] || continue
+      if (( i < TASK_STEP )); then
+        lines+=("✓ ${TASK_STEPS[$i]}") styles+=("")
+      else
+        lines+=("▸ ${TASK_STEPS[$i]}") styles+=("$TUI_BOLD")
+      fi
+    done
+    end=$((TASK_STEP_TOTAL - TASK_STEP))
+    if (( end > 0 )); then
+      line="$end steps to go"
+      (( end == 1 )) && line="1 step to go"
+      lines+=("  $line") styles+=("${TUI_DIM}${TUI_FG_MENU_DIM}")
+    fi
+  else
+    lines+=("Elapsed $_ELAPSED") styles+=("$TUI_FG_SUBTITLE")
+    lines+=("$_HLINE_SEP") styles+=("$TUI_FG_SEPARATOR")
+  fi
+  lines+=("") styles+=("")
+  while IFS= read -r line; do
+    lines+=("$line") styles+=("${TUI_DIM}${TUI_FG_MENU_DIM}")
+  done < <(printf '%s\n' "The relay is offline while this runs. Esc and q wait; Ctrl-C stops it, and the relay is started again." | fold -s -w "$LEFT_CONTENT_W")
+  for ((i = 0; i < LEFT_CONTENT_HEIGHT; i++)); do
+    line="" ; local st=""
+    if (( i < ${#lines[@]} )); then line="${lines[$i]}"; st="${styles[$i]}"; fi
+    tui_truncate "$line" "$LEFT_CONTENT_W"
+    tui_print_left_styled $((row + i)) "$st" "$_TRUNC"
+  done
+}
+
+tui_render_right_task() {
+  tui_flow_elapsed
+  if [[ "$TUI_TASK_ACTIVE" == "1" ]]; then
+    TUI_RIGHT_TITLE="Relay offline $_ELAPSED │ Output"
+  else
+    TUI_RIGHT_TITLE="Output"
+  fi
+  tui_draw_title_row
+  local -a out_rows=()
+  local line row
+  for line in "${TASK_LINES[@]+"${TASK_LINES[@]}"}"; do
+    [[ "$line" == ::* ]] && continue
+    while IFS= read -r row; do out_rows+=("$row"); done < <(printf '%s\n' "$line" | fold -s -w "$RIGHT_CONTENT_W")
+  done
+  local start=$(( ${#out_rows[@]} > RIGHT_CONTENT_HEIGHT ? ${#out_rows[@]} - RIGHT_CONTENT_HEIGHT : 0 ))
+  for ((row = 0; row < RIGHT_CONTENT_HEIGHT; row++)); do
+    line=""
+    (( start + row < ${#out_rows[@]} )) && line="${out_rows[$((start + row))]}"
+    tui_truncate "$line" "$RIGHT_CONTENT_W"
+    tui_pad_to "$_TRUNC" "$RIGHT_CONTENT_W"
+    printf '\033[%d;%dH%s' "$((RIGHT_CONTENT_ROW + row + 1))" "$((RIGHT_X + 1))" "$_PADDED"
+  done
+}
+
+# tui_flow_run <kind> <title> <head> <verb args...> — run `./haven <verb args>`
+# as a child and show it until it ends: the left pane the task state (for an
+# engine switch the steps from its ::step lines), the title row how long the
+# relay has been offline, the right pane the verb's output. Every key waits
+# (Esc and q too); Ctrl-C is passed to the child, whose signal guard stops the
+# one-shot and starts the relay again. The TUI's own log stream pauses for
+# the duration. Sets TASK_RC, TASK_RESULT, TASK_STEPS, TASK_LINES.
+tui_flow_run() {
+  local kind="$1" title="$2" head="$3" saved_int saved_left="$TUI_LEFT_TITLE" redraw=1 now last=0
+  shift 3
+  local -a cmd=("$ROOT_DIR/$SCRIPT_NAME")
+  [[ "$MODE" == tor ]] && cmd+=(--tor)
+  [[ "$MODE" == plain ]] && cmd+=(--plain)
+  cmd+=("$@")
+  TASK_KIND="$kind" TASK_HEAD="$head"
+  TASK_LINES=() TASK_STEPS=() TASK_STEP=0 TASK_STEP_TOTAL=0 TASK_RESULT="" TASK_RC=0 TASK_INT=0 TASK_CARRY=""
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then stop_log_stream; fi
+  TASK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/haven-task.XXXXXX")"
+  : > "$TASK_DIR/out"
+  printf -v TASK_T0 '%(%s)T' -1
+  saved_int="$(trap -p INT)"
+  trap 'TASK_INT=1; [[ -n "$TASK_PID" ]] && kill -INT "$TASK_PID" 2>/dev/null' INT
+  # A background job of a shell without job control ignores SIGINT and
+  # cannot trap it; with -m the child keeps the default, gets its own process
+  # group (the terminal's Ctrl-C reaches the TUI, which passes it on) and its
+  # guard can run.
+  set -m
+  "${cmd[@]}" >"$TASK_DIR/out" 2>&1 </dev/null &
+  TASK_PID=$!
+  set +m
+  exec {TASK_FD}<"$TASK_DIR/out"
+  TUI_TASK_ACTIVE=1
+  TUI_RIGHT_PREV_TASK="$TUI_RIGHT_MODE"
+  TUI_RIGHT_MODE="task"
+  TUI_LEFT_TITLE="Haven / $title"
+  TUI_FOOTER="task"
+  while :; do
+    if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
+      TUI_NEED_RESIZE=0
+      tui_update_layout
+      redraw=1
+    fi
+    tui_flow_drain && redraw=2
+    if ! kill -0 "$TASK_PID" 2>/dev/null; then
+      tui_flow_drain || true
+      [[ -z "$TASK_CARRY" ]] || { tui_flow_take "$TASK_CARRY"; TASK_CARRY=""; }
+      break
+    fi
+    printf -v now '%(%s)T' -1
+    if (( redraw == 1 )); then
+      tui_draw_frame 1
+      redraw=2
+    fi
+    if (( redraw == 2 || now != last )); then
+      tui_render_left_task
+      tui_render_right_panel
+      tui_sync_mark
+      redraw=0
+      last=$now
+    fi
+    tui_read_key || true   # every key waits while the verb runs
+  done
+  TASK_RC=0
+  wait "$TASK_PID" 2>/dev/null || TASK_RC=$?
+  TASK_PID=""
+  exec {TASK_FD}<&-
+  TASK_FD=""
+  rm -rf -- "$TASK_DIR"
+  TASK_DIR=""
+  if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
+  TUI_TASK_ACTIVE=0
+  TUI_FOOTER=""
+  TUI_LEFT_TITLE="$saved_left"
+}
+
+# tui_flow_finish <box title> <first line> — the result box (the verb's own
+# closing lines), then back to the main view with the log stream resumed.
+tui_flow_finish() {
+  local title="$1" first="$2" text
+  tui_flow_summary
+  text="$_SUMMARY"
+  [[ -z "$first" ]] || text="$first"$'\n\n'"$text"
+  tui_message "$title" "$text"
+  TUI_RIGHT_MODE="${TUI_RIGHT_PREV_TASK:-logs}"
+  [[ "$TUI_RIGHT_MODE" == task || "$TUI_RIGHT_MODE" == details ]] && TUI_RIGHT_MODE="logs"
+  tui_set_view main
+  TUI_NEED_FRAME=1
+  tui_refresh_logs_view
+}
+
+# tui_flow_summary — _SUMMARY: the verb's closing lines: those after its last
+# ::step line and after its last progress line (one that ends in "..."),
+# protocol lines left out, the INFO and OK words dropped.
+tui_flow_summary() {
+  local i from=0 line
+  _SUMMARY=""
+  for ((i = 0; i < ${#TASK_LINES[@]}; i++)); do
+    line="${TASK_LINES[$i]}"
+    [[ "$line" == "::step "* || "$line" == *... ]] && from=$((i + 1))
+  done
+  for ((i = from; i < ${#TASK_LINES[@]}; i++)); do
+    line="${TASK_LINES[$i]}"
+    [[ "$line" == ::* || -z "$line" ]] && continue
+    line="${line#INFO }"
+    line="${line#OK }"
+    _SUMMARY+="${_SUMMARY:+$'\n'}$line"
+  done
+  [[ -n "$_SUMMARY" ]] || _SUMMARY="The command printed nothing more (exit status $TASK_RC); its output is on the right."
+}
+
+# tui_flow_outcome <noun> — _TITLE for a backup or restore box from the exit status
+tui_flow_outcome() {
+  if (( TASK_RC == 0 )); then
+    _TITLE="$1 finished"
+  elif (( TASK_INT )) || (( TASK_RC == 130 )); then
+    _TITLE="$1 interrupted"
+  else
+    _TITLE="$1 failed"
+  fi
+}
+
+tui_flow_backup() {
+  tui_confirm "Back up now? The relay is offline while the backup runs; the file goes to backups/ in this directory." "y" || return 0
+  tui_flow_run backup "Back up now" "Backing up…" backup
+  tui_flow_outcome "Backup"
+  tui_flow_finish "$_TITLE" ""
+}
+
+# tui_flow_backups_list — FLOW_FILES (newest first), FLOW_FILE_SIZE and
+# FLOW_FILE_TIME (by name) for the .zip files in backups/; FLOW_LIST_ERR when
+# the directory cannot be read.
+FLOW_FILES=()
+declare -A FLOW_FILE_SIZE=()
+declare -A FLOW_FILE_TIME=()
+FLOW_LIST_ERR=""
+tui_flow_backups_list() {
+  local f name t sz
+  FLOW_FILES=() FLOW_FILE_SIZE=() FLOW_FILE_TIME=() FLOW_LIST_ERR=""
+  [[ -d "$BACKUP_DIR" ]] || return 0
+  if [[ ! -r "$BACKUP_DIR" || ! -x "$BACKUP_DIR" ]]; then
+    FLOW_LIST_ERR="backups/ cannot be read by $(id -un 2>/dev/null || id -u): its permissions do not allow listing it."
+    return 0
+  fi
+  while IFS=$'\t' read -r t sz name; do
+    [[ -n "$name" ]] || continue
+    FLOW_FILES+=("$name")
+    FLOW_FILE_SIZE[$name]="$sz"
+    FLOW_FILE_TIME[$name]="$t"
+  done < <(
+    for f in "$BACKUP_DIR"/*.zip; do
+      [[ -f "$f" ]] || continue
+      t="$(stat -L -c %Y "$f" 2>/dev/null || stat -L -f %m "$f" 2>/dev/null || echo 0)"
+      sz="$(stat -L -c %s "$f" 2>/dev/null || stat -L -f %z "$f" 2>/dev/null || echo 0)"
+      printf '%s\t%s\t%s\n' "$t" "$sz" "$(printable_text "${f##*/}")"
+    done | LC_ALL=C sort -t $'\t' -k1,1nr -k3,3
+  )
+}
+
+# tui_flow_age <epoch> [short] — _AGE: "5 min ago", "3 h ago", "2 days ago";
+# with "short": "now", "5m", "3h", "2d"
+tui_flow_age() {
+  local now d
+  printf -v now '%(%s)T' -1
+  d=$((now - $1))
+  (( d < 0 )) && d=0
+  if [[ "${2:-}" == short ]]; then
+    if (( d < 60 )); then _AGE="now"
+    elif (( d < 3600 )); then _AGE="$((d / 60))m"
+    elif (( d < 172800 )); then _AGE="$((d / 3600))h"
+    else _AGE="$((d / 86400))d"
+    fi
+    return 0
+  fi
+  if (( d < 60 )); then _AGE="just now"
+  elif (( d < 3600 )); then _AGE="$((d / 60)) min ago"
+  elif (( d < 172800 )); then _AGE="$((d / 3600)) h ago"
+  else _AGE="$((d / 86400)) days ago"
+  fi
+}
+
+# tui_flow_short_size <bytes> — _SHORT: 512B, 12K, 3.4M, 1.2G
+tui_flow_short_size() {
+  _SHORT="$(awk -v b="$1" 'BEGIN { split("B K M G T", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1 || b >= 10) printf "%d%s", b, u[i]; else printf "%.1f%s", b, u[i] }')"
+}
+
+tui_flow_restore() {
+  tui_flow_backups_list
+  if [[ -n "$FLOW_LIST_ERR" ]]; then
+    tui_message "Restore a backup" "$FLOW_LIST_ERR"
+    return 0
+  fi
+  if (( ${#FLOW_FILES[@]} == 0 )); then
+    tui_message "Restore a backup" "There is no backup in backups/ yet. Make one with Back up now, or with ./$SCRIPT_NAME backup in a terminal."
+    return 0
+  fi
+  tui_set_view restore_list
+}
+
+tui_flow_restore_pick() {
+  local name="$1"
+  tui_confirm "Restore $name? It adds the events of this backup that are missing; it never deletes or duplicates anything, and events that exist only in the database stay. The relay is offline while it runs." "n" || return 0
+  tui_flow_run restore "Restore a backup" "Restoring…" restore "$name" --yes
+  tui_flow_outcome "Restore"
+  tui_flow_finish "$_TITLE" ""
+}
+
+# tui_flow_switch_facts — FLOW_FOUND (what db/ holds, from db_disk_engine),
+# FLOW_TARGET, FLOW_MIXED (1: the two --from choices), FLOW_DB_SIZE, FLOW_FREE,
+# FLOW_BACKUP_AGE for the overview of the engine switch.
+tui_flow_switch_facts() {
+  local eff
+  db_disk_engine
+  eff="lmdb"
+  [[ "$(env_engine_state)" == badger ]] && eff="badger"
+  FLOW_MIXED=0
+  case "$DISK_ENGINE" in
+    badger) FLOW_FOUND="badger"; FLOW_TARGET="lmdb" ;;
+    lmdb) FLOW_FOUND="lmdb"; FLOW_TARGET="badger" ;;
+    mixed|split|unknown) FLOW_FOUND="both engines"; FLOW_TARGET="$eff"; FLOW_MIXED=1 ;;
+    *) FLOW_FOUND="no data"; FLOW_TARGET="badger"; [[ "$eff" == badger ]] && FLOW_TARGET="lmdb" ;;
+  esac
+  FLOW_DB_SIZE="$(du -sh "$ROOT_DIR/db" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$FLOW_DB_SIZE" ]] || FLOW_DB_SIZE="unknown"
+  FLOW_FREE="$(df -Pk "$ROOT_DIR/db" 2>/dev/null | awk 'NR == 2 {print $4}')"
+  if [[ "$FLOW_FREE" =~ ^[0-9]+$ ]]; then
+    tui_flow_short_size $((FLOW_FREE * 1024))
+    FLOW_FREE="$_SHORT"
+  else
+    FLOW_FREE="unknown"
+  fi
+  tui_flow_backups_list
+  if [[ -n "$FLOW_LIST_ERR" ]]; then
+    FLOW_BACKUP_AGE="backups/ unreadable"
+  elif (( ${#FLOW_FILES[@]} )); then
+    tui_flow_age "${FLOW_FILE_TIME[${FLOW_FILES[0]}]}"
+    FLOW_BACKUP_AGE="$_AGE"
+  else
+    FLOW_BACKUP_AGE="never"
+  fi
+}
+
+tui_flow_switch() {
+  tui_flow_switch_facts
+  tui_set_view switch
+}
+
+# tui_flow_switch_go [<from>] — the typed confirmation, then the switch.
+tui_flow_switch_go() {
+  local from="${1:-}" typed
+  typed="$(tui_prompt "Type $FLOW_TARGET:" "")"
+  if [[ "$typed" != "$FLOW_TARGET" ]]; then
+    if [[ -z "$typed" ]]; then
+      tui_message "Switch engine" "Cancelled; nothing was changed."
+    else
+      tui_message "Switch engine" "Cancelled: you typed '$(printable_text "$typed")', not '$FLOW_TARGET'. Nothing was changed."
+    fi
+    return 0
+  fi
+  local -a args=(db-switch "$FLOW_TARGET")
+  [[ -z "$from" ]] || args+=(--from "$from")
+  args+=(--yes)
+  local source="$FLOW_FOUND"
+  [[ -z "$from" ]] || source="$from"
+  tui_flow_run switch "Switch engine" "Switching to $FLOW_TARGET" "${args[@]}"
+  local failed_step="${TASK_STEPS[$TASK_STEP]:-}"
+  case "$TASK_RESULT" in
+    ok) tui_flow_finish "Engine switched" "" ;;
+    rolled-back)
+      tui_flow_finish "Switch rolled back" "Step '$failed_step' failed; the switch was rolled back: db/ and DB_ENGINE are back on $source." ;;
+    *)
+      if (( TASK_STEP <= 1 )) && [[ "$TASK_RESULT" == failed ]]; then
+        tui_flow_finish "Switch not started" ""
+      elif [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+        tui_flow_finish "Switch failed" "Step '$failed_step' failed and the switch is not finished. Next step: ./$SCRIPT_NAME db-switch --rollback (Undo interrupted switch in the Data group)."
+      else
+        tui_flow_finish "Switch failed" "Step '$failed_step' failed."
+      fi
+      ;;
+  esac
+}
+
+tui_flow_rollback() {
+  tui_confirm "Undo the interrupted switch? It puts the previous engine and its data back as the switch recorded them; nothing in db/ is deleted. The relay is offline while it runs." "n" || return 0
+  tui_flow_run rollback "Undo interrupted switch" "Undoing the switch" db-switch --rollback
+  case "$TASK_RESULT" in
+    rolled-back) tui_flow_finish "Switch undone" "" ;;
+    *) tui_flow_finish "Undo failed" "" ;;
+  esac
+}
+
+# tui_flow_details — DETAIL_LINES for the restore list and the switch overview
+tui_flow_details() {
+  local id="" v="" t
+  DETAIL_LINES=() DETAIL_BOLD=0
+  (( ${#MENU_IDS[@]} > 0 && TUI_SEL < ${#MENU_IDS[@]} )) && id="${MENU_IDS[$TUI_SEL]}"
+  case "$id" in
+    file:*)
+      t="${id#file:}"
+      while IFS= read -r v; do DETAIL_LINES+=("$v"); done < <(printf '%s\n' "$t" | fold -w "$RIGHT_CONTENT_W")
+      DETAIL_BOLD=${#DETAIL_LINES[@]}
+      tui_flow_age "${FLOW_FILE_TIME[$t]:-0}"
+      v="$(human_size "${FLOW_FILE_SIZE[$t]:-0}")"
+      DETAIL_LINES+=("" "Size: $v" "Written: $(date -d "@${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null) ($_AGE)" "")
+      v="A restore adds the events of this backup that are missing; it never deletes or duplicates anything. Enter asks before anything runs."
+      ;;
+    switch) v="Moves the $FLOW_FOUND data into a new $FLOW_TARGET database: a verified backup first, then the old directories are set aside in db/.pre-switch-$FLOW_FOUND-<time>/ and kept; ./$SCRIPT_NAME db-switch --rollback goes back. You confirm by typing $FLOW_TARGET." ;;
+    from:*)
+      t="${id#from:}"
+      local o=badger
+      [[ "$t" == badger ]] && o=lmdb
+      v="Carries the notes of the $t side over into a clean $FLOW_TARGET database; the notes of the $o side stay in the set-aside directory db/.pre-switch-mixed-<time>/ and are not merged. You confirm by typing $FLOW_TARGET." ;;
+    back) v="Back to the main menu." ;;
+  esac
+  while IFS= read -r t; do DETAIL_LINES+=("$t"); done < <(printf '%s\n' "$v" | fold -s -w "$RIGHT_CONTENT_W")
+}
+# tui_flow_end — end of the flow code (see the comment at its start)
 
 # About screen: the distributed version (image tag from the compose file)
 # plus the running relay image digest, best effort without the daemon.
@@ -5716,15 +6991,10 @@ $(cat "$onion_torrc")"
             TUI_NEED_RIGHT=1
           fi
           ;;
-        backup)
-          tui_message "Back up now" "To back up the database, run ./$SCRIPT_NAME backup in a terminal."
-          ;;
-        restore)
-          tui_message "Restore a backup" "To restore a backup, run ./$SCRIPT_NAME restore <file> in a terminal."
-          ;;
-        db_switch)
-          tui_message "Switch engine" "To move the data to the other engine, run ./$SCRIPT_NAME db-switch <badger|lmdb> in a terminal."
-          ;;
+        backup) tui_flow_backup ;;
+        restore) tui_flow_restore ;;
+        db_switch) tui_flow_switch ;;
+        switch_rollback) tui_flow_rollback ;;
         env_upgrade)
           if [[ ! -f "$ROOT_DIR/.env.example" ]]; then
             tui_message "Add missing settings" ".env.example not found."
@@ -5899,6 +7169,19 @@ $(cat "$onion_torrc")"
           ;;
       esac
       ;;
+    restore_list)
+      case "$id" in
+        back) tui_set_view "main" ;;
+        file:*) tui_flow_restore_pick "${id#file:}" ;;
+      esac
+      ;;
+    switch)
+      case "$id" in
+        back) tui_set_view "main" ;;
+        switch) tui_flow_switch_go ;;
+        from:*) tui_flow_switch_go "${id#from:}" ;;
+      esac
+      ;;
     json_files)
       if [[ "$id" == "back" ]]; then
         tui_set_view "main"
@@ -6030,9 +7313,17 @@ tui_handle_key() {
       fi
       ;;
     /)
+      # In the settings list: filter the settings (name and description).
+      if [[ "$TUI_VIEW" == env_list ]]; then
+        local new_settings_filter
+        new_settings_filter="$(tui_prompt "Filter settings:" "")"
+        settings_set_filter "$new_settings_filter"
+        TUI_NEED_LEFT=1
+        return 0
+      fi
       # Live substring filter for the log panel. No default on purpose:
       # an empty Enter must clear the filter instead of re-applying it.
-      if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then
+      if [[ "$TUI_RIGHT_MODE" == "logs" ]] && ! tui_view_has_details; then
         local new_filter
         new_filter="$(tui_prompt "Filter logs:" "")"
         LOG_FILTER="$new_filter"
@@ -6043,7 +7334,10 @@ tui_handle_key() {
       fi
       ;;
     tab)
-      if [[ "$TUI_RIGHT_MODE" == "logs" ]]; then
+      # settings editor: details <-> logs; elsewhere: logs <-> status
+      if tui_view_has_details; then
+        if [[ "$TUI_RIGHT_MODE" == "details" ]]; then TUI_RIGHT_MODE="logs"; else TUI_RIGHT_MODE="details"; fi
+      elif [[ "$TUI_RIGHT_MODE" == "logs" ]]; then
         TUI_RIGHT_MODE="status"
       else
         TUI_RIGHT_MODE="logs"
@@ -6082,7 +7376,28 @@ tui_handle_key() {
       # never fall through to esc/back.
       ;;
   esac
+  # the details pane follows the selection
+  [[ "$TUI_RIGHT_MODE" == "details" ]] && TUI_NEED_RIGHT=1
   return 0
+}
+
+# settings_set_filter <text> — apply (or with "" clear) the settings filter; the
+# selection stays on the same setting when it is still listed, else it is
+# clamped by the next render. The filter never writes .env.
+settings_set_filter() {
+  local keep=""
+  if (( ${#MENU_IDS[@]} > 0 && TUI_SEL < ${#MENU_IDS[@]} )); then keep="${MENU_IDS[$TUI_SEL]}"; fi
+  SETTINGS_FILTER="$1"
+  tui_build_menu
+  TUI_NEED_MENU=0
+  local i
+  for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do
+    if [[ "${MENU_IDS[$i]}" == "$keep" ]]; then TUI_SEL=$i; break; fi
+  done
+  (( i < ${#MENU_IDS[@]} )) || TUI_SEL=0
+  TUI_OFFSET=0
+  TUI_NEED_LEFT=1
+  TUI_NEED_RIGHT=1
 }
 
 # Test seam (see HAVEN_TUI_SYNC_FILE at the top): publish "a render pass has
@@ -6099,6 +7414,13 @@ tui_loop() {
   local start_view="$1"
   local running=1
   local rendered=0
+
+  # A full-screen TUI cannot draw on a terminal without cursor addressing.
+  if [[ "${TERM:-}" == "dumb" || -z "${TERM:-}" ]]; then
+    printf '%s: the TUI needs a terminal that can position the cursor (TERM is "%s"); use the commands instead, e.g. ./%s status, ./%s start, ./%s backup — ./%s help lists them all.\n' \
+      "$SCRIPT_NAME" "${TERM:-}" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" >&2
+    exit 1
+  fi
 
   # Size check BEFORE tui_init touches stty/the alternate screen, so a
   # too-small terminal leaves the shell state untouched.
@@ -6117,6 +7439,7 @@ tui_loop() {
   else
     TUI_VIEW="main"
   fi
+  [[ "$TUI_VIEW" == env_list ]] && TUI_RIGHT_MODE="details"
   TUI_SEL=0
   TUI_OFFSET=0
   TUI_NEED_FRAME=1
@@ -6161,7 +7484,7 @@ tui_loop() {
     fi
 
     _SPINNER_TICK=$((_SPINNER_TICK + 1))
-    if (( _SPINNER_TICK % 4 == 0 && FOLLOW_LOGS == 1 )); then
+    if (( _SPINNER_TICK % 4 == 0 && FOLLOW_LOGS == 1 )) && [[ "$TUI_RIGHT_MODE" != details ]]; then
       # With the 150 ms poll this fires every ~600 ms; draining pulls all
       # buffered lines per tick, so follow-logs stay visibly flowing.
       TUI_NEED_RIGHT=1
@@ -6279,7 +7602,7 @@ menu_logs() {
 menu_json_editor() {
   if [[ "$TUI_ACTIVE" == "1" ]]; then
     if ! detect_json_tool; then
-      tui_message "JSON Editor" "jq or python3 is required for JSON editing."
+      tui_message "Access lists" "Editing the lists needs jq or python3."
       return
     fi
     tui_set_view "json_files"

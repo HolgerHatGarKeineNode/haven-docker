@@ -95,18 +95,24 @@ REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 }
 
 @test "tui_collect_status: parses container states from docker ps -a" {
+  # a sandbox ROOT_DIR: the collection reads .env, db/, blossom/ and backups/
+  local sb
+  sb="$(mktemp -d)"
+  mkdir -p "$sb/db" "$sb/blossom"
+  printf 'RELAY_URL="relay.example.org"\n' > "$sb/.env"
   PATH="$REPO_ROOT/tests/mock:$PATH"
   run bash -c '
     source '"$REPO_ROOT"'/haven
     set +e
-    ROOT_DIR='"$REPO_ROOT"'
+    ROOT_DIR='"$sb"' BACKUP_DIR='"$sb"'/backups
     tui_collect_status
     printf "%s\n" "${TUI_STATUS_CACHE[@]}"
   '
+  rm -rf "$sb"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"haven-relay: running up 2 hours"* ]]
-  [[ "$output" == *"haven-tor: exited"* ]]
-  [[ "$output" == *"image: sha256:abcdef123456789…"* ]]
-  [[ "$output" == *"db/:"* ]]
-  [[ "$output" == *"blossom/:"* ]]
+  [[ "$output" == *"Container|haven-relay: running, up 2 hours"* ]]
+  [[ "$output" == *"Container|haven-tor: stopped"* ]]
+  [[ "$output" == *"Image|"*", sha256:abcdef123456"* ]]
+  [[ "$output" == *"Database|"*", db/ "* ]]
+  [[ "$output" == *"Media|blossom/ "* ]]
 }

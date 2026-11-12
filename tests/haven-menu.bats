@@ -174,17 +174,20 @@ TRACE_STUBS='
   [ -z "$bad" ]
 }
 
-@test "menu: the data entries name their CLI command in one sentence" {
+@test "menu: the data entries open their guided flows" {
+  # Back up asks first; Restore with no backups/ names the backup command;
+  # Switch engine opens its overview. Nothing runs without a confirmation.
   run in_haven "$TRACE_STUBS"'
+    tui_flow_run() { echo "run[$*]"; }
     for l in "Back up now" "Restore a backup" "Switch engine"; do
       for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_LABELS[$i]}" == "$l" ]] && TUI_SEL=$i; done
       tui_handle_enter
     done'
   [ "$status" -eq 0 ]
   echo "$output"
-  [[ "$output" == "message[Back up now|To back up the database, run ./haven backup in a terminal.]
-message[Restore a backup|To restore a backup, run ./haven restore <file> in a terminal.]
-message[Switch engine|To move the data to the other engine, run ./haven db-switch <badger|lmdb> in a terminal.]" ]]
+  [[ "$output" == "confirm[Back up now? The relay is offline while the backup runs; the file goes to backups/ in this directory.]
+message[Restore a backup|There is no backup in backups/ yet. Make one with Back up now, or with ./haven backup in a terminal.]
+view[switch]" ]]
 }
 
 @test "menu: the relay state behind Relay drops whole fields from the right instead of cutting a word" {
