@@ -624,6 +624,7 @@ section "11 masking and validation"
 # the entry); it lives in the sandbox like everything else.
 new_sandbox t11
 printf 'RELAY_URL="relay.example.org"\nTEST_SECRET_KEY=abcdefgh1234\n' > "$SB/.env"
+mkdir -p "$SB/db/private" && printf 'fake\n' > "$SB/db/private/MANIFEST"
 env_hash_t11="$(sha256sum "$SB/.env" | cut -d' ' -f1)"
 start_pane t11 100 30 "$SB" './haven tui'
 if ! wait_for t11 "Dashboard"; then
@@ -681,6 +682,30 @@ else
     ok "Escape closes the value prompt (the keys reach the list again)"
   else
     bad "Escape did not close the value prompt ($(capture t11 | grep -m1 'New value' | head -c 60))"
+  fi
+  # DB_ENGINE away from the engine of the data in db/ is refused at the prompt
+  # and names the db-switch that moves the data (the sandbox db/ holds badger)
+  wait_for t11 "Add variable"
+  send_settled t11 Home   # prompt_cancelled moved down; goto_item only walks down
+  goto_item t11 "Add variable"
+  tmx send-keys -t t11 Enter
+  wait_for t11 "New key"
+  tmx send-keys -t t11 -l "DB_ENGINE"
+  wait_for t11 "DB_ENGINE"
+  tmx send-keys -t t11 Enter
+  wait_for t11 "New value"
+  tmx send-keys -t t11 -l "lmdb"
+  wait_for t11 "lmdb"
+  tmx send-keys -t t11 Enter
+  if wait_for t11 "use ./haven db-switch lmdb"; then
+    ok "DB_ENGINE flip against the data on disk is refused inline, naming db-switch lmdb"
+  else
+    bad "DB_ENGINE flip not refused inline ($(capture t11 | tr '\n' '|' | head -c 200))"
+  fi
+  if prompt_cancelled t11 "New value"; then
+    ok "Escape closes the refused DB_ENGINE prompt"
+  else
+    bad "Escape did not close the refused DB_ENGINE prompt"
   fi
 fi
 kill_pane t11
