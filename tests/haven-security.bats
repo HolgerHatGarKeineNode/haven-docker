@@ -507,6 +507,111 @@ TABLE
   [ "${lines[4]}" = "2" ]
 }
 
+# --- R1: a captured write never runs the parent's (the TUI's) trap actions ---
+# `trap -p` in a subshell lists the parent's traps; the writer guard saved and
+# put back that list, and the subshell's exit ran the TUI's EXIT action (stty
+# on the live terminal). Each parent action appends its name and the pid it
+# runs in to a marker file; only lines from another pid than the parent count
+# (bash itself runs the parent's INT trap when a child dies of SIGINT).
+R1_PARENT_TRAPS='m="$S/ran"; : > "$m"; parent=$BASHPID
+    for s in EXIT INT TERM HUP; do trap "echo $s \$BASHPID >> \"\$m\"" "$s"; done
+    in_subshells() { grep -vc " $parent\$" "$m"; }'
+
+@test "R1: a captured set_env_var/remove_env_var runs none of the parent's EXIT/INT/TERM/HUP actions in its subshell" {
+  printf 'A=1\n' > "$SB/.env"
+  run in_haven "$R1_PARENT_TRAPS"'
+    write_then() { set_env_var B "$RANDOM" || return 9; kill -s "$1" "$BASHPID"; }
+    run_capture set_env_var B 2; echo "set status=$RUN_STATUS"
+    run_capture remove_env_var B; echo "remove status=$RUN_STATUS"
+    for s in INT TERM HUP; do run_capture write_then "$s"; echo "$s status=$RUN_STATUS"; done
+    echo "parent actions run in the subshells: $(in_subshells)"
+    trap -p EXIT | grep -c "echo EXIT"; cat "$m"'
+  echo "$output"
+  [ "${lines[0]}" = "set status=0" ]
+  [ "${lines[1]}" = "remove status=0" ]
+  [ "${lines[2]}" = "INT status=130" ]
+  [ "${lines[3]}" = "TERM status=143" ]
+  [ "${lines[4]}" = "HUP status=129" ]
+  [ "${lines[5]}" = "parent actions run in the subshells: 0" ]
+  [ "${lines[6]}" = "1" ]   # the parent's own EXIT trap is still in place
+}
+
+@test "R1: ensure_docker_uid writing inside a captured prepare runs none of the parent's trap actions" {
+  printf 'A=1\n' > "$SB/.env"
+  run in_haven "$R1_PARENT_TRAPS"'
+    run_capture tui_prepare_start_quiet; echo "status=$RUN_STATUS"
+    grep -c "^DOCKER_[UG]ID=" "$S/.env"
+    echo "parent actions run in the subshell: $(in_subshells)"; cat "$m"'
+  echo "$output"
+  [ "${lines[0]}" = "status=0" ]
+  [ "${lines[1]}" = "2" ]
+  [ "${lines[2]}" = "parent actions run in the subshell: 0" ]
+}
+
+@test "R1: run_capture keeps an ignored signal ignored (that disposition is inherited)" {
+  run in_haven '
+    trap "" INT
+    run_capture trap -p INT; echo "[$RUN_OUTPUT]"
+    run_capture trap -p EXIT TERM HUP; echo "[$RUN_OUTPUT]"'
+  echo "$output"
+  [ "${lines[0]}" = "[trap -- '' SIGINT]" ]
+  [ "${lines[1]}" = "[]" ]
+}
+
+@test "R1: the TUI's EXIT and INT/TERM actions do nothing in a subshell, even when a write there armed them" {
+  printf 'A=1\n' > "$SB/.env"
+  run in_haven '
+    m="$S/ran"; : > "$m"
+    tui_cleanup() { echo "cleanup in $BASHPID" >> "$m"; }
+    tui_restore_tty() { echo "restore in $BASHPID" >> "$m"; }
+    TUI_PID=$BASHPID; trap tui_on_exit EXIT; trap tui_on_signal INT TERM
+    ( set_env_var B 2 ); echo "plain subshell rc=$?"
+    ( set_env_var B 3; kill -TERM $BASHPID ); echo "signalled subshell rc=$?"
+    echo "actions in subshells: $(grep -c "" "$m")"
+    tui_on_exit; grep -c "in $BASHPID\$" "$m"'
+  echo "$output"
+  [ "${lines[0]}" = "plain subshell rc=0" ]
+  [ "${lines[1]}" = "signalled subshell rc=130" ]
+  [ "${lines[2]}" = "actions in subshells: 0" ]
+  [ "${lines[3]}" = "2" ]   # in the TUI's own process they still act
+}
+
+# --- R2: no default-action window while the writer guard puts the traps back ---
+# A `trap` stand-in (a shell function shadowing the builtin, defined only in
+# the test) passes every call through and, on the k-th call made from
+# writer_guard_off, sends one TERM to the process right after it. Every k from
+# 1 to the number of calls is run, so the TERM lands at every point between the
+# restore steps. Before the fix the first call was `trap - EXIT INT TERM HUP`,
+# and a TERM there got the default action.
+R2_TRAP_STANDIN='N=0
+    trap() {
+      builtin trap "$@"; local rc=$?
+      if [[ "${FUNCNAME[1]:-}" == writer_guard_off ]]; then
+        N=$((N + 1)); (( N != K )) || { echo sent >> "$S/sent"; kill -TERM "$BASHPID"; }
+      fi
+      return "$rc"
+    }'
+
+@test "R2: a TERM at any point while the writer guard restores the traps runs the outer handler, and no temp file stays" {
+  local k
+  for k in 1 2 3 4; do   # four restore steps: EXIT, INT, TERM, HUP
+    printf 'A=1\n' > "$SB/.env"; rm -f "$SB/sent" "$SB/outer"
+    run in_haven 'K='"$k"'
+      builtin trap "echo OUTER >> \"\$S/outer\"" TERM
+      '"$R2_TRAP_STANDIN"'
+      set_env_var B 2; echo "rc=$?"; unset -f trap
+      echo "after the write"'
+    echo "k=$k status=$status sent=$(cat "$SB/sent" 2>/dev/null) outer=$(grep -c "" "$SB/outer" 2>/dev/null) $output"
+    [ -e "$SB/sent" ]
+    [ "$status" -eq 0 ]
+    [ "$output" = "rc=0
+after the write" ]
+    [ "$(grep -c "" "$SB/outer")" -eq 1 ]
+    [ -z "$(find "$SB" -maxdepth 1 \( -name '.env.pre.*' -o -name '.env.tmp.*' \) -print -quit)" ]
+    grep -qx 'B=2' "$SB/.env"
+  done
+}
+
 @test "D5: run_capture runs with TUI_ACTIVE=0: a die inside does not run tui_cleanup, the error is in the output" {
   run in_haven '
     TUI_ACTIVE=1

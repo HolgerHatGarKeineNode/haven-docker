@@ -466,8 +466,26 @@ tui_init() {
   # modes it saved AFTER the INT/TERM trap's stty — the shell was left
   # -icanon -echo (measured in tmux, stty -g before/after). The EXIT trap runs
   # once the read has unwound.
-  trap 'tui_cleanup; tui_restore_tty' EXIT
-  trap 'tui_cleanup; exit 130' INT TERM
+  TUI_PID="$BASHPID"
+  trap tui_on_exit EXIT
+  trap tui_on_signal INT TERM
+}
+
+# tui_on_exit / tui_on_signal — the TUI's EXIT and INT/TERM actions; they act
+# only in the TUI's own process. A subshell lists the parent's traps under
+# `trap -p` without them being in force, and a writer guard that saved and put
+# back that list armed them there: the subshell's exit then ran stty with the
+# pre-TUI modes on the live terminal (echo on under the running TUI).
+TUI_PID=""
+tui_on_exit() {
+  [[ "$BASHPID" == "$TUI_PID" ]] || return 0
+  tui_cleanup
+  tui_restore_tty
+}
+
+tui_on_signal() {
+  [[ "$BASHPID" != "$TUI_PID" ]] || tui_cleanup
+  exit 130
 }
 
 # tui_restore_tty — the terminal modes from before tui_init, by name (stdin may
@@ -1684,14 +1702,20 @@ env_write_check() {
 # exit meanwhile (errexit) removes both first and then runs the previous EXIT
 # trap. Measured on 4c29cf3: 10 of 60 SIGTERMs left a .env.pre.* behind, a full
 # copy of .env.
-WG_SAVED=""
+WG_SAVED_EXIT=""
+WG_SAVED_INT=""
+WG_SAVED_TERM=""
+WG_SAVED_HUP=""
 WG_SIG=""
 WG_SNAP=""
 writer_guard_on() {
   local exit_action=""
-  WG_SAVED="$(trap -p EXIT INT TERM HUP)"
+  WG_SAVED_EXIT="$(trap -p EXIT)"
+  WG_SAVED_INT="$(trap -p INT)"
+  WG_SAVED_TERM="$(trap -p TERM)"
+  WG_SAVED_HUP="$(trap -p HUP)"
   WG_SIG="" WG_SNAP="" REPLACE_TMP=""
-  trap_action_of "$(trap -p EXIT)"
+  trap_action_of "$WG_SAVED_EXIT"
   exit_action="$_TRAP_ACTION"
   # shellcheck disable=SC2064  # the previous EXIT action is meant to be expanded now
   trap "writer_guard_clean; $exit_action" EXIT
@@ -1717,14 +1741,29 @@ writer_guard_clean() {
 }
 
 writer_guard_off() {
-  local sig
+  local sig saved
   writer_guard_clean
-  trap - EXIT INT TERM HUP
-  eval "$WG_SAVED"
+  # each signal goes straight from the guard's handler to the trap saved for
+  # it, never through the default action: a TERM between a `trap -` and the
+  # restore killed the process there (db-switch step 5: no rollback). Only a
+  # signal without a saved trap goes back to the default.
+  for sig in EXIT INT TERM HUP; do
+    case "$sig" in
+      EXIT) saved="$WG_SAVED_EXIT" ;;
+      INT) saved="$WG_SAVED_INT" ;;
+      TERM) saved="$WG_SAVED_TERM" ;;
+      *) saved="$WG_SAVED_HUP" ;;
+    esac
+    if [[ -n "$saved" ]]; then
+      eval "$saved"
+    else
+      trap - "$sig"
+    fi
+  done
   # read only now: a signal held until here is in WG_SIG, a later one already
   # met the trap put back above
   sig="$WG_SIG"
-  WG_SAVED="" WG_SIG=""
+  WG_SAVED_EXIT="" WG_SAVED_INT="" WG_SAVED_TERM="" WG_SAVED_HUP="" WG_SIG=""
   [[ -z "$sig" ]] || kill -s "$sig" "$BASHPID" 2>/dev/null || true
 }
 
@@ -1815,9 +1854,17 @@ set_env_var_write() {
 # failures itself. TUI_ACTIVE=0 in the subshell: a die in a captured action
 # ends only the subshell and leaves the running TUI's terminal alone (no
 # tui_cleanup: no stty reset, no rmcup, bracketed paste stays on); the caller
-# shows the output, the error included.
+# shows the output, the error included. The parent's EXIT/INT/TERM/HUP traps
+# are cleared first: `trap -p` in a subshell lists them although they are not
+# in force, and a writer guard (set_env_var) that put that list back armed the
+# TUI's EXIT action in here — the subshell's exit reset the live terminal. An
+# ignored signal stays ignored: that disposition is inherited for real.
 run_capture_child() {
+  local sig
   TUI_ACTIVE=0
+  for sig in EXIT INT TERM HUP; do
+    [[ "$(trap -p "$sig")" == "trap -- '' "* ]] || trap - "$sig"
+  done
   "$@"
 }
 

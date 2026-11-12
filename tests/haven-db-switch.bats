@@ -1459,6 +1459,53 @@ SH
   [ "$(result_line)" = "::result ok" ]
 }
 
+# R2: a `trap` stand-in, loaded into the ./haven process through BASH_ENV (no
+# change to the script): every call passes through to the builtin, and the
+# k-th call that writer_guard_off makes inside step 5 (dbs_set_engine) is
+# followed by one TERM to the process. Before the fix the first such call was
+# `trap - EXIT INT TERM HUP`, and the TERM killed the switch with no rollback.
+@test "R2 SIGTERM at each restore step of the step-5 .env write: rolled back, relay running, DB_ENGINE and disk agree, no marker" {
+  cat > "$TEST_DIR/trap-standin.sh" <<'SH'
+trap() {
+  builtin trap "$@"
+  local rc=$? IFS=" "   # ./haven sets IFS to newline and tab
+  if [[ "${FUNCNAME[1]:-}" == writer_guard_off && " ${FUNCNAME[*]} " == *" dbs_set_engine "* ]]; then
+    HV_N=$((${HV_N:-0} + 1))
+    if ((HV_N == HV_K)); then
+      echo "sent bashpid=$BASHPID main=$$" >> "$HV_SENT"
+      kill -TERM "$BASHPID"
+    fi
+  fi
+  return "$rc"
+}
+SH
+  local k st
+  for k in 1 2 3 4; do
+    rm -rf "$SB/db" "$SB/backups" "$TEST_DIR/sent" "$MOCK_DOCKER_STATE_DIR"
+    mkdir -p "$SB/db" "$MOCK_DOCKER_STATE_DIR"; mkdir -m 700 "$SB/backups"
+    printf '*\n!.gitignore\n' > "$SB/db/.gitignore"
+    fake_engine badger
+    relay_running
+    snapshot
+    st=0
+    BASH_ENV="$TEST_DIR/trap-standin.sh" HV_K="$k" HV_SENT="$TEST_DIR/sent" \
+      "$SB/haven" db-switch lmdb --yes </dev/null >"$TEST_DIR/out" 2>&1 || st=$?
+    output="$(cat "$TEST_DIR/out")"
+    echo "k=$k rc=$st $(cat "$TEST_DIR/sent" 2>/dev/null)"; echo "$output"
+    [ -e "$TEST_DIR/sent" ]
+    grep -qE '^sent bashpid=([0-9]+) main=\1$' "$TEST_DIR/sent"
+    [ "$st" -eq 143 ]
+    grep -q 'Received SIGTERM during the engine switch' "$TEST_DIR/out"
+    relay_is_running
+    [ ! -e "$SB/db/.switch-in-progress" ]
+    [ "$(env_engine)" = badger ] && [ "$(disk_engine)" = badger ]
+    originals_in_place
+    [ "$(result_line)" = "::result rolled-back" ]
+    [ -z "$(find "$SB" -maxdepth 1 \( -name '.env.pre.*' -o -name '.env.tmp.*' \) -print -quit)" ]
+    nothing_lost
+  done
+}
+
 @test "A5 late failure without a rollback (start fails, marker cannot be written): the message says db/ holds the new database, and --rollback brings the old one back" {
   [ "$(id -u)" -ne 0 ] || skip "uid 0 writes into a read-only directory"
   fake_engine badger

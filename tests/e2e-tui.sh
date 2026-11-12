@@ -19,6 +19,8 @@
 #          refused write, failing writer), Ctrl-C while the result box lays
 #          out, die inside a captured action, OSC in the log pane, terminal
 #          modes after q / Ctrl-C / SIGTERM
+#   31. terminal modes (ECHO, ICANON) sampled while a setting is saved, and a
+#       key typed right after it (python3; skipped without it)
 #
 # Isolation (enforced here, not requested): every check runs in its OWN copy of
 # the repository's tracked files under a temp dir, with .env.example as .env, a
@@ -2294,6 +2296,110 @@ for t30 in q ctrlc term; do
   expect_calls "t30$t30" "terminal modes ($t30): no state-changing docker call"
   kill_pane "t30$t30"
 done
+
+# --- 31: terminal modes while a setting is saved (R1) -------------------------
+# The writer ran inside a captured subshell, put the TUI's traps back there, and
+# the subshell's exit ran the TUI's EXIT action: stty with the pre-TUI modes on
+# the live terminal (ECHO and ICANON on; the read builtin turns echo off only
+# while it waits for a key). tests/pty-modes.py samples ECHO and ICANON of the
+# pane's tty from outside (tcgetattr) while the TUI runs. Keys typed throughout
+# the save must never be echoed by the terminal driver: the pane's raw output
+# (pipe-pane) must not contain the typed character, which the TUI never prints.
+# The raw stream, not the screen: a later frame redraw paints over an echo.
+section "31 terminal modes while a setting is saved (R1)"
+# pty_sample_start <session> <name> / pty_sample_stop <name> — a sampler on the
+# session's pane tty; pty_sample_stop sets PTY_MODES (no command substitution:
+# only the rig's own shell can wait for the sampler)
+pty_sample_start() {
+  local tty
+  tty="$(tmx display -p -t "$1" '#{pane_tty}')"
+  rm -f "$WORK/$2.stop" "$WORK/$2.modes"
+  python3 -I "$ROOT_DIR/tests/pty-modes.py" "$tty" "$WORK/$2.modes" "$WORK/$2.stop" 120 2>"$WORK/$2.err" &
+  PTY_SAMPLER_PID=$!
+}
+pty_sample_stop() {
+  : > "$WORK/$1.stop"
+  wait "$PTY_SAMPLER_PID" 2>/dev/null
+  PTY_SAMPLER_PID=""
+  PTY_MODES="$(cat "$WORK/$1.modes" 2>/dev/null)" || PTY_MODES="no result ($(head -c 120 "$WORK/$1.err" 2>/dev/null))"
+}
+mode_count() { local n; n="$(sed -n "s/.*$2=\([0-9]*\).*/\1/p" <<<"$1")"; printf '%s' "${n:-0}"; }
+pipe_raw() { tmx pipe-pane -o -t "$1" "cat >> $(printf '%q' "$WORK/$1.raw")"; }
+T31_KEY='§'
+key_echoes() { grep -o "$T31_KEY" "$WORK/$1.raw" 2>/dev/null | wc -l; }
+if ! command -v python3 >/dev/null 2>&1; then
+  say "SKIP: 31 terminal modes: python3 not found"
+else
+  # positive control: a plain shell pane is cooked (ECHO and ICANON set), and a
+  # key typed into it is echoed by the terminal driver into the raw stream
+  new_sandbox t31c
+  SYNC=0 start_pane t31c 80 24 "$SB" 'echo control-ready; sleep 60'
+  if wait_for t31c "control-ready"; then
+    pipe_raw t31c
+    pty_sample_start t31c t31c
+    sleep 0.3
+    tmx send-keys -t t31c -l "$T31_KEY$T31_KEY$T31_KEY"
+    wait_for t31c "$T31_KEY$T31_KEY$T31_KEY"
+    pty_sample_stop t31c
+    tmx pipe-pane -t t31c
+    if (( $(mode_count "$PTY_MODES" samples) > 50 && $(mode_count "$PTY_MODES" echo) > 0 && $(mode_count "$PTY_MODES" icanon) > 0 && $(key_echoes t31c) >= 3 )); then
+      ok "control: the sampler sees ECHO and ICANON on a plain shell pane ($PTY_MODES), typed keys are echoed there ($(key_echoes t31c) in the raw stream)"
+    else
+      bad "control: plain shell pane [$PTY_MODES], echoes in the raw stream: $(key_echoes t31c)"
+    fi
+  else
+    bad "control: the plain shell pane did not start"
+  fi
+  kill_pane t31c
+
+  T31_DOWN="compose -f SB/docker-compose.yml down --remove-orphans"
+  T31_UP="compose -f SB/docker-compose.yml up -d --build"
+  new_sandbox t31
+  seed_jsons "$SB"
+  start_pane t31 120 30 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr'
+  if ! wait_for t31 "▸ s Start"; then
+    bad "terminal modes during a save: TUI did not start"
+  else
+    settle_after t31 "$(sync_n t31)"
+    pty_sample_start t31 t31
+    t31_arm() { pipe_raw t31; }
+    if save_setting t31 '"Renamed relay"' t31_arm; then
+      # keys right behind the Enter, 25 ms apart, through the save, the restart,
+      # the result box (the first key read dismisses it) and the settings view
+      # loading again
+      for ((t31_i = 0; t31_i < 60; t31_i++)); do
+        tmx send-keys -t t31 -l "$T31_KEY"
+        sleep 0.025
+      done
+      settle_after t31 "$(sync_n t31)"
+      left_has t31 ".env was saved" && send_settled t31 x
+      wait_for t31 "Edit value"
+      settle_after t31 "$(sync_n t31)"
+      pty_sample_stop t31
+      tmx pipe-pane -t t31
+      if (( $(mode_count "$PTY_MODES" samples) > 50 )) && [[ "$(mode_count "$PTY_MODES" echo)" == 0 && "$(mode_count "$PTY_MODES" icanon)" == 0 ]]; then
+        ok "terminal modes during and after a save: ECHO and ICANON never set while the TUI runs ($PTY_MODES)"
+      else
+        bad "terminal modes during and after a save: $PTY_MODES"
+      fi
+      if [[ -s "$WORK/t31.raw" ]] && (( $(key_echoes t31) == 0 )) && tui_pid_found t31; then
+        ok "60 keys typed right after the save: none echoed onto the frame ($(wc -c < "$WORK/t31.raw") bytes of pane output read)"
+      else
+        bad "keys typed right after the save: $(key_echoes t31) of 60 echoed onto the frame ($(wc -c < "$WORK/t31.raw" 2>/dev/null) bytes of pane output)"
+      fi
+      grep -qx 'PRIVATE_RELAY_NAME="Renamed relay"' "$SB/.env" && grep -q '^DOCKER_UID=' "$SB/.env" \
+        && ok "the save and the captured preparation wrote .env (PRIVATE_RELAY_NAME, DOCKER_UID)" \
+        || bad "the save or the captured preparation did not reach .env"
+      [[ ! -s "$SB/.rig/stderr" ]] && ok "terminal modes during a save: TUI stderr empty" || bad "terminal modes during a save: stderr $(head -c 160 "$SB/.rig/stderr" | tr '\n' '|')"
+    else
+      pty_sample_stop t31
+      bad "terminal modes during a save: PRIVATE_RELAY_NAME's Edit value not reachable [$PTY_MODES]"
+    fi
+  fi
+  [[ -z "${PTY_SAMPLER_PID:-}" ]] || pty_sample_stop t31
+  expect_calls t31 "terminal modes during a save: down, then up" "$T31_DOWN" "$T31_UP"
+  kill_pane t31
+fi
 
 section "21 leftovers"
 new_sandbox t21
