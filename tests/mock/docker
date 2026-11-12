@@ -14,6 +14,8 @@
 #   started     touched by a held `run`, release: touch `release` to let it go
 # Knobs (environment):
 #   MOCK_STOP_FAILS=1   `compose stop` returns 0 but leaves `running` untouched
+#   MOCK_STOP_SLEEP=<s> `compose stop` sleeps <s> seconds first (a slow stop, so
+#                       a signal can land while it runs)
 #   MOCK_START_FAILS=1  `compose start|up|restart` exit 1 and leave `running`
 #                       untouched (a relay that does not come back)
 #   MOCK_RUN_EXIT=<n>   exit status of every `compose run` (default 0)
@@ -119,6 +121,7 @@ mock_scripted() {
       exit 0
       ;;
     stop)
+      [[ -z "${MOCK_STOP_SLEEP:-}" ]] || sleep "$MOCK_STOP_SLEEP"
       if [[ "${MOCK_STOP_FAILS:-0}" != "1" ]]; then
         if [[ -s "$d/running" ]]; then
           cat "$d/running" >> "$d/exited"

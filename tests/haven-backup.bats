@@ -51,7 +51,8 @@ SH
   export MOCK_DOCKER_STATE_DIR="$TEST_DIR/state"
   mkdir -p "$MOCK_DOCKER_STATE_DIR"
   unset MOCK_STOP_FAILS MOCK_RUN_EXIT MOCK_FAIL_AT MOCK_RUN_WRITES MOCK_RUN_HOLD \
-    MOCK_HOLD_MAX MOCK_RUN_PAYLOAD MOCK_RUN_PAYLOAD_FILE HAVEN_HOST_UNZIP
+    MOCK_HOLD_MAX MOCK_RUN_PAYLOAD MOCK_RUN_PAYLOAD_FILE HAVEN_HOST_UNZIP \
+    MOCK_START_FAILS MOCK_STOP_SLEEP
   export HAVEN_CONTAINER_NAME=havenbk-relay
 }
 
@@ -576,4 +577,214 @@ PY
   [ "$status" -ne 0 ]
   [[ "$output" == *"  ?[2Jraw.zip"* ]]
   [[ "$output" != *$'\e'* ]]
+}
+
+# ---------- second security audit: N1, N2 and the start-path gap ----------
+
+# ignored_bit <pid> <signal number> — 0 when the signal is NOT ignored by <pid>
+ignored_bit() {
+  local mask
+  mask="$(awk '/^SigIgn:/ {print $2}' "/proc/$1/status")"
+  [ -n "$mask" ] || return 2
+  printf '%d\n' $(( (16#$mask >> ($2 - 1)) & 1 ))
+}
+
+# pty_case <hangup|kill> <verb args...> — ./haven as session leader of a fresh
+# pty (tests/pty-hangup.py) with a held one-shot; leaves the fixture's verdict
+# ("exit <n>" or "signal <n>") in PTY_ST and the output in $TEST_DIR/pty.out.
+pty_case() {
+  local mode="$1"
+  shift
+  rm -f "$MOCK_DOCKER_STATE_DIR/started" "$MOCK_DOCKER_STATE_DIR/release"
+  : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+  relay_running
+  export MOCK_RUN_HOLD=1 MOCK_HOLD_MAX=20
+  PTY_ST="$(python3 -I "$REPO_ROOT/tests/pty-hangup.py" "$mode" "$MOCK_DOCKER_STATE_DIR" "$TEST_DIR/pty.out" "$SB/haven" "$@")"
+  echo "pty $mode $*: $PTY_ST"
+  cat "$TEST_DIR/pty.out"
+  echo
+  calls
+}
+
+@test "N1: terminal hangup during the held backup: one-shot stopped, relay restarted (control: SIGHUP, terminal open)" {
+  command -v python3 >/dev/null 2>&1 || skip "python3 is required for the pty fixture (tests/pty-hangup.py)"
+  good_payload
+  # control: the same signal on a terminal that still works — proves the
+  # fixture delivers SIGHUP to ./haven and reads its output
+  pty_case kill backup c.zip
+  [ "$PTY_ST" = "signal 1" ]
+  relay_is_running
+  stopped_before_restart
+  grep -q 'Received SIGHUP during the backup' "$TEST_DIR/pty.out"
+  grep -q 'INFO.* The relay is running\.' "$TEST_DIR/pty.out"   # colours: it is a tty
+  # the hangup: SIGHUP, and every write to the terminal fails with EIO
+  pty_case hangup backup h.zip
+  [ "$PTY_ST" = "signal 1" ]
+  relay_is_running
+  stopped_before_restart
+}
+
+@test "N1: terminal hangup during the held restore and the held import: relay restarted" {
+  command -v python3 >/dev/null 2>&1 || skip "python3 is required for the pty fixture (tests/pty-hangup.py)"
+  cp "$FIXTURES/good.zip" "$SB/backups/good.zip"
+  pty_case hangup restore good.zip --yes
+  [ "$PTY_ST" = "signal 1" ]
+  relay_is_running
+  stopped_before_restart
+  pty_case hangup import
+  [ "$PTY_ST" = "signal 1" ]
+  relay_is_running
+  stopped_before_restart
+}
+
+# Ctrl-C with the output going through a pipe: the terminal sends SIGINT to the
+# whole foreground group, so the reader (cat) dies together with the signal and
+# every write of the handler to stdout hits a closed pipe. The launcher resets
+# SIGINT and SIGPIPE to their defaults, makes itself a group leader, forks the
+# reader into that group and execs ./haven (same pid) with stdout on the pipe.
+@test "N1: SIGINT to the process group while stdout goes through a pipe whose reader dies: relay restarted, exit 130" {
+  relay_running
+  good_payload
+  export MOCK_RUN_HOLD=1 MOCK_HOLD_MAX=20
+  python3 -I -c '
+import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+os.setsid()
+r, w = os.pipe()
+if os.fork() == 0:
+    os.dup2(r, 0); os.close(r); os.close(w)
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.dup2(fd, 1)
+    os.execvp("cat", ["cat"])
+os.close(r); os.dup2(w, 1); os.close(w)
+os.execv(sys.argv[2], sys.argv[2:])
+' "$TEST_DIR/piped" "$SB/haven" backup p.zip </dev/null 2>"$TEST_DIR/err" &
+  local pid=$! st=0 reader
+  wait_started
+  [ "$(ignored_bit "$pid" 2)" = 0 ]    # SIGINT reaches ./haven
+  [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]
+  reader="$(pgrep -P "$pid" -x cat)"
+  [ -n "$reader" ]
+  # ./haven itself ignores SIGPIPE by now (the guard); the reader was forked
+  # after the launcher's reset, so its mask shows what ./haven started with
+  [ "$(ignored_bit "$reader" 13)" = 0 ]
+  [ "$(ignored_bit "$reader" 2)" = 0 ]
+  kill -s INT -- -"$pid"
+  wait "$pid" || st=$?
+  echo "exit $st"; cat "$TEST_DIR/piped" "$TEST_DIR/err"; calls
+  ! kill -0 "$reader" 2>/dev/null      # the reader is gone
+  [ "$st" -eq 130 ]
+  relay_is_running
+  stopped_before_restart
+}
+
+# No signal at all: the reader goes away while the one-shot runs, and the
+# one-shot then ends normally. Decided exit status: 141. Inside the guarded
+# window SIGPIPE is ignored, so the relay restart cannot be cut short; after the
+# window the disposition is the default again and the next write ends ./haven
+# by SIGPIPE, as any command writing into a closed pipe does — the caller learns
+# that output was lost. The backup itself is complete by then (verified,
+# renamed), and the relay runs.
+@test "N1: the output reader goes away while the one-shot runs, no signal: relay restarted, backup complete, exit 141" {
+  relay_running
+  good_payload
+  export MOCK_RUN_HOLD=1 MOCK_HOLD_MAX=20
+  mkfifo "$TEST_DIR/fifo"
+  cat "$TEST_DIR/fifo" > "$TEST_DIR/piped" &
+  local rpid=$!
+  python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGPIPE, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' \
+    "$SB/haven" backup g.zip </dev/null >"$TEST_DIR/fifo" 2>"$TEST_DIR/err" &
+  local pid=$! st=0
+  wait_started
+  # (SIGPIPE cannot be checked here: ./haven ignores it inside the guard; the
+  # exit status 141 asserted below needs the default disposition on entry)
+  kill -KILL "$rpid"
+  wait "$rpid" || true
+  : > "$MOCK_DOCKER_STATE_DIR/release"
+  wait "$pid" || st=$?
+  echo "exit $st"; cat "$TEST_DIR/piped" "$TEST_DIR/err"; calls
+  relay_is_running
+  local r t
+  r="$(line_of " run .* $BK")"
+  t="$(line_of ' start relay$')"
+  [ -n "$r" ] && [ -n "$t" ] && (( r < t ))
+  cmp "$FIXTURES/good.zip" "$SB/backups/g.zip"
+  [ "$st" -eq 141 ]
+}
+
+# TERM while `compose stop relay` is still running (a 2 s stop): the trap fires
+# when the stop returns, inside relay_stop_for_oneshot.
+@test "N2: SIGTERM during a slow relay stop: the handler's messages reach the original output; with a failing start the NOT-running warning too" {
+  local start_fails
+  for start_fails in 0 1; do
+    : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+    relay_running
+    export MOCK_STOP_SLEEP=2 MOCK_START_FAILS="$start_fails"
+    "$SB/haven" backup s.zip </dev/null >"$TEST_DIR/out" 2>&1 &
+    local pid=$! st=0 i
+    for ((i = 0; i < 100; i++)); do
+      [ -n "$(line_of ' stop relay$')" ] && break
+      sleep 0.05
+    done
+    [ -n "$(line_of ' stop relay$')" ]
+    sleep 0.3
+    kill -s TERM "$pid"
+    wait "$pid" || st=$?
+    echo "MOCK_START_FAILS=$start_fails exit $st"; cat "$TEST_DIR/out"; calls
+    [ "$st" -eq 143 ]
+    [ -z "$(line_of ' run ')" ]
+    grep -q 'Received SIGTERM during the backup' "$TEST_DIR/out"
+    if [ "$start_fails" = 0 ]; then
+      relay_is_running
+      grep -q 'INFO The relay is running\.' "$TEST_DIR/out"
+    else
+      ! relay_is_running
+      grep -q 'The relay did not start again; it is NOT running' "$TEST_DIR/out"
+      grep -q "WARN The relay is NOT running. Start it with './haven start'." "$TEST_DIR/out"
+    fi
+  done
+}
+
+# The TUI menu (Start Docker, Start Tor, Restart) and the restart after an .env
+# edit, driven through the real handlers with the dialogs stubbed. The .env
+# restart runs with errexit active, as inside the TUI: a refusal must not end it.
+@test "gap: TUI Start/Restart and the restart after an .env edit refuse while a one-shot container exists; nothing is started" {
+  relay_running
+  printf 'havenbk-relay-oneshot\n' > "$MOCK_DOCKER_STATE_DIR/exited"
+  run bash -c '
+    source "$1"
+    set +e
+    DOCKER_COMPOSE=(docker compose)
+    TUI_ACTIVE=1 FOLLOW_LOGS=0 TUI_VIEW=main TUI_SEL=0
+    tui_confirm() { return 0; }
+    tui_require_docker() { return 0; }
+    tui_refresh_logs_view() { :; }
+    tui_message() { printf "MESSAGE[%s]\n%s\nEND\n" "$1" "$2"; }
+    for id in start_plain start_tor restart; do
+      MENU_IDS=("$id")
+      echo "== $id"
+      tui_handle_enter
+    done
+    echo "== env"
+    set -e
+    restart_after_env_change
+    echo "env rc=$?"
+  ' _ "$SB/haven"
+  echo "$output"
+  calls
+  [ "$status" -eq 0 ]
+  [ -z "$(grep -E '^compose .* (up|start|down|stop|restart)( |$)' "$MOCK_DOCKER_STATE_DIR/calls.log")" ]
+  local refusal='one-shot container (backup, restore or import) exists: havenbk-relay-oneshot'
+  local id
+  for id in start_plain start_tor restart; do
+    printf '%s\n' "$output" | awk -v id="== $id" '$0 == id {on = 1; next} /^== / {on = 0} on' > "$TEST_DIR/block"
+    grep -q '^MESSAGE\[\(Start\|Restart\)\]$' "$TEST_DIR/block"
+    grep -qF "$refusal" "$TEST_DIR/block"
+  done
+  printf '%s\n' "$output" | awk '$0 == "== env" {on = 1; next} on' > "$TEST_DIR/block"
+  grep -q '^MESSAGE\[Restart\]$' "$TEST_DIR/block"
+  grep -qF '.env was saved; the restart to apply it is skipped.' "$TEST_DIR/block"
+  grep -qF "$refusal" "$TEST_DIR/block"
+  grep -qx 'env rc=0' "$TEST_DIR/block"
 }
