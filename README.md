@@ -267,8 +267,10 @@ works differently from the command line.
 
 - **Settings (.env)** lists your settings in the sections of `.env.example`,
   each with a short name and its current value; the section stays at the top
-  while the list scrolls. Credentials show only their last four characters:
-  keys with a word (split at `_` and at camelCase humps) that ends in KEY,
+  while the list scrolls. Credentials are masked: a value longer than eight
+  characters shows `…` and its last four characters, a shorter one only `…`.
+  A credential is the value of a key with a word (split at `_` and at
+  camelCase humps) that ends in KEY,
   KEYS, TOKEN, SECRET(S), PASSWORD(S), PASSWD, PASS, PASSPHRASE, PW or PWD,
   such as `S3_SECRET_KEY`, `APITOKEN` or `DB_PWD`, or that is NSEC, SK, SEED,
   MNEMONIC, XPRV, MACAROON, RUNE, CREDENTIAL(S), AUTH, AUTHORIZATION, BUNKER,
@@ -366,10 +368,15 @@ Copy those yourself. If you restore the Blossom index without the files in
 `blossom/`, the list entries are there, but downloading them returns 404 until
 the files are back.
 
-A restore adds the events that are missing from the database. It never
-deletes anything and never creates duplicates; events that exist only in the
-database stay. If the database already holds data, `./haven restore` asks
-first. In a script without a terminal, add `--yes`.
+A restore adds the events that are missing from the database and never
+deletes anything; events that exist only in the database stay. Notes that are
+already there are skipped. The media (Blossom) index behaves differently on
+lmdb: restored into a database that already lists a file, `/list/<pubkey>`
+shows that file once more per restore (identical entries; the file itself is
+served as before). On badger, and into an empty database (which is what
+`db-switch` restores into), each file is listed once. If the database already
+holds data, `./haven restore` asks first. In a script without a terminal, add
+`--yes`.
 
 ### Switching the database engine
 

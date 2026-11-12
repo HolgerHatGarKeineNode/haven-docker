@@ -23,8 +23,10 @@ images published so far still show the old text.
   reports success with a truncated zip. The output says what a backup does not
   contain: the media files in `blossom/`, `.env` and the JSON lists
 - `./haven restore <file>` restores a zip from `backups/` after checking it
-  first. It adds the events that are missing and never deletes anything; when
-  the database already holds data it asks first (`--yes` without a terminal)
+  first. It adds the events that are missing and never deletes anything; notes
+  that are already there are skipped, while on lmdb a media (Blossom) index
+  entry that is already there is listed once more per restore. When the
+  database already holds data it asks first (`--yes` without a terminal)
 - `./haven db-switch <badger|lmdb>` moves the data to the other engine: stop,
   verified backup, old directories renamed to `db/.pre-switch-<engine>-<time>/`,
   `DB_ENGINE` set, restore, a second backup compared entry by entry with the
@@ -151,9 +153,11 @@ images published so far still show the old text.
   `.env`: `\n` typed as two characters became a line break on the way to the
   file, so a pasted `"My relay"\nOWNER_NPUB=…` set a second `OWNER_NPUB` that
   Compose used. Values are now written byte for byte (a typed `\n` stays a
-  backslash and an `n`); a value with a control character (line break, tab,
-  escape) is refused for every setting, and so is one that starts with a
-  quote but is not one quoted string; after every write `.env` must have the
+  backslash and an `n`); the prompt drops line breaks, tabs and other control
+  characters from a paste, and a value that still holds one (line break, tab,
+  escape) when it is checked or written is refused for every setting, and so
+  is one that starts with a quote but is not one quoted string; after every
+  write `.env` must have the
   same lines as before (one more for a new setting), or the previous file is
   put back and the write fails
 - A setting that is in `.env` more than once is shown with the value Compose
