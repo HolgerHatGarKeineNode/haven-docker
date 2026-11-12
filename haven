@@ -148,9 +148,15 @@ COMMAND=""
 # backup/restore: the file argument and --yes
 DATA_FILE_ARG=""
 ASSUME_YES=0
+# db-switch: the engine argument (set or not) and --rollback
+DB_SWITCH_ARG=""
+DB_SWITCH_ARG_SET=0
+DB_SWITCH_ROLLBACK=0
 JSON_TOOL=""
 VALIDATION_ERROR=""
 VALIDATION_VALUE=""
+# A valid value that still deserves a word (validate_env_value; DB_ENGINE only)
+VALIDATION_WARNING=""
 RUN_OUTPUT=""
 RUN_STATUS=0
 TUI_ACTIVE=0
@@ -227,6 +233,12 @@ RELAY_CONTAINER="${HAVEN_CONTAINER_NAME:-haven-relay}"
 # a second writer next to the next one.
 ONESHOT_CONTAINER="${RELAY_CONTAINER}-oneshot"
 BACKUP_DIR="$ROOT_DIR/backups"
+# db-switch: present from the moment the old directories start moving until the
+# new layout is final (or rolled back); every start path refuses while it exists.
+DB_SWITCH_MARKER="$ROOT_DIR/db/.switch-in-progress"
+# The five database directories; both engines use the same names.
+DB_ENGINE_DIRS=(private chat outbox inbox blossom)
+DB_ENGINE_DIRS_TEXT="private chat outbox inbox blossom"
 # The five entries of an upstream backup zip, sorted with LC_ALL=C.
 BACKUP_ENTRIES=$'blossom.jsonl\nchat.jsonl\ninbox.jsonl\noutbox.jsonl\nprivate.jsonl'
 # Host unzip used to verify a backup; the image's own unzip is the fallback.
@@ -282,6 +294,11 @@ Commands:
   import              Import old notes once (stops the relay while it runs)
   backup [file]       Back up the database to backups/ (verified zip; stops the relay while it runs)
   restore <file>      Restore a backup from backups/ (adds missing events; stops the relay while it runs)
+  db-switch <badger|lmdb>
+                      Move the database to the other engine: backup, switch, restore, verify
+                      (stops the relay while it runs; the old directories are kept in db/)
+  db-switch --rollback
+                      Finish an interrupted switch's rollback, or undo the last completed switch
   env                 Edit .env (TUI)
   env-upgrade         Add missing vars from .env.example
   json                Open JSON list editor
@@ -296,7 +313,8 @@ Options:
   --no-follow          Logs: do not follow (no -f)
   --no-build           Start/Restart without --build
   --build              Start/Restart with --build (default)
-  -y, --yes            Restore: confirm restoring into a database that holds data
+  -y, --yes            Restore: confirm restoring into a database that holds data;
+                       db-switch: confirm without a terminal prompt
   -h, --help           Show this help
 
 Examples:
@@ -305,6 +323,7 @@ Examples:
   $SCRIPT_NAME import
   $SCRIPT_NAME backup
   $SCRIPT_NAME restore haven-backup-20260101-120000.zip
+  $SCRIPT_NAME db-switch lmdb
   $SCRIPT_NAME logs --service relay --tail 200
   $SCRIPT_NAME json
   $SCRIPT_NAME env
@@ -1369,6 +1388,7 @@ validate_env_value() {
   local provider=""
 
   VALIDATION_ERROR=""
+  VALIDATION_WARNING=""
   VALIDATION_VALUE="$raw"
 
   if [[ -n "$raw" ]]; then
@@ -1424,6 +1444,11 @@ validate_env_value() {
         badger|lmdb) VALIDATION_VALUE="$(wrap_like_raw "$raw" "${value,,}")" ;;
         *) VALIDATION_ERROR="DB_ENGINE must be badger or lmdb."; return 1 ;;
       esac
+      # Measured (plan P1): a flip alone serves 0 events without any warning.
+      db_disk_engine
+      if [[ ( "$DISK_ENGINE" == "badger" || "$DISK_ENGINE" == "lmdb" ) && "$DISK_ENGINE" != "${value,,}" ]]; then
+        VALIDATION_WARNING="db/ holds $DISK_ENGINE data: with DB_ENGINE=${value,,} the relay will appear empty (the data stays on disk but is not served). To move the data, keep DB_ENGINE=$DISK_ENGINE and run './$SCRIPT_NAME db-switch ${value,,}'."
+      fi
       ;;
     LMDB_MAPSIZE)
       if ! is_int "$value"; then
@@ -2170,10 +2195,20 @@ relay_stop_for_oneshot() {
 # own: compose start, compose up -d as the fallback (its output stays visible,
 # it names the reason), then the container check. Compose is called directly
 # for the same reason as in relay_stop_for_oneshot.
+# With ONESHOT_RELAY_RECREATE=1 (db-switch) it is `compose up -d relay` instead:
+# `compose start` restarts the existing container with the environment it was
+# created with, so after a DB_ENGINE change the relay opened the old engine's
+# files in the new directories and served 0 events (measured, P3 real Docker).
+# up -d recreates the container from the current .env when it differs.
+ONESHOT_RELAY_RECREATE=0
 relay_start_again() {
   local compose_file="$1"
-  "${DOCKER_COMPOSE[@]}" -f "$compose_file" start relay >/dev/null 2>&1 \
-    || "${DOCKER_COMPOSE[@]}" -f "$compose_file" up -d || return 1
+  if [[ "$ONESHOT_RELAY_RECREATE" == "1" ]]; then
+    "${DOCKER_COMPOSE[@]}" -f "$compose_file" up -d relay >/dev/null 2>&1 || return 1
+  else
+    "${DOCKER_COMPOSE[@]}" -f "$compose_file" start relay >/dev/null 2>&1 \
+      || "${DOCKER_COMPOSE[@]}" -f "$compose_file" up -d || return 1
+  fi
   relay_container_running
 }
 
@@ -2212,6 +2247,12 @@ ONESHOT_GUARD_FILE=""
 ONESHOT_GUARD_WHAT=""
 ONESHOT_GUARD_PARTIAL=""
 ONESHOT_SAVED_TRAPS=""
+# Optional hooks of a caller that changes more than the relay state (db-switch):
+# ROLLBACK runs after the one-shot is stopped and before the relay restart and
+# must not print (0 = the relay may start); REPORT runs last, best effort, with
+# the "one-shot still running" flag as its argument.
+ONESHOT_GUARD_ROLLBACK=""
+ONESHOT_GUARD_REPORT=""
 
 # Armed BEFORE relay_stop_for_oneshot, so the stop window is covered too; the
 # handler reads ONESHOT_RELAY_WAS_RUNNING, which the stop sets first.
@@ -2220,6 +2261,9 @@ oneshot_guard_on() { # <compose_file> <what>
   ONESHOT_GUARD_WHAT="$2"
   ONESHOT_RELAY_WAS_RUNNING=0
   ONESHOT_GUARD_PARTIAL=""
+  ONESHOT_GUARD_ROLLBACK=""
+  ONESHOT_GUARD_REPORT=""
+  ONESHOT_RELAY_RECREATE=0
   ONESHOT_PID=""
   # The TUI's own INT/TERM trap is put back by oneshot_guard_off.
   ONESHOT_SAVED_TRAPS="$(trap -p INT TERM HUP PIPE)"
@@ -2235,6 +2279,9 @@ oneshot_guard_off() {
     eval "$ONESHOT_SAVED_TRAPS"
   fi
   ONESHOT_PID=""
+  ONESHOT_GUARD_ROLLBACK=""
+  ONESHOT_GUARD_REPORT=""
+  ONESHOT_RELAY_RECREATE=0
 }
 
 # oneshot_run <compose args...> — compose in the background, waited for. Returns
@@ -2257,7 +2304,7 @@ oneshot_run() {
 }
 
 oneshot_on_signal() {
-  local sig="$1" i blocked=0 relay_rc=0
+  local sig="$1" i blocked=0 relay_rc=0 rollback_rc=0
   trap '' INT TERM HUP
   # --- the work: nothing below prints until the relay state is settled ---
   if [[ -n "$ONESHOT_PID" ]] && kill -0 "$ONESHOT_PID" 2>/dev/null; then
@@ -2273,9 +2320,18 @@ oneshot_on_signal() {
     wait "$ONESHOT_PID" 2>/dev/null || true
   fi
   ONESHOT_PID=""
+  # A compose client that died on its own (HUP from a closed terminal) leaves
+  # the container running: stop it whenever docker lists it, whatever became of
+  # the client.
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
+    docker stop -t 10 "$ONESHOT_CONTAINER" >/dev/null 2>&1 || true
+  fi
 
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
     blocked=1
+  elif [[ -n "$ONESHOT_GUARD_ROLLBACK" ]] && ! "$ONESHOT_GUARD_ROLLBACK"; then
+    # the caller's own undo (db-switch) did not finish: start nothing
+    rollback_rc=1
   elif [[ "$ONESHOT_RELAY_WAS_RUNNING" == "1" ]]; then
     relay_start_again "$ONESHOT_GUARD_FILE" || relay_rc=1
   fi
@@ -2297,8 +2353,13 @@ oneshot_on_signal() {
   fi
   if relay_container_running; then
     info "The relay is running." || true
-  else
+  elif [[ "$rollback_rc" -eq 0 ]]; then
     warn "The relay is NOT running. Start it with './$SCRIPT_NAME start'." || true
+  else
+    warn "The relay is NOT running." || true
+  fi
+  if [[ -n "$ONESHOT_GUARD_REPORT" ]]; then
+    "$ONESHOT_GUARD_REPORT" "$blocked" || true
   fi
 
   # Back to the disposition from before the guard (default, or the TUI's own
@@ -2310,8 +2371,25 @@ oneshot_on_signal() {
 }
 
 # Every start path (CLI start/restart, the TUI menu, the restart after an .env
-# edit) passes start_services or restart_services, and both ask this first: the
-# relay must not run next to a one-shot container.
+# edit) passes start_services or restart_services, and both ask start_blocked
+# first: the relay must not run next to a one-shot container, nor on a database
+# that an engine switch left half moved.
+start_blocked() {
+  oneshot_blocks_start && return 0
+  switch_marker_blocks "the relay does not start"
+}
+
+# switch_marker_blocks <what> — 0 (with the reason) while db/.switch-in-progress
+# exists: db/ and DB_ENGINE may not belong together until the rollback has run.
+switch_marker_blocks() {
+  if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+    warn "An engine switch did not finish (db/.switch-in-progress exists): db/ and DB_ENGINE may not match, so $1."
+    warn "Run './$SCRIPT_NAME db-switch --rollback' to put the previous engine and its data back, then try again."
+    return 0
+  fi
+  return 1
+}
+
 oneshot_blocks_start() {
   if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
     warn "A one-shot container (backup, restore or import) exists: $ONESHOT_CONTAINER — the relay cannot share db/ with it."
@@ -2333,6 +2411,7 @@ run_import_once() {
   compose_file="$(compose_file_for "$mode")"
   require_compose_file "$compose_file"
 
+  if switch_marker_blocks "the import does not run"; then return 1; fi
   ensure_docker_uid
   ensure_data_dirs
   ensure_example_jsons
@@ -2664,10 +2743,83 @@ human_size() {
   }'
 }
 
+# backup_oneshot_to <compose_file> <partial> [compose run options...] — the
+# backup one-shot itself, writing <partial> inside backups/. The relay must be
+# down and the signal guard armed. Extra options (db-switch: -e DB_ENGINE=...)
+# go in front of the service name. Returns the one-shot's exit status.
+backup_oneshot_to() {
+  local compose_file="$1" partial="$2"
+  shift 2
+  # umask 077 inside the container: the zip is a full copy of the database
+  # (badger keeps db/<relay>/ at 0700), so it is created 0600 for whatever uid
+  # the container runs as. --entrypoint sh keeps entrypoint.sh out, as before.
+  # shellcheck disable=SC2016  # $1 expands inside the container's sh, not here
+  oneshot_run -f "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+    -v "$BACKUP_DIR:/app/backups" "$@" --entrypoint sh relay \
+    -c 'umask 077; exec /app/haven backup "$1"' sh "/app/backups/${partial##*/}"
+}
+
+# backup_finish <compose_file> <status> <partial> <target> — everything after
+# the backup one-shot: the file must exist, belong to the container user, be a
+# verified zip; then it is renamed to <target>. Warns and returns 1 otherwise
+# (a kept .partial is named). Prints nothing on success.
+backup_finish() {
+  local compose_file="$1" status="$2" partial="$3" target="$4" vrc=0
+  local name="${target##*/}"
+  if [[ "$status" -ne 0 ]]; then
+    warn "The backup exited with status $status; no backup was written."
+    if [[ -e "$partial" && ! -L "$partial" ]]; then
+      warn_plain "The incomplete file is kept for inspection: $partial — it is not a usable backup; delete it when done."
+    fi
+    return 1
+  fi
+  if [[ ! -e "$partial" && ! -L "$partial" ]]; then
+    warn "The backup reported success but wrote no file; no backup was written."
+    return 1
+  fi
+  # Something other than the container put this path there (a symlink planted
+  # during the run, a foreign file): it is neither verified nor renamed.
+  if ! backup_file_owned "$partial"; then
+    warn "No backup was written."
+    return 1
+  fi
+  if [[ ! -s "$partial" ]]; then
+    warn "The backup reported success but wrote an empty file; no backup was written."
+    return 1
+  fi
+
+  verify_backup_zip "$compose_file" "$partial" || vrc=$?
+  if [[ "$vrc" -ne 0 ]]; then
+    warn_plain "No backup was written. The unverified file is kept for inspection: $partial — it is not a usable backup; delete it when done."
+    return 1
+  fi
+
+  if [[ -e "$target" || -L "$target" ]]; then
+    warn_plain "backups/$name appeared while the backup ran; the verified file stays as $partial."
+    return 1
+  fi
+  mv -n -- "$partial" "$target"
+  if [[ -e "$partial" || -L "$target" || ! -f "$target" ]]; then
+    warn_plain "Could not rename $partial to $name; the verified file stays as $partial."
+    return 1
+  fi
+  return 0
+}
+
+# restore_oneshot <compose_file> <name in backups/> [compose run options...] —
+# the restore one-shot itself; same preconditions as backup_oneshot_to.
+restore_oneshot() {
+  local compose_file="$1" name="$2"
+  shift 2
+  oneshot_run -f "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+    -v "$BACKUP_DIR:/app/backups" "$@" --entrypoint /app/haven \
+    relay restore "/app/backups/$name"
+}
+
 # backup_relay_db <mode> [file]
 backup_relay_db() {
   local mode="$1" requested="$2"
-  local compose_file name target partial status=0 was_running vrc=0 size relay_rc=0
+  local compose_file name target partial status=0 was_running size relay_rc=0
 
   compose_file="$(compose_file_for "$mode")"
   require_compose_file "$compose_file"
@@ -2681,6 +2833,7 @@ backup_relay_db() {
   fi
   target="$BACKUP_DIR/$name"
   partial="$target.partial-$(random_suffix)"
+  if switch_marker_blocks "the backup does not run"; then return 1; fi
 
   ensure_docker_uid
   ensure_data_dirs
@@ -2707,59 +2860,13 @@ backup_relay_db() {
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
   info "Writing backups/$name ($mode)..." || true
-  # umask 077 inside the container: the zip is a full copy of the database
-  # (badger keeps db/<relay>/ at 0700), so it is created 0600 for whatever uid
-  # the container runs as. --entrypoint sh keeps entrypoint.sh out, as before.
-  # shellcheck disable=SC2016  # $1 expands inside the container's sh, not here
-  oneshot_run -f "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
-    -v "$BACKUP_DIR:/app/backups" --entrypoint sh relay \
-    -c 'umask 077; exec /app/haven backup "$1"' sh "/app/backups/${partial##*/}" || status=$?
+  backup_oneshot_to "$compose_file" "$partial" || status=$?
 
   # The relay comes back before the verification: it does not need db/ quiet.
   relay_restart_after_oneshot "$compose_file" "$was_running" || relay_rc=1
   oneshot_guard_off
 
-  if [[ "$status" -ne 0 ]]; then
-    warn "The backup exited with status $status; no backup was written."
-    if [[ -e "$partial" && ! -L "$partial" ]]; then
-      warn_plain "The incomplete file is kept for inspection: $partial — it is not a usable backup; delete it when done."
-    fi
-    oneshot_fail "$relay_rc"
-    return 1
-  fi
-  if [[ ! -e "$partial" && ! -L "$partial" ]]; then
-    warn "The backup reported success but wrote no file; no backup was written."
-    oneshot_fail "$relay_rc"
-    return 1
-  fi
-  # Something other than the container put this path there (a symlink planted
-  # during the run, a foreign file): it is neither verified nor renamed.
-  if ! backup_file_owned "$partial"; then
-    warn "No backup was written."
-    oneshot_fail "$relay_rc"
-    return 1
-  fi
-  if [[ ! -s "$partial" ]]; then
-    warn "The backup reported success but wrote an empty file; no backup was written."
-    oneshot_fail "$relay_rc"
-    return 1
-  fi
-
-  verify_backup_zip "$compose_file" "$partial" || vrc=$?
-  if [[ "$vrc" -ne 0 ]]; then
-    warn_plain "No backup was written. The unverified file is kept for inspection: $partial — it is not a usable backup; delete it when done."
-    oneshot_fail "$relay_rc"
-    return 1
-  fi
-
-  if [[ -e "$target" || -L "$target" ]]; then
-    warn_plain "backups/$name appeared while the backup ran; the verified file stays as $partial."
-    oneshot_fail "$relay_rc"
-    return 1
-  fi
-  mv -n -- "$partial" "$target"
-  if [[ -e "$partial" || -L "$target" || ! -f "$target" ]]; then
-    warn_plain "Could not rename $partial to $name; the verified file stays as $partial."
+  if ! backup_finish "$compose_file" "$status" "$partial" "$target"; then
     oneshot_fail "$relay_rc"
     return 1
   fi
@@ -2791,6 +2898,7 @@ restore_relay_db() {
   backup_normalize_name "$requested" || return 1
   name="$BACKUP_NAME"
   file="$BACKUP_DIR/$name"
+  if switch_marker_blocks "the restore does not run"; then return 1; fi
 
   ensure_docker_uid
   ensure_data_dirs
@@ -2837,9 +2945,7 @@ restore_relay_db() {
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
   info "Restoring from backups/$name ($mode)..." || true
-  oneshot_run -f "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
-    -v "$BACKUP_DIR:/app/backups" --entrypoint /app/haven \
-    relay restore "/app/backups/$name" || status=$?
+  restore_oneshot "$compose_file" "$name" || status=$?
 
   relay_restart_after_oneshot "$compose_file" "$was_running" || relay_rc=1
   oneshot_guard_off
@@ -2860,6 +2966,1089 @@ restore_relay_db() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# db-switch
+#
+# Moves the relay database to the other engine the way upstream supports it:
+# backup, switch DB_ENGINE, restore — with every fact taken from disk, not from
+# .env or an exit code. Measured on v1.2.2-6 (plan P1): flipping DB_ENGINE alone
+# serves 0 events and leaves the other engine's files next to the old ones; both
+# engines use the same five directories; per-entry CRCs of a backup are equal
+# across engines for the same data.
+#
+#   1 preflight  read-only checks, then one confirmation (or --yes)
+#   2 stop       the relay, when it runs, verified gone
+#   3 backup     backups/haven-pre-switch-<engine>-<ts>.zip, verified
+#   4 move       marker db/.switch-in-progress, then the five directories into
+#                db/.pre-switch-<old engine>-<ts>/ (renames inside db/)
+#   5 config     DB_ENGINE in .env (set_env_var, with its config backup)
+#   6 restore    restore, then a second backup of the new database whose
+#                per-entry CRCs must equal the first
+#   7 start      marker removed, relay started when it ran before
+#
+# Any failure or signal once step 4 has begun rolls back: what the restore made
+# goes to db/.failed-<ts>/, the old directories come back, DB_ENGINE is put back
+# verbatim, the marker goes only when the old layout is complete. Nothing in
+# db/ is ever deleted; the old directories stay for the user to remove.
+# Progress lines for a caller: "::step <n>/<total> <name>", "::result <ok|
+# rolled-back|failed>".
+# ---------------------------------------------------------------------------
+
+DBS_STEPS=7
+DBS_ACTIVE=0             # 1 while db/ may hold a half-moved layout (marker written)
+DBS_KIND=""              # switch | undo
+DBS_SOURCE=""            # switch: the old engine; undo: the engine set aside
+DBS_TARGET=""            # switch: the new engine; undo: the engine brought back
+DBS_TS=""
+DBS_BACKUP=""            # switch: the pre-switch zip in backups/
+DBS_BACKUP2=""           # switch: the zip of the new database
+DBS_STASH=""             # directory in db/ whose contents come back on rollback
+DBS_ASIDE=""             # directory in db/ that takes what is set aside on rollback
+DBS_DIRS=""              # database directories of the layout to come back
+DBS_ENV_SET=0            # 1: the DB_ENGINE line DBS_ENV_LINE belongs in .env
+DBS_ENV_LINE=""          # 0: no DB_ENGINE line belongs in .env
+DBS_RELAY_WAS_RUNNING=0
+DBS_STEP=""
+DBS_ERR=""
+DBS_ROLLED=0             # signal path: 1 rolled back, 2 rollback did not finish
+DISK_ENGINE=""
+DISK_REPORT=""
+DISK_DATA=""
+DISK_BAD=""
+
+dbs_progress() { printf '::step %s/%s %s\n' "$1" "$2" "$3" || true; }
+dbs_result() { printf '::result %s\n' "$1" || true; }
+dbs_word_in() { [[ " $2 " == *" $1 "* ]]; }
+dbs_ts() { date +%Y%m%d-%H%M%S; }
+
+# db_dir_engine <dir> — what a database directory holds, judged by its files:
+# badger (MANIFEST, KEYREGISTRY, *.vlog, *.sst), lmdb (data.mdb, lock.mdb),
+# mixed (both), empty, missing, other (files of neither engine, or not a
+# directory) or unreadable.
+db_dir_engine() {
+  local d="$1" any="" b="" l=""
+  if [[ ! -e "$d" && ! -L "$d" ]]; then printf 'missing'; return 0; fi
+  if [[ ! -d "$d" ]]; then printf 'other'; return 0; fi
+  any="$(find -H "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" || { printf 'unreadable'; return 0; }
+  if [[ -z "$any" ]]; then printf 'empty'; return 0; fi
+  b="$(find -H "$d" -mindepth 1 -maxdepth 1 \( -name MANIFEST -o -name KEYREGISTRY -o -name '*.vlog' -o -name '*.sst' \) -print -quit 2>/dev/null)" || { printf 'unreadable'; return 0; }
+  l="$(find -H "$d" -mindepth 1 -maxdepth 1 \( -name data.mdb -o -name lock.mdb \) -print -quit 2>/dev/null)" || { printf 'unreadable'; return 0; }
+  if [[ -n "$b" && -n "$l" ]]; then
+    printf 'mixed'
+  elif [[ -n "$b" ]]; then
+    printf 'badger'
+  elif [[ -n "$l" ]]; then
+    printf 'lmdb'
+  else
+    printf 'other'
+  fi
+}
+
+# db_disk_engine [base] — the engine of the five directories under base (db/):
+# sets DISK_ENGINE to badger, lmdb, none (no data), mixed (a directory holds
+# both; DISK_BAD names them), split (directories disagree) or unknown (DISK_BAD
+# names the unreadable ones or those holding neither), DISK_DATA to the
+# directories with data and DISK_REPORT to "name=engine ...".
+db_disk_engine() {
+  local base="${1:-$ROOT_DIR/db}" n e seen="" mixed="" bad="" data="" report=""
+  for n in "${DB_ENGINE_DIRS[@]}"; do
+    e="$(db_dir_engine "$base/$n")"
+    report+="$n=$e "
+    case "$e" in
+      badger|lmdb)
+        data+="$n "
+        if [[ -z "$seen" ]]; then
+          seen="$e"
+        elif [[ "$seen" != "$e" ]]; then
+          seen="split"
+        fi
+        ;;
+      mixed) mixed+="$n " ;;
+      other|unreadable) bad+="$n " ;;
+    esac
+  done
+  DISK_REPORT="${report% }"
+  DISK_DATA="${data% }"
+  DISK_BAD=""
+  if [[ -n "$mixed" ]]; then
+    DISK_ENGINE="mixed"
+    DISK_BAD="${mixed% }"
+  elif [[ -n "$bad" ]]; then
+    DISK_ENGINE="unknown"
+    DISK_BAD="${bad% }"
+  elif [[ "$seen" == "split" ]]; then
+    DISK_ENGINE="split"
+  elif [[ -z "$seen" ]]; then
+    DISK_ENGINE="none"
+  else
+    DISK_ENGINE="$seen"
+  fi
+}
+
+# env_key_lines <key> — the .env lines that set <key>, matched as read_env_var does
+env_key_lines() {
+  local env_file="$ROOT_DIR/.env"
+  [[ -f "$env_file" ]] || return 0
+  awk -v key="$1" '$0 ~ "^[ \t]*export[ \t]+" key "=" || $0 ~ "^" key "=" { print }' "$env_file"
+}
+
+# env_engine_state — "unset", "badger", "lmdb" or "other" for DB_ENGINE in .env.
+# Upstream runs lmdb for anything but "badger" (read in code, plan P0).
+env_engine_state() {
+  local v
+  if [[ -z "$(env_key_lines DB_ENGINE)" ]]; then
+    printf 'unset'
+    return 0
+  fi
+  v="$(env_value_or_empty DB_ENGINE)"
+  case "$v" in
+    badger|lmdb) printf '%s' "$v" ;;
+    *) printf 'other' ;;
+  esac
+}
+
+# Test seam: with HAVEN_TEST_SWITCH_HOOK set to an executable, db-switch runs it
+# with a point name (after-backup, after-move, after-config, before-restore,
+# after-restore); a non-zero exit fails that step. Unset: nothing runs.
+dbs_hook() {
+  [[ -n "${HAVEN_TEST_SWITCH_HOOK:-}" ]] || return 0
+  "$HAVEN_TEST_SWITCH_HOOK" "$1" </dev/null >/dev/null 2>&1 || { DBS_ERR="the test hook failed at $1"; return 1; }
+}
+
+# The marker: key=value lines, written to a fresh temporary file and renamed.
+dbs_write_marker() {
+  local content tmp
+  printf -v content 'kind=%s\nsource=%s\ntarget=%s\nstarted=%s\nbackup=%s\nstash=%s\naside=%s\ndirs=%s\nrelay_was_running=%s\nenv_set=%s\nenv_line=%s\nstep=%s\n' \
+    "$DBS_KIND" "$DBS_SOURCE" "$DBS_TARGET" "$DBS_TS" "$DBS_BACKUP" "$DBS_STASH" "$DBS_ASIDE" \
+    "$DBS_DIRS" "$DBS_RELAY_WAS_RUNNING" "$DBS_ENV_SET" "$DBS_ENV_LINE" "$DBS_STEP"
+  tmp="$(mktemp "$DB_SWITCH_MARKER.XXXXXX" 2>/dev/null)" || return 1
+  if ! printf '%s' "$content" > "$tmp" 2>/dev/null || ! mv -f -- "$tmp" "$DB_SWITCH_MARKER" 2>/dev/null; then
+    rm -f -- "$tmp" 2>/dev/null
+    return 1
+  fi
+  [[ -f "$DB_SWITCH_MARKER" && ! -L "$DB_SWITCH_MARKER" ]]
+}
+
+# dbs_load_marker — reads db/.switch-in-progress into the DBS_* variables and
+# checks every field: the names it holds decide which directories are renamed,
+# so anything unexpected is refused (DBS_ERR says what).
+dbs_load_marker() {
+  local l k v
+  DBS_KIND="" DBS_SOURCE="" DBS_TARGET="" DBS_TS="" DBS_BACKUP="" DBS_STASH="" DBS_ASIDE=""
+  DBS_DIRS="" DBS_RELAY_WAS_RUNNING="" DBS_ENV_SET="" DBS_ENV_LINE="" DBS_STEP="" DBS_ERR=""
+  if [[ -L "$DB_SWITCH_MARKER" || ! -f "$DB_SWITCH_MARKER" || ! -r "$DB_SWITCH_MARKER" ]]; then
+    DBS_ERR="it is not a readable regular file"
+    return 1
+  fi
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    k="${l%%=*}"
+    v="${l#*=}"
+    case "$k" in
+      kind) DBS_KIND="$v" ;;
+      source) DBS_SOURCE="$v" ;;
+      target) DBS_TARGET="$v" ;;
+      started) DBS_TS="$v" ;;
+      backup) DBS_BACKUP="$v" ;;
+      stash) DBS_STASH="$v" ;;
+      aside) DBS_ASIDE="$v" ;;
+      dirs) DBS_DIRS="$v" ;;
+      relay_was_running) DBS_RELAY_WAS_RUNNING="$v" ;;
+      env_set) DBS_ENV_SET="$v" ;;
+      env_line) DBS_ENV_LINE="$v" ;;
+      step) DBS_STEP="$v" ;;
+    esac
+  done < "$DB_SWITCH_MARKER"
+  local n
+  if [[ "$DBS_KIND" != "switch" && "$DBS_KIND" != "undo" ]]; then
+    DBS_ERR="unknown kind"
+  elif [[ ! "$DBS_SOURCE" =~ ^(badger|lmdb)$ || ! "$DBS_TARGET" =~ ^(badger|lmdb)$ || "$DBS_SOURCE" == "$DBS_TARGET" ]]; then
+    DBS_ERR="invalid engines"
+  elif [[ ! "$DBS_STASH" =~ ^\.pre-switch-(badger|lmdb)-[0-9]{8}-[0-9]{6}$ ]]; then
+    DBS_ERR="invalid stash directory name"
+  elif [[ -n "$DBS_ASIDE" && ! "$DBS_ASIDE" =~ ^\.(failed|post-switch-(badger|lmdb))-[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]]; then
+    DBS_ERR="invalid set-aside directory name"
+  elif [[ ! "$DBS_RELAY_WAS_RUNNING" =~ ^[01]$ || ! "$DBS_ENV_SET" =~ ^[01]$ ]]; then
+    DBS_ERR="invalid flags"
+  elif [[ "$DBS_ENV_SET" == "1" && ! "$DBS_ENV_LINE" =~ ^[[:blank:]]*(export[[:blank:]]+)?DB_ENGINE= ]]; then
+    DBS_ERR="invalid DB_ENGINE line"
+  elif [[ ! "$DBS_STEP" =~ ^(move|moved|config|restored|verified|start|undo)$ ]]; then
+    DBS_ERR="unknown step"
+  fi
+  if [[ -z "$DBS_ERR" ]]; then
+    local -a words=()
+    IFS=' ' read -r -a words <<< "$DBS_DIRS"
+    for n in "${words[@]}"; do
+      dbs_word_in "$n" "$DB_ENGINE_DIRS_TEXT" || DBS_ERR="unknown directory name in dirs"
+    done
+  fi
+  [[ -z "$DBS_ERR" ]]
+}
+
+# dbs_unique <name> — <name> when db/<name> is free, else <name>-2, -3, ...
+dbs_unique() {
+  local c="$1" i=2
+  while [[ -e "$ROOT_DIR/db/$c" || -L "$ROOT_DIR/db/$c" ]]; do
+    c="$1-$i"
+    i=$((i + 1))
+  done
+  printf '%s' "$c"
+}
+
+# dbs_move <from> <to> — a plain rename; never onto an existing path.
+dbs_move() {
+  if [[ -e "$2" || -L "$2" ]]; then
+    DBS_ERR="${2#"$ROOT_DIR/"} already exists"
+    return 1
+  fi
+  mv -- "$1" "$2" 2>/dev/null
+  if [[ -e "$1" || -L "$1" ]] || [[ ! -e "$2" && ! -L "$2" ]]; then
+    DBS_ERR="could not move ${1#"$ROOT_DIR/"} to ${2#"$ROOT_DIR/"}"
+    return 1
+  fi
+  return 0
+}
+
+# dbs_set_aside <name> — db/<name> into the set-aside directory, created (and
+# recorded in the marker) on first use.
+dbs_set_aside() {
+  local db="$ROOT_DIR/db"
+  if [[ -z "$DBS_ASIDE" ]]; then
+    DBS_ASIDE="$(dbs_unique ".failed-$(dbs_ts)")"
+    if ! dbs_write_marker; then
+      DBS_ERR="cannot update db/.switch-in-progress"
+      return 1
+    fi
+  fi
+  if [[ ! -d "$db/$DBS_ASIDE" ]] && ! mkdir -m 700 -- "$db/$DBS_ASIDE" 2>/dev/null; then
+    DBS_ERR="cannot create db/$DBS_ASIDE"
+    return 1
+  fi
+  dbs_move "$db/$1" "$db/$DBS_ASIDE/$1"
+}
+
+# dbs_env_put — the DB_ENGINE line of .env back to DBS_ENV_LINE (or removed
+# when DBS_ENV_SET=0), verbatim; nothing is written when it already matches.
+dbs_env_put() {
+  local env_file="$ROOT_DIR/.env" cur tmp mode
+  cur="$(env_key_lines DB_ENGINE)"
+  if [[ "$DBS_ENV_SET" == "1" ]]; then
+    [[ "$cur" != "$DBS_ENV_LINE" ]] || return 0
+  else
+    [[ -n "$cur" ]] || return 0
+  fi
+  if [[ ! -f "$env_file" || ! -w "$env_file" ]]; then
+    DBS_ERR=".env is not writable; DB_ENGINE could not be set back"
+    return 1
+  fi
+  backup_config_file "$env_file"
+  tmp="$env_file.tmp"
+  mode="$(path_mode "$env_file")"
+  if DBS_LINE="$DBS_ENV_LINE" DBS_SET="$DBS_ENV_SET" awk '
+      $0 ~ /^[ \t]*export[ \t]+DB_ENGINE=/ || $0 ~ /^DB_ENGINE=/ {
+        if (ENVIRON["DBS_SET"] == "1" && !done) { print ENVIRON["DBS_LINE"]; done = 1 }
+        next
+      }
+      { print }
+      END { if (ENVIRON["DBS_SET"] == "1" && !done) print ENVIRON["DBS_LINE"] }
+    ' "$env_file" > "$tmp" 2>/dev/null; then
+    [[ -z "$mode" ]] || chmod "$mode" "$tmp" 2>/dev/null
+    mv -- "$tmp" "$env_file" 2>/dev/null
+  fi
+  cur="$(env_key_lines DB_ENGINE)"
+  if [[ "$DBS_ENV_SET" == "1" && "$cur" != "$DBS_ENV_LINE" ]] || [[ "$DBS_ENV_SET" != "1" && -n "$cur" ]]; then
+    DBS_ERR="DB_ENGINE in .env could not be set back"
+    return 1
+  fi
+  return 0
+}
+
+# dbs_restore_layout — the rollback itself, silent (DBS_ERR on failure): every
+# directory recorded in DBS_DIRS that sits in the stash comes back, whatever is
+# in its place goes to the set-aside directory first; a database directory that
+# did not exist before is set aside as well. Then DB_ENGINE, then a check that
+# the old layout is complete — only then the marker goes. Safe to repeat.
+dbs_restore_layout() {
+  local db="$ROOT_DIR/db" n stash
+  DBS_ERR=""
+  stash="$db/$DBS_STASH"
+  for n in "${DB_ENGINE_DIRS[@]}"; do
+    if dbs_word_in "$n" "$DBS_DIRS"; then
+      [[ -e "$stash/$n" || -L "$stash/$n" ]] || continue
+      if [[ -e "$db/$n" || -L "$db/$n" ]]; then
+        dbs_set_aside "$n" || return 1
+      fi
+      dbs_move "$stash/$n" "$db/$n" || return 1
+    elif [[ -e "$db/$n" || -L "$db/$n" ]]; then
+      dbs_set_aside "$n" || return 1
+    fi
+  done
+  dbs_env_put || return 1
+  for n in "${DB_ENGINE_DIRS[@]}"; do
+    if dbs_word_in "$n" "$DBS_DIRS"; then
+      if [[ ! -d "$db/$n" ]] || [[ -e "$stash/$n" || -L "$stash/$n" ]]; then
+        DBS_ERR="db/$n is not back in place"
+        return 1
+      fi
+    elif [[ -e "$db/$n" || -L "$db/$n" ]]; then
+      DBS_ERR="db/$n is still there"
+      return 1
+    fi
+  done
+  # rmdir removes the stash only when it is empty
+  rmdir -- "$stash" 2>/dev/null || true
+  rm -f -- "$DB_SWITCH_MARKER" 2>/dev/null
+  if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+    DBS_ERR="cannot remove db/.switch-in-progress"
+    return 1
+  fi
+  DBS_ACTIVE=0
+  return 0
+}
+
+# The engine a rollback brings back.
+dbs_back_engine() {
+  if [[ "$DBS_KIND" == "undo" ]]; then printf '%s' "$DBS_TARGET"; else printf '%s' "$DBS_SOURCE"; fi
+}
+
+dbs_manual_steps() {
+  local env_hint
+  if [[ "$DBS_ENV_SET" == "1" ]]; then
+    env_hint="set the DB_ENGINE line in .env back to: $(printable_text "$DBS_ENV_LINE")"
+  else
+    env_hint="remove the DB_ENGINE line from .env"
+  fi
+  warn_plain "The automatic rollback did not finish: $(printable_text "$DBS_ERR")." || true
+  warn "db/.switch-in-progress stays, so './$SCRIPT_NAME start' refuses until the old layout is back. To finish by hand:" || true
+  info_plain "  1. For each of $DB_ENGINE_DIRS_TEXT that is in db/$DBS_STASH/: move db/<name> (if there) into db/${DBS_ASIDE:-.failed-manual}/, then: mv db/$DBS_STASH/<name> db/<name>" || true
+  info_plain "  2. $env_hint" || true
+  info_plain "  3. Remove db/.switch-in-progress, then run './$SCRIPT_NAME start'." || true
+  info "Or remove the cause and run './$SCRIPT_NAME db-switch --rollback' again; it continues where it stopped." || true
+}
+
+# Signal hooks (see oneshot_on_signal).
+dbs_signal_rollback() {
+  [[ "$DBS_ACTIVE" == "1" ]] || return 0
+  if dbs_restore_layout; then
+    DBS_ROLLED=1
+    return 0
+  fi
+  DBS_ROLLED=2
+  return 1
+}
+
+dbs_signal_report() {
+  local blocked="$1" back
+  back="$(dbs_back_engine)"
+  if [[ "$blocked" == "1" && "$DBS_ACTIVE" == "1" ]]; then
+    warn "Interrupted in step '$DBS_STEP' and NOT rolled back: the one-shot container still runs and may write to db/." || true
+    warn "Once it has stopped, run './$SCRIPT_NAME db-switch --rollback'." || true
+    dbs_result failed
+  elif [[ "$DBS_ROLLED" == "1" ]]; then
+    info "Rolled back: the $back directories are in db/ again and DB_ENGINE is as before." || true
+    [[ -z "$DBS_ASIDE" ]] || info_plain "What the interrupted run produced is kept in db/$DBS_ASIDE/." || true
+    [[ "$DBS_KIND" != "switch" || ! -f "$BACKUP_DIR/$DBS_BACKUP" ]] || info_plain "The verified backup made before the switch stays: backups/$DBS_BACKUP" || true
+    dbs_result rolled-back
+  elif [[ "$DBS_ROLLED" == "2" ]]; then
+    dbs_manual_steps
+    dbs_result failed
+  elif [[ "$DBS_STEP" == "done" ]]; then
+    info "The switch had completed before the signal: db/ holds $DBS_TARGET data and DB_ENGINE=$DBS_TARGET; the old directories are in db/$DBS_STASH/." || true
+    dbs_result ok
+  else
+    info "Nothing was changed: db/ and DB_ENGINE are as before." || true
+    [[ "$DBS_KIND" != "switch" || -z "$DBS_BACKUP" || ! -f "$BACKUP_DIR/$DBS_BACKUP" ]] || info_plain "The verified backup made before the switch stays: backups/$DBS_BACKUP" || true
+    dbs_result failed
+  fi
+}
+
+# dbs_fail <compose_file> <reason> — a step failed: roll back when step 4 has
+# begun, start the relay on the old engine when it ran before, say which state
+# the installation is in. Always returns 1.
+dbs_fail() {
+  local compose_file="$1" why="$2" rolled=0 relay_rc=0 back
+  # the rollback runs to its end; a signal now would only cut it short
+  trap '' INT TERM HUP
+  if [[ "$DBS_ACTIVE" == "1" ]]; then
+    if dbs_restore_layout; then rolled=1; else rolled=2; fi
+  fi
+  if [[ "$rolled" != "2" && "$DBS_RELAY_WAS_RUNNING" == "1" ]] && ! relay_container_running; then
+    relay_start_again "$compose_file" || relay_rc=1
+  fi
+  oneshot_guard_off
+  back="$(dbs_back_engine)"
+
+  warn_plain "The engine switch failed: $why" || true
+  case "$rolled" in
+    0) info "Nothing was changed: db/ and DB_ENGINE are as before." || true ;;
+    1)
+      info "Rolled back: the $back directories are in db/ again and DB_ENGINE is as before." || true
+      [[ -z "$DBS_ASIDE" ]] || info_plain "What the failed run produced is kept in db/$DBS_ASIDE/ (remove it when you no longer need it)." || true
+      ;;
+    2) dbs_manual_steps ;;
+  esac
+  if [[ "$DBS_KIND" == "switch" && -n "$DBS_BACKUP" && -f "$BACKUP_DIR/$DBS_BACKUP" ]]; then
+    info_plain "The verified backup made before the switch stays: backups/$DBS_BACKUP" || true
+  fi
+  if [[ "$rolled" == "2" ]]; then
+    warn "The relay was not started." || true
+  elif relay_container_running; then
+    info "The relay is running ($back)." || true
+  elif [[ "$relay_rc" -ne 0 ]]; then
+    warn "The relay did not start again; it is NOT running. Check './$SCRIPT_NAME logs relay', then start it with './$SCRIPT_NAME start'." || true
+  else
+    info "The relay was not running before and was not started." || true
+  fi
+  if [[ "$rolled" == "1" ]]; then dbs_result rolled-back; else dbs_result failed; fi
+  return 1
+}
+
+# zip_entry_crcs <zip> — "name crc" per entry, sorted, from the host unzip.
+zip_entry_crcs() {
+  "$HOST_UNZIP" -v "$1" 2>/dev/null | awk 'NF >= 8 && $7 ~ /^[0-9a-f]{8}$/ {print $8, $7}' | LC_ALL=C sort
+}
+
+dbs_compare_crcs() {
+  local a b
+  a="$(zip_entry_crcs "$1")" || a=""
+  b="$(zip_entry_crcs "$2")" || b=""
+  if [[ "$(printf '%s\n' "$a" | awk 'NF {n++} END {print n + 0}')" -ne 5 ]]; then
+    DBS_ERR="cannot read the entry CRCs of ${1##*/}"
+    return 1
+  fi
+  if [[ "$a" != "$b" ]]; then
+    DBS_ERR="the backup of the new database differs from the backup of the old one (per-entry CRC32) — old: ${a//$'\n'/, } — new: ${b//$'\n'/, }"
+    return 1
+  fi
+  return 0
+}
+
+# dbs_common_checks <need_unzip:0|1> — read-only checks shared by the switch and
+# the undo; warns and returns 1 on the first that fails.
+dbs_common_checks() {
+  local db="$ROOT_DIR/db" uid gid lines out=""
+  if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+    warn "An engine switch did not finish (db/.switch-in-progress exists). Run './$SCRIPT_NAME db-switch --rollback' first."
+    return 1
+  fi
+  if [[ ! -f "$ROOT_DIR/.env" ]]; then
+    warn ".env not found; the relay configuration is needed to know who owns db/ and which engine it runs."
+    return 1
+  fi
+  lines="$(env_key_lines DB_ENGINE | awk 'END {print NR}')"
+  if (( lines > 1 )); then
+    warn ".env sets DB_ENGINE $lines times; keep one line, then run db-switch again."
+    return 1
+  fi
+  if [[ -L "$db" && ! -e "$db" ]]; then
+    warn_plain "db is a broken symlink: $db"
+    return 1
+  fi
+  if [[ ! -d "$db" || ! -r "$db" || ! -x "$db" || ! -w "$db" ]]; then
+    warn_plain "$db must be a directory this user can read and write; db-switch renames directories inside it."
+    return 1
+  fi
+  uid="$(env_value_or_empty DOCKER_UID)"
+  gid="$(env_value_or_empty DOCKER_GID)"
+  [[ -n "$uid" ]] || uid="1000"
+  [[ -n "$gid" ]] || gid="1000"
+  if ! is_int "$uid"; then
+    warn_plain "DOCKER_UID is not numeric ($(printable_text "$uid")); db-switch cannot check who owns db/ and does not run. Set a numeric DOCKER_UID in .env."
+    return 1
+  fi
+  if ! out="$(find -H "$db" -mindepth 1 ! -user "$((10#$uid))" -print -quit 2>/dev/null)"; then
+    warn_plain "Cannot read everything inside $db; db-switch does not run without checking it. Fix the permissions (sudo chown -R ${uid}:${gid} $db)."
+    return 1
+  fi
+  if [[ -n "$out" ]]; then
+    warn_plain "$(printable_text "${out#"$ROOT_DIR/"}") is not owned by uid $uid, the user the container runs as; the restored database could not be written next to it. Fix with: sudo chown -R ${uid}:${gid} $db"
+    return 1
+  fi
+  if [[ "$1" == "1" ]] && ! command -v "$HOST_UNZIP" >/dev/null 2>&1; then
+    warn "db-switch compares the backups before and after entry by entry with unzip, and there is no unzip on this host. Install it (e.g. 'apt install unzip') and try again."
+    return 1
+  fi
+  oneshot_leftover_check || return 1
+  return 0
+}
+
+# dbs_same_fs <dir names...> — every given db/<name> lives on the filesystem of
+# db/ itself, so the moves are renames and never a copy.
+dbs_same_fs() {
+  local db="$ROOT_DIR/db" n dev_db dev
+  dev_db="$(stat -L -c %d "$db" 2>/dev/null || stat -L -f %d "$db" 2>/dev/null || true)"
+  for n in "$@"; do
+    [[ -e "$db/$n" || -L "$db/$n" ]] || continue
+    dev="$(stat -c %d "$db/$n" 2>/dev/null || stat -f %d "$db/$n" 2>/dev/null || true)"
+    if [[ -z "$dev_db" || "$dev" != "$dev_db" ]]; then
+      warn_plain "db/$n is on another filesystem than db/ (a mount point?); db-switch only renames inside db/ and does not copy. Move it by hand first."
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Free space for two backups (before and after) and a second database.
+dbs_space_check() {
+  local db="$ROOT_DIR/db" bdir="$BACKUP_DIR" need free_b free_d dev_b dev_d n
+  local -a paths=()
+  [[ -d "$bdir" ]] || bdir="$ROOT_DIR"
+  for n in "${DB_ENGINE_DIRS[@]}"; do
+    [[ -e "$db/$n" ]] && paths+=("$db/$n")
+  done
+  need="$(du -skH "${paths[@]}" 2>/dev/null | awk '{s += $1} END {print s + 0}' || true)"
+  free_b="$(df -Pk "$bdir" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  free_d="$(df -Pk "$db" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  dev_b="$(stat -L -c %d "$bdir" 2>/dev/null || stat -L -f %d "$bdir" 2>/dev/null || true)"
+  dev_d="$(stat -L -c %d "$db" 2>/dev/null || stat -L -f %d "$db" 2>/dev/null || true)"
+  if ! is_int "$need" || ! is_int "$free_b" || ! is_int "$free_d" || [[ -z "$dev_b" || -z "$dev_d" ]]; then
+    warn "Could not measure the free space; continuing (every step is verified, a failure rolls back)."
+    return 0
+  fi
+  if [[ "$dev_b" == "$dev_d" ]]; then
+    if (( free_d < 3 * need )); then
+      warn "Not enough free space: the switch needs about $((3 * need)) KiB (two backups and a second database of ${need} KiB), ${free_d} KiB are free."
+      return 1
+    fi
+  elif (( free_b < 2 * need || free_d < need )); then
+    warn "Not enough free space: backups/ needs about $((2 * need)) KiB (${free_b} KiB free), db/ about ${need} KiB (${free_d} KiB free)."
+    return 1
+  fi
+  return 0
+}
+
+# dbs_confirm <question> — tty: ask; otherwise --yes is required.
+dbs_confirm() {
+  if [[ "$ASSUME_YES" == "1" ]]; then
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    ask_yes_no "$1 [y/N] " "n" && return 0
+    info "Cancelled; nothing was changed."
+    return 1
+  fi
+  warn "No terminal to ask for confirmation. Run again with --yes to go ahead."
+  return 1
+}
+
+# dbs_env_disk_check <disk engine> <verb> — refuses when .env names the other
+# engine explicitly: which one is current cannot be decided then. Unset or
+# unknown values leave the decision to the disk (said out loud).
+dbs_env_disk_check() {
+  local disk="$1" state raw
+  state="$(env_engine_state)"
+  case "$state" in
+    unset)
+      info "DB_ENGINE is not set in .env (the relay would run lmdb); db/ holds $disk data — the disk decides." ;;
+    other)
+      raw="$(env_value_or_empty DB_ENGINE)"
+      info_plain "DB_ENGINE in .env is '$(printable_text "$raw")', which is not an engine (the relay would run lmdb); db/ holds $disk data — the disk decides." ;;
+    "$disk") : ;;
+    *)
+      warn ".env says DB_ENGINE=$state, but db/ holds $disk data ($DISK_DATA). Which engine is current cannot be decided safely, so nothing was changed."
+      warn "If the relay should serve the $disk data, set DB_ENGINE=$disk in .env ('./$SCRIPT_NAME env'), then run './$SCRIPT_NAME $2' again."
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# db_switch <engine>
+db_switch() {
+  local target="$1" mode compose_file source ts n relay_now db="$ROOT_DIR/db" state rc=0
+
+  # --- 1 preflight: nothing is stopped or written before all of this passed ---
+  dbs_progress 1 "$DBS_STEPS" preflight
+  if [[ "$target" != "badger" && "$target" != "lmdb" ]]; then
+    warn_plain "Unknown engine '$(printable_text "$target")'. Use './$SCRIPT_NAME db-switch badger' or './$SCRIPT_NAME db-switch lmdb' (lower case), or '--rollback'."
+    dbs_result failed
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker daemon not reachable. Is Docker running?"
+    dbs_result failed
+    return 1
+  fi
+  mode="$(resolve_mode "db-switch")"
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+  if ! dbs_common_checks 1; then
+    dbs_result failed
+    return 1
+  fi
+
+  db_disk_engine
+  case "$DISK_ENGINE" in
+    mixed)
+      warn "db/ holds files of both engines in: $DISK_BAD. Which engine holds your data cannot be decided for you, so nothing was changed."
+      info "Sort it out by hand, then run db-switch again:"
+      info "  1. Decide which engine holds the data (the one the relay served before DB_ENGINE was changed)."
+      info "  2. Set DB_ENGINE to that engine in .env and back it up: './$SCRIPT_NAME backup'."
+      info "  3. Stop the relay, move db/private db/chat db/outbox db/inbox db/blossom out of db/ (keep them), set DB_ENGINE to the engine you want, then: './$SCRIPT_NAME restore <that backup> --yes'."
+      info "  4. Start the relay, check that it serves your events, and keep the old directories until you are sure."
+      dbs_result failed
+      return 1
+      ;;
+    unknown)
+      warn "Cannot tell the engine of: $DISK_BAD (unreadable, or files of neither engine). Nothing was changed."
+      dbs_result failed
+      return 1
+      ;;
+    split)
+      warn "The directories in db/ disagree about the engine ($DISK_REPORT). Which engine holds your data cannot be decided for you, so nothing was changed."
+      dbs_result failed
+      return 1
+      ;;
+    none)
+      info "db/ holds no data, so there is nothing to move: only .env needs changing. Set DB_ENGINE=$target ('./$SCRIPT_NAME env') and start the relay."
+      dbs_result failed
+      return 1
+      ;;
+  esac
+  source="$DISK_ENGINE"
+  info "Found $source data in db/ ($DISK_DATA)."
+  dbs_env_disk_check "$source" "db-switch $target" || { dbs_result failed; return 1; }
+  if [[ "$source" == "$target" ]]; then
+    state="$(env_engine_state)"
+    warn "db/ already holds $target data; there is nothing to switch."
+    [[ "$state" == "$target" ]] || info "Set DB_ENGINE=$target in .env so the relay opens it ('./$SCRIPT_NAME env')."
+    dbs_result failed
+    return 1
+  fi
+  dbs_same_fs "${DB_ENGINE_DIRS[@]}" || { dbs_result failed; return 1; }
+  backup_dir_check 0 || { dbs_result failed; return 1; }
+
+  ts="$(dbs_ts)"
+  DBS_KIND="switch"
+  DBS_SOURCE="$source"
+  DBS_TARGET="$target"
+  DBS_TS="$ts"
+  DBS_BACKUP="haven-pre-switch-$target-$ts.zip"
+  DBS_BACKUP2="haven-post-switch-$target-$ts.zip"
+  DBS_STASH=".pre-switch-$source-$ts"
+  DBS_ASIDE=""
+  DBS_DIRS=""
+  for n in "${DB_ENGINE_DIRS[@]}"; do
+    [[ -e "$db/$n" || -L "$db/$n" ]] && DBS_DIRS+="$n "
+  done
+  DBS_DIRS="${DBS_DIRS% }"
+  if [[ -n "$(env_key_lines DB_ENGINE)" ]]; then
+    DBS_ENV_SET=1
+    DBS_ENV_LINE="$(env_key_lines DB_ENGINE)"
+  else
+    DBS_ENV_SET=0
+    DBS_ENV_LINE=""
+  fi
+  for n in "$BACKUP_DIR/$DBS_BACKUP" "$BACKUP_DIR/$DBS_BACKUP2" "$db/$DBS_STASH"; do
+    if [[ -e "$n" || -L "$n" ]]; then
+      warn_plain "$n already exists; try again in a second."
+      dbs_result failed
+      return 1
+    fi
+  done
+  dbs_space_check || { dbs_result failed; return 1; }
+
+  relay_now="the relay is not running and stays stopped"
+  relay_container_running && relay_now="the relay is offline for the duration and is started again afterwards"
+  info "Switch the relay database from $source to $target:"
+  info "  - $relay_now"
+  info "  - first a verified backup: backups/$DBS_BACKUP"
+  info "  - the old directories are kept in db/$DBS_STASH/ (this script never deletes them)"
+  if ! dbs_confirm "Switch from $source to $target now?"; then
+    dbs_result failed
+    return 1
+  fi
+  # bind-mount sources compose would otherwise create root-owned (may stop here)
+  ensure_example_jsons
+  ensure_data_dirs
+
+  DBS_ACTIVE=0
+  DBS_ROLLED=0
+  DBS_RELAY_WAS_RUNNING=0
+  DBS_STEP="stop"
+  oneshot_guard_on "$compose_file" "engine switch"
+  ONESHOT_GUARD_ROLLBACK="dbs_signal_rollback"
+  ONESHOT_GUARD_REPORT="dbs_signal_report"
+  ONESHOT_RELAY_RECREATE=1
+  dbs_run "$compose_file" || rc=$?
+  return "$rc"
+}
+
+# dbs_run <compose_file> — steps 2 to 7, inside the signal guard. Messages here
+# are best effort (|| true); every step checks its own result.
+dbs_run() {
+  local compose_file="$1" db="$ROOT_DIR/db" partial status n vrc
+
+  # --- 2 stop ---
+  dbs_progress 2 "$DBS_STEPS" stop
+  if ! relay_stop_for_oneshot "$compose_file" "engine switch"; then
+    DBS_RELAY_WAS_RUNNING="$ONESHOT_RELAY_WAS_RUNNING"
+    dbs_fail "$compose_file" "the relay did not stop."
+    return 1
+  fi
+  DBS_RELAY_WAS_RUNNING="$ONESHOT_RELAY_WAS_RUNNING"
+
+  # --- 3 backup (DB_ENGINE given explicitly: .env may name no engine) ---
+  dbs_progress 3 "$DBS_STEPS" backup
+  DBS_STEP="backup"
+  backup_dir_check 1 || { dbs_fail "$compose_file" "backups/ is not usable."; return 1; }
+  partial="$BACKUP_DIR/$DBS_BACKUP.partial-$(random_suffix)"
+  ONESHOT_GUARD_PARTIAL="$partial"
+  info "Backing up the $DBS_SOURCE database to backups/$DBS_BACKUP..." || true
+  status=0
+  backup_oneshot_to "$compose_file" "$partial" -e "DB_ENGINE=$DBS_SOURCE" || status=$?
+  ONESHOT_GUARD_PARTIAL=""
+  if ! backup_finish "$compose_file" "$status" "$partial" "$BACKUP_DIR/$DBS_BACKUP"; then
+    dbs_fail "$compose_file" "the backup before the switch did not succeed."
+    return 1
+  fi
+  success_plain "Backup verified: backups/$DBS_BACKUP" || true
+  dbs_hook after-backup || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
+
+  # --- 4 move ---
+  dbs_progress 4 "$DBS_STEPS" move
+  DBS_STEP="move"
+  if ! dbs_write_marker; then
+    rm -f -- "$DB_SWITCH_MARKER" 2>/dev/null
+    dbs_fail "$compose_file" "cannot write db/.switch-in-progress."
+    return 1
+  fi
+  DBS_ACTIVE=1
+  if ! mkdir -m 700 -- "$db/$DBS_STASH" 2>/dev/null; then
+    DBS_ERR="cannot create db/$DBS_STASH"
+    dbs_fail "$compose_file" "$DBS_ERR."
+    return 1
+  fi
+  for n in "${DB_ENGINE_DIRS[@]}"; do
+    dbs_word_in "$n" "$DBS_DIRS" || continue
+    dbs_move "$db/$n" "$db/$DBS_STASH/$n" || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
+  done
+  DBS_STEP="moved"
+  dbs_write_marker || { dbs_fail "$compose_file" "cannot update db/.switch-in-progress."; return 1; }
+  info_plain "Moved the $DBS_SOURCE directories to db/$DBS_STASH/." || true
+  dbs_hook after-move || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
+
+  # --- 5 config ---
+  dbs_progress 5 "$DBS_STEPS" config
+  dbs_set_engine "$DBS_TARGET" || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
+  DBS_STEP="config"
+  dbs_write_marker || { dbs_fail "$compose_file" "cannot update db/.switch-in-progress."; return 1; }
+  info "Set DB_ENGINE=$DBS_TARGET in .env." || true
+  dbs_hook after-config || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
+
+  # --- 6 restore, then a second backup whose entries must equal the first ---
+  dbs_progress 6 "$DBS_STEPS" restore
+  vrc=0
+  if ! backup_file_owned "$BACKUP_DIR/$DBS_BACKUP"; then
+    dbs_fail "$compose_file" "backups/$DBS_BACKUP cannot be used for the restore."
+    return 1
+  fi
+  verify_backup_zip "$compose_file" "$BACKUP_DIR/$DBS_BACKUP" || vrc=$?
+  if [[ "$vrc" -ne 0 ]]; then
+    dbs_fail "$compose_file" "backups/$DBS_BACKUP no longer verifies."
+    return 1
+  fi
+  dbs_hook before-restore || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
+  info "Restoring into a new $DBS_TARGET database..." || true
+  status=0
+  restore_oneshot "$compose_file" "$DBS_BACKUP" -e "DB_ENGINE=$DBS_TARGET" || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    dbs_fail "$compose_file" "the restore exited with status $status."
+    return 1
+  fi
+  DBS_STEP="restored"
+  dbs_write_marker || { dbs_fail "$compose_file" "cannot update db/.switch-in-progress."; return 1; }
+  dbs_hook after-restore || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
+  db_disk_engine
+  if [[ "$DISK_ENGINE" != "$DBS_TARGET" ]]; then
+    dbs_fail "$compose_file" "after the restore db/ does not hold $DBS_TARGET data ($DISK_REPORT)."
+    return 1
+  fi
+  partial="$BACKUP_DIR/$DBS_BACKUP2.partial-$(random_suffix)"
+  ONESHOT_GUARD_PARTIAL="$partial"
+  info "Backing up the new $DBS_TARGET database to compare it..." || true
+  status=0
+  backup_oneshot_to "$compose_file" "$partial" -e "DB_ENGINE=$DBS_TARGET" || status=$?
+  ONESHOT_GUARD_PARTIAL=""
+  if ! backup_finish "$compose_file" "$status" "$partial" "$BACKUP_DIR/$DBS_BACKUP2"; then
+    dbs_fail "$compose_file" "the backup of the new database did not succeed."
+    return 1
+  fi
+  if ! dbs_compare_crcs "$BACKUP_DIR/$DBS_BACKUP" "$BACKUP_DIR/$DBS_BACKUP2"; then
+    dbs_fail "$compose_file" "$DBS_ERR."
+    return 1
+  fi
+  DBS_STEP="verified"
+  dbs_write_marker || { dbs_fail "$compose_file" "cannot update db/.switch-in-progress."; return 1; }
+  success "The new $DBS_TARGET database holds the same entries as the old one (per-entry CRC32 of both backups)." || true
+
+  # --- 7 start ---
+  dbs_progress 7 "$DBS_STEPS" start
+  rm -f -- "$DB_SWITCH_MARKER" 2>/dev/null
+  if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+    dbs_fail "$compose_file" "cannot remove db/.switch-in-progress."
+    return 1
+  fi
+  DBS_ACTIVE=0
+  DBS_STEP="done"
+  if [[ "$DBS_RELAY_WAS_RUNNING" == "1" ]]; then
+    info "Starting the relay on $DBS_TARGET..." || true
+    if ! relay_start_again "$compose_file"; then
+      # the marker comes back first, so an interrupted rollback can be resumed
+      DBS_STEP="start"
+      if dbs_write_marker; then
+        DBS_ACTIVE=1
+        dbs_fail "$compose_file" "the relay did not start on $DBS_TARGET."
+      else
+        dbs_fail "$compose_file" "the relay did not start on $DBS_TARGET, and db/.switch-in-progress could not be written to roll back; db/ holds the new $DBS_TARGET database, the old directories are in db/$DBS_STASH/."
+      fi
+      return 1
+    fi
+  fi
+  oneshot_guard_off
+
+  success "Switched the relay database from $DBS_SOURCE to $DBS_TARGET."
+  info_plain "Backup of the old $DBS_SOURCE database: backups/$DBS_BACKUP"
+  info_plain "Backup of the new $DBS_TARGET database: backups/$DBS_BACKUP2"
+  info_plain "The old $DBS_SOURCE directories are kept in db/$DBS_STASH/ — this script never deletes them; removing them is your own step once you are sure the relay serves everything."
+  info "To go back: './$SCRIPT_NAME db-switch --rollback' (events received after the switch stay in the $DBS_TARGET directories and are not carried back)."
+  if [[ "$DBS_RELAY_WAS_RUNNING" == "1" ]]; then
+    info "The relay is running on $DBS_TARGET."
+  else
+    info "The relay was not running before and was not started."
+  fi
+  dbs_result ok
+  return 0
+}
+
+# dbs_set_engine <engine> — step 5: DB_ENGINE through set_env_var (and its
+# config backup), keeping the quoting of the old value; read back afterwards.
+dbs_set_engine() {
+  local env_file="$ROOT_DIR/.env" raw
+  if [[ ! -f "$env_file" || ! -w "$env_file" ]]; then
+    DBS_ERR=".env is not writable, so DB_ENGINE cannot be set to $1"
+    return 1
+  fi
+  raw="$(read_env_var DB_ENGINE 2>/dev/null || true)"
+  set_env_var DB_ENGINE "$(wrap_like_raw "$raw" "$1")"
+  if [[ "$(env_value_or_empty DB_ENGINE)" != "$1" || "$(env_key_lines DB_ENGINE | awk 'END {print NR}')" -ne 1 ]]; then
+    DBS_ERR="DB_ENGINE in .env could not be set to $1"
+    return 1
+  fi
+  return 0
+}
+
+# db_switch_rollback — with a marker: finish the rollback it records; without:
+# undo the last completed switch (db/.pre-switch-*).
+db_switch_rollback() {
+  local mode compose_file relay_rc=0 back
+
+  dbs_progress 1 4 preflight
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker daemon not reachable. Is Docker running?"
+    dbs_result failed
+    return 1
+  fi
+  mode="$(resolve_mode "db-switch")"
+  compose_file="$(compose_file_for "$mode")"
+  require_compose_file "$compose_file"
+  if [[ ! -e "$DB_SWITCH_MARKER" && ! -L "$DB_SWITCH_MARKER" ]]; then
+    dbs_undo_last "$compose_file"
+    return $?
+  fi
+
+  if ! dbs_load_marker; then
+    warn_plain "db/.switch-in-progress is not a marker this script can use ($DBS_ERR); nothing was changed."
+    info "Look at it ('cat db/.switch-in-progress') and at db/.pre-switch-*/; put the directories back by hand, then remove the marker."
+    dbs_result failed
+    return 1
+  fi
+  oneshot_leftover_check || { dbs_result failed; return 1; }
+  back="$(dbs_back_engine)"
+  info_plain "Unfinished engine switch found ($DBS_KIND $DBS_SOURCE -> $DBS_TARGET, step '$DBS_STEP'); putting the $back directories back."
+
+  DBS_ROLLED=0
+  oneshot_guard_on "$compose_file" "engine switch rollback"
+  ONESHOT_GUARD_ROLLBACK="dbs_signal_rollback"
+  ONESHOT_GUARD_REPORT="dbs_signal_report"
+  ONESHOT_RELAY_RECREATE=1
+  dbs_progress 2 4 stop
+  if ! relay_stop_for_oneshot "$compose_file" "rollback"; then
+    oneshot_guard_off
+    dbs_result failed
+    return 1
+  fi
+  [[ "$ONESHOT_RELAY_WAS_RUNNING" != "1" ]] || DBS_RELAY_WAS_RUNNING=1
+  ONESHOT_RELAY_WAS_RUNNING="$DBS_RELAY_WAS_RUNNING"
+  DBS_ACTIVE=1
+  dbs_progress 3 4 rollback
+  trap '' INT TERM HUP
+  if ! dbs_restore_layout; then
+    oneshot_guard_off
+    dbs_manual_steps
+    warn "The relay was not started." || true
+    dbs_result failed
+    return 1
+  fi
+  dbs_progress 4 4 start
+  if [[ "$DBS_RELAY_WAS_RUNNING" == "1" ]]; then
+    relay_start_again "$compose_file" || relay_rc=1
+  fi
+  oneshot_guard_off
+  dbs_rolled_back_report "$relay_rc"
+  return "$relay_rc"
+}
+
+dbs_rolled_back_report() {
+  local back
+  back="$(dbs_back_engine)"
+  success "Rolled back: the $back directories are in db/ again and DB_ENGINE is as before."
+  if [[ -n "$DBS_ASIDE" ]]; then
+    if [[ "$DBS_KIND" == "undo" ]]; then
+      info_plain "The $DBS_SOURCE directories are kept in db/$DBS_ASIDE/ — events received since the switch are there and were NOT merged back."
+    else
+      info_plain "What the unfinished switch produced is kept in db/$DBS_ASIDE/ (remove it when you no longer need it)."
+    fi
+  fi
+  if [[ "$1" -ne 0 ]]; then
+    warn "The relay did not start again; it is NOT running. Check './$SCRIPT_NAME logs relay', then start it with './$SCRIPT_NAME start'."
+  elif relay_container_running; then
+    info "The relay is running ($back)."
+  else
+    info "The relay was not running and was not started."
+  fi
+  dbs_result rolled-back
+}
+
+# dbs_undo_last <compose_file> — no marker: put back the directories of the
+# last completed switch (the newest db/.pre-switch-<engine>-<ts>/), the current
+# ones go to db/.post-switch-<engine>-<ts>/.
+dbs_undo_last() {
+  local compose_file="$1" db="$ROOT_DIR/db" d name best="" best_ts="" e_old e_cur ts n raw prefix relay_rc=0
+  for d in "$db"/.pre-switch-*; do
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    name="${d##*/}"
+    [[ "$name" =~ ^\.pre-switch-(badger|lmdb)-([0-9]{8}-[0-9]{6})$ ]] || continue
+    if [[ -z "$best" || "${BASH_REMATCH[2]}" > "$best_ts" ]]; then
+      best="$name"
+      best_ts="${BASH_REMATCH[2]}"
+      e_old="${BASH_REMATCH[1]}"
+    fi
+  done
+  if [[ -z "$best" ]]; then
+    info "Nothing to roll back: no unfinished switch (db/.switch-in-progress) and no earlier switch (db/.pre-switch-*)."
+    dbs_result ok
+    return 0
+  fi
+  for d in "$db"/.post-switch-*; do
+    name="${d##*/}"
+    if [[ -d "$d" && "$name" =~ ^\.post-switch-(badger|lmdb)-([0-9]{8}-[0-9]{6})(-[0-9]+)?$ && ! "${BASH_REMATCH[2]}" < "$best_ts" ]]; then
+      info_plain "Nothing to roll back: the last switch was already rolled back (db/$name/ is not older than db/$best/)."
+      dbs_result ok
+      return 0
+    fi
+  done
+
+  if ! dbs_common_checks 0; then
+    dbs_result failed
+    return 1
+  fi
+  db_disk_engine "$db/$best"
+  if [[ "$DISK_ENGINE" != "$e_old" ]]; then
+    warn_plain "db/$best/ does not hold clean $e_old data ($DISK_REPORT); nothing was changed."
+    dbs_result failed
+    return 1
+  fi
+  DBS_DIRS=""
+  for n in "${DB_ENGINE_DIRS[@]}"; do
+    [[ -e "$db/$best/$n" || -L "$db/$best/$n" ]] && DBS_DIRS+="$n "
+  done
+  DBS_DIRS="${DBS_DIRS% }"
+  db_disk_engine
+  case "$DISK_ENGINE" in
+    none) e_cur="$( [[ "$e_old" == badger ]] && echo lmdb || echo badger )" ;;
+    badger|lmdb)
+      e_cur="$DISK_ENGINE"
+      if [[ "$e_cur" == "$e_old" ]]; then
+        warn_plain "db/ already holds $e_old data, like db/$best/; there is no switch to undo. Nothing was changed."
+        dbs_result failed
+        return 1
+      fi
+      dbs_env_disk_check "$e_cur" "db-switch --rollback" || { dbs_result failed; return 1; }
+      ;;
+    *)
+      warn "The current directories in db/ are not one clean engine ($DISK_REPORT); nothing was changed."
+      dbs_result failed
+      return 1
+      ;;
+  esac
+  dbs_same_fs "${DB_ENGINE_DIRS[@]}" || { dbs_result failed; return 1; }
+
+  ts="$(dbs_ts)"
+  DBS_KIND="undo"
+  DBS_SOURCE="$e_cur"
+  DBS_TARGET="$e_old"
+  DBS_TS="$ts"
+  DBS_BACKUP=""
+  DBS_STASH="$best"
+  DBS_ASIDE="$(dbs_unique ".post-switch-$e_cur-$ts")"
+  raw="$(read_env_var DB_ENGINE 2>/dev/null || true)"
+  prefix=""
+  [[ "$(env_key_lines DB_ENGINE)" =~ ^[[:blank:]]*export[[:blank:]] ]] && prefix="export "
+  DBS_ENV_SET=1
+  DBS_ENV_LINE="${prefix}DB_ENGINE=$(wrap_like_raw "$raw" "$e_old")"
+  DBS_STEP="undo"
+  DBS_RELAY_WAS_RUNNING=0
+  relay_container_running && DBS_RELAY_WAS_RUNNING=1
+
+  info "Undo the last engine switch (db/$best/):"
+  info "  - the current $e_cur directories go to db/$DBS_ASIDE/; events received since the switch stay there and are NOT merged back"
+  info "  - the $e_old directories from db/$best/ come back, DB_ENGINE becomes $e_old"
+  if [[ "$DBS_RELAY_WAS_RUNNING" == "1" ]]; then
+    info "  - the relay is offline meanwhile and is started again afterwards"
+  fi
+  if ! dbs_confirm "Undo the switch now?"; then
+    dbs_result failed
+    return 1
+  fi
+
+  DBS_ROLLED=0
+  oneshot_guard_on "$compose_file" "engine switch rollback"
+  ONESHOT_GUARD_ROLLBACK="dbs_signal_rollback"
+  ONESHOT_GUARD_REPORT="dbs_signal_report"
+  ONESHOT_RELAY_RECREATE=1
+  dbs_progress 2 4 stop
+  if ! relay_stop_for_oneshot "$compose_file" "rollback"; then
+    oneshot_guard_off
+    dbs_result failed
+    return 1
+  fi
+  if ! dbs_write_marker; then
+    rm -f -- "$DB_SWITCH_MARKER" 2>/dev/null
+    relay_restart_after_oneshot "$compose_file" "$DBS_RELAY_WAS_RUNNING" || true
+    oneshot_guard_off
+    warn "Cannot write db/.switch-in-progress; nothing was changed."
+    dbs_result failed
+    return 1
+  fi
+  DBS_ACTIVE=1
+  dbs_progress 3 4 rollback
+  trap '' INT TERM HUP
+  if ! dbs_restore_layout; then
+    oneshot_guard_off
+    dbs_manual_steps
+    warn "The relay was not started." || true
+    dbs_result failed
+    return 1
+  fi
+  dbs_progress 4 4 start
+  if [[ "$DBS_RELAY_WAS_RUNNING" == "1" ]]; then
+    relay_start_again "$compose_file" || relay_rc=1
+  fi
+  oneshot_guard_off
+  dbs_rolled_back_report "$relay_rc"
+  return "$relay_rc"
+}
+
 start_services() {
   local mode="$1"
   local compose_file
@@ -2869,7 +4058,7 @@ start_services() {
   require_compose_file "$compose_file"
 
   # return, not die: in the TUI the caller shows the warnings in its own box
-  if oneshot_blocks_start; then return 1; fi
+  if start_blocked; then return 1; fi
 
   prepare_start
 
@@ -2904,7 +4093,7 @@ stop_services() {
 restart_services() {
   local mode="$1"
   # before the stop: a refused start must not leave the relay stopped
-  if oneshot_blocks_start; then return 1; fi
+  if start_blocked; then return 1; fi
   stop_services "$mode"
   start_services "$mode"
 }
@@ -3956,6 +5145,7 @@ $(cat "$onion_torrc")"
             return
           fi
           set_env_var "$new_key" "$new_value"
+          env_change_warning "$new_key" "$new_value"
           restart_after_env_change
           ;;
         back)
@@ -3981,6 +5171,7 @@ $(cat "$onion_torrc")"
             return
           fi
           set_env_var "$CURRENT_ENV_KEY" "$new_value"
+          env_change_warning "$CURRENT_ENV_KEY" "$new_value"
           restart_after_env_change
           ;;
         reveal)
@@ -4281,6 +5472,20 @@ tui_loop() {
   done
 }
 
+# env_change_warning <key> <value> — after an .env edit: the warning of
+# validate_env_value, if any, in the TUI's message box (or on the terminal).
+# The prompt validates in a subshell, so its VALIDATION_WARNING is gone here.
+env_change_warning() {
+  validate_env_value "$1" "$2" || return 0
+  [[ -n "$VALIDATION_WARNING" ]] || return 0
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    tui_message "$1" "$VALIDATION_WARNING"
+  else
+    warn "$VALIDATION_WARNING"
+  fi
+  return 0
+}
+
 restart_after_env_change() {
   if ! docker info >/dev/null 2>&1; then
     warn "Docker not running; restart skipped."
@@ -4300,7 +5505,7 @@ restart_after_env_change() {
   # Runs with errexit active inside the TUI: a refusal from restart_services
   # would end the TUI, so the one-shot check comes first and is shown here.
   local refusal=""
-  if refusal="$(oneshot_blocks_start 2>&1)"; then
+  if refusal="$(start_blocked 2>&1)"; then
     if [[ "$TUI_ACTIVE" == "1" ]]; then
       tui_message "Restart" ".env was saved; the restart to apply it is skipped."$'\n\n'"$refusal"
     else
@@ -4383,12 +5588,16 @@ parse_args() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      start|stop|restart|logs|status|tui|help|import|onion|json|env|env-upgrade|backup|restore)
+      start|stop|restart|logs|status|tui|help|import|onion|json|env|env-upgrade|backup|restore|db-switch)
         COMMAND="$1"
         shift
         ;;
       -y|--yes)
         ASSUME_YES=1
+        shift
+        ;;
+      --rollback)
+        DB_SWITCH_ROLLBACK=1
         shift
         ;;
       -t|--tor)
@@ -4433,12 +5642,30 @@ parse_args() {
         if [[ ( "$COMMAND" == "backup" || "$COMMAND" == "restore" ) && -z "$DATA_FILE_ARG" && "$1" != -* ]]; then
           DATA_FILE_ARG="$1"
           shift
+        elif [[ "$COMMAND" == "db-switch" && "$DB_SWITCH_ARG_SET" == "0" && "$1" != -* ]]; then
+          DB_SWITCH_ARG="$1"
+          DB_SWITCH_ARG_SET=1
+          shift
+        elif [[ "$COMMAND" == "db-switch" && "$1" != -* ]]; then
+          die "db-switch takes one engine: badger or lmdb."
         else
           die "Unknown argument: $1"
         fi
         ;;
     esac
   done
+
+  if [[ "$DB_SWITCH_ROLLBACK" == "1" && "$COMMAND" != "db-switch" ]]; then
+    die "--rollback belongs to db-switch: $SCRIPT_NAME db-switch --rollback"
+  fi
+  if [[ "$COMMAND" == "db-switch" ]]; then
+    if [[ "$DB_SWITCH_ROLLBACK" == "1" && "$DB_SWITCH_ARG_SET" == "1" ]]; then
+      die "db-switch takes either an engine or --rollback, not both."
+    fi
+    if [[ "$DB_SWITCH_ROLLBACK" == "0" && "$DB_SWITCH_ARG_SET" == "0" ]]; then
+      die "db-switch needs an engine: $SCRIPT_NAME db-switch badger|lmdb (or --rollback)."
+    fi
+  fi
 }
 
 main() {
@@ -4499,6 +5726,14 @@ main() {
     restore)
       ensure_docker
       restore_relay_db "$(resolve_mode "restore")" "$DATA_FILE_ARG" || exit 1
+      ;;
+    db-switch)
+      # both check docker themselves, after the argument: a typo needs no daemon
+      if [[ "$DB_SWITCH_ROLLBACK" == "1" ]]; then
+        db_switch_rollback || exit 1
+      else
+        db_switch "$DB_SWITCH_ARG" || exit 1
+      fi
       ;;
     env)
       menu_env_editor
