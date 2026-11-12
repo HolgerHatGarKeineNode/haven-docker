@@ -27,7 +27,11 @@
 #
 # STEPS
 #   seed     relay up, N kind-1 notes + one blob over the wire, golden ID set
-#   backup   ./haven backup p2.zip with the relay running (host unzip verifies)
+#   backup   ./haven backup p2.zip with the relay running (host unzip verifies);
+#            backups/ created 0700, the zip 0600 (umask 077 in the container)
+#   sigterm  ./haven backup sig.zip, SIGTERM to ./haven while the one-shot
+#            container exists: what the trap does with compose run -T (relay
+#            restarted? one-shot container gone?)
 #   image    ./haven backup p2-image.zip with no host unzip (image unzip verifies)
 #   damaged  ./haven restore of a 1-byte-truncated and a byte-flipped copy, with
 #            the image's unzip only: both refused, relay not restarted
@@ -294,17 +298,55 @@ check zip-five-entries "$( [ "$(tr '\n' ' ' <"$EVID/p2.entries")" = "blossom.jso
 check zip-unzip-t "$( [ $ut = 0 ] && echo yes || echo no)" "host unzip -t rc=$ut"
 own=$(stat -c '%u:%g' "$Z")
 check zip-host-owner "$( [ "$own" = "$(id -u):$(id -g)" ] && echo yes || echo no)" "zip owner $own, host $(id -u):$(id -g); $(stat -c '%a %s' "$Z") (mode, bytes)"
-check zip-no-partial "$( [ ! -e "$Z.partial" ] && echo yes || echo no)" "$(ls -A "$SB/backups" | tr '\n' ' ')"
+zmode=$(stat -c %a "$Z"); bmode=$(stat -c %a "$SB/backups")
+check zip-mode-600 "$( [ "$zmode" = 600 ] && echo yes || echo no)" "zip mode $zmode"
+check backups-mode-700 "$( [ "$bmode" = 700 ] && echo yes || echo no)" "backups/ mode $bmode (created by ./haven)"
+check zip-no-partial "$( [ -z "$(find "$SB/backups" -name '*.partial*' -print -quit)" ] && echo yes || echo no)" "$(find "$SB/backups" -mindepth 1 -printf '%f ')"
 t1=$(relay_started_at)
 check backup-relay-restarted "$( [ "$t0" != "$t1" ] && [ "$(relay_state)" = running ] && echo yes || echo no)" "StartedAt before=$t0 after=$t1 state=$(relay_state)"
 wait_ready after-backup && snap after-backup
 check backup-relay-serves "${R[after-backup.eq]:-no}" "after the backup the restarted relay serves the golden set"
 
 # ===========================================================================
+# SIGTERM to ./haven backup while the one-shot container runs
+# ===========================================================================
+ONESHOT="$RELAY_NAME-oneshot"
+oneshot_present() { docker ps -a --format '{{.Names}}' | grep -qxF -- "$ONESHOT"; }
+sig_landed=no
+for attempt in 1 2 3; do
+  [ "$(relay_state)" = running ] || wait_ready "before-sigterm-$attempt"
+  t8=$(relay_started_at)
+  printf '+ COMPOSE_PROJECT_NAME=%s HAVEN_CONTAINER_NAME=%s ./haven --plain backup sig%s.zip & ; kill -TERM <pid> once %s exists\n' "$PROJ" "$RELAY_NAME" "$attempt" "$ONESHOT" >>"$CMDLOG"
+  ( cd "$SB" && COMPOSE_PROJECT_NAME=$PROJ HAVEN_CONTAINER_NAME=$RELAY_NAME exec ./haven --plain backup "sig$attempt.zip" ) >"$EVID/sigterm-$attempt.log" 2>&1 &
+  hp=$!
+  seen=no
+  for ((i = 0; i < 600; i++)); do
+    if oneshot_present; then seen=yes; break; fi
+    kill -0 "$hp" 2>/dev/null || break
+    sleep 0.05
+  done
+  [ "$seen" = yes ] && kill -TERM "$hp"
+  wait "$hp"; sig_rc=$?
+  result "sigterm-$attempt" "one-shot seen=$seen, ./haven rc=$sig_rc"
+  if [ "$seen" = yes ] && grep -q 'Received SIGTERM during the backup' "$EVID/sigterm-$attempt.log"; then
+    sig_landed=yes
+    break
+  fi
+done
+sleep 1
+t9=$(relay_started_at)
+check sigterm-landed "$sig_landed" "SIGTERM reached ./haven while $ONESHOT existed (attempt $attempt); ./haven rc=$sig_rc"
+check sigterm-exit-143 "$( [ "$sig_rc" = 143 ] && echo yes || echo no)" "./haven re-raised the signal: rc=$sig_rc"
+check sigterm-relay-restarted "$( [ "$(relay_state)" = running ] && [ "$t8" != "$t9" ] && echo yes || echo no)" "relay state=$(relay_state), StartedAt before=$t8 after=$t9; ./haven said: $(grep -oE 'The relay is (running|NOT running)' "$EVID/sigterm-$attempt.log" | tail -n1)"
+check sigterm-oneshot-gone "$( ! oneshot_present && echo yes || echo no)" "docker ps -a lists $ONESHOT: $(oneshot_present && echo yes || echo no)"
+result sigterm-files "backups/ after the interrupted run: $(find "$SB/backups" -mindepth 1 -printf '%f ')"
+wait_ready after-sigterm
+
+# ===========================================================================
 # backup verified by the image's unzip (no host unzip)
 # ===========================================================================
 HAVEN_HOST_UNZIP=no-such-unzip-p2 haven backup-image --plain backup p2-image.zip
-check image-backup-verified "$( [ "${R[backup-image.rc]}" = 0 ] && grep -q "verified with the image's unzip" "$EVID/backup-image.log" && echo yes || echo no)" "rc=${R[backup-image.rc]}; $(grep -o 'Backup written: .*' "$EVID/backup-image.log" | sed "s#$SB/##")"
+check image-backup-verified "$( [ "${R[backup-image.rc]}" = 0 ] && grep -q "verified with the image's unzip" "$EVID/backup-image.log" && [ "$(stat -c %a "$SB/backups/p2-image.zip")" = 600 ] && echo yes || echo no)" "rc=${R[backup-image.rc]}; mode $(stat -c %a "$SB/backups/p2-image.zip" 2>/dev/null); $(grep -o 'Backup written: .*' "$EVID/backup-image.log" | sed "s#$SB/##")"
 wait_ready after-image-backup
 
 # ===========================================================================
