@@ -1610,7 +1610,9 @@ if wait_for t19f "▸ s Start"; then
   tmx send-keys -t t19f -l lmdb
   poll_until "$WAIT_T" prompt_cell_is t19f "Type lmdb:" "lmdb"
   tmx send-keys -t t19f Enter
-  if wait_for t19f "Switch rolled back" && [[ "$(left_rows t19f 4 22 | tr -s ' \n' '  ')" == *"Step 'restore' failed; the switch was rolled back: db/ and DB_ENGINE are back on badger."* ]]; then
+  # the box's title is drawn before its body: poll for the whole sentence
+  t19f_box() { [[ "$(left_rows t19f 4 22 | tr -s ' \n' '  ')" == *"Step 'restore' failed; the switch was rolled back: db/ and DB_ENGINE are back on badger."* ]]; }
+  if wait_for t19f "Switch rolled back" && poll_until "$WAIT_T" t19f_box; then
     ok "switch: an injected restore failure names the step and the old engine"
   else
     bad "switch: rolled-back box wrong ($(capture t19f | tr '\n' '|' | head -c 240))"
@@ -1669,7 +1671,7 @@ if wait_for t19r "▸ s Start" && wait_for t19r "n Undo interrupted switch"; the
   send_settled t19r n
   wait_for t19r "Undo the interrupted switch?"
   tmx send-keys -t t19r Left Enter
-  if wait_for t19r "Undo failed" && has_text t19r "not a marker this script can use"; then
+  if wait_for t19r "Undo failed" && wait_for t19r "not a marker this script can use"; then
     ok "marker: the entry ran db-switch --rollback and shows the verb's refusal"
   else
     bad "marker: no rollback result ($(capture t19r | tr '\n' '|' | head -c 200))"
@@ -1690,7 +1692,7 @@ if wait_for t19c "▸ s Start"; then
   poll_until "$WAIT_T" test -e "$SB/.rig/started"
   wait_for t19c "Backing up"
   tmx send-keys -t t19c C-c
-  if wait_for t19c "Backup interrupted" && has_text t19c "Received SIGINT"; then
+  if wait_for t19c "Backup interrupted" && wait_for t19c "Received SIGINT"; then
     ok "Ctrl-C: the child's guard reported, the TUI shows it"
   else
     bad "Ctrl-C: no interrupted box ($(capture t19c | tr '\n' '|' | head -c 240))"
