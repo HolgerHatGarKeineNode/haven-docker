@@ -105,10 +105,11 @@ env_engine() {
   if grep -q '^DB_ENGINE=' "$SB/.env"; then echo "$v"; else echo unset; fi
 }
 
-# hash and path of every file under db/ (the marker and the DB_ENGINE note of a
-# mixed stash excluded: they are ./haven's own)
+# hash and path of every file under db/ (the marker, the DB_ENGINE note of a
+# mixed stash and the directory note of every stash excluded: they are
+# ./haven's own)
 db_files() {
-  (cd "$SB/db" && find . -type f ! -name '.switch-in-progress*' ! -name '.switch-env' -print0 | sort -z | xargs -0 -r sha1sum)
+  (cd "$SB/db" && find . -type f ! -name '.switch-in-progress*' ! -name '.switch-env' ! -name '.switch-dirs' -print0 | sort -z | xargs -0 -r sha1sum)
 }
 snapshot() { db_files > "$TEST_DIR/before.files"; cp -p "$SB/.env" "$TEST_DIR/env.before"; }
 # 14. every file that was under db/ is still there with the same content: at
@@ -961,7 +962,7 @@ editor_edit() { # <current db/ state is set up> <value>
     set +e
     DOCKER_COMPOSE=(docker compose)
     TUI_ACTIVE=1 FOLLOW_LOGS=0 TUI_VIEW=env_item MENU_IDS=(edit) TUI_SEL=0 CURRENT_ENV_KEY=DB_ENGINE
-    tui_prompt() { if "$3" "$2"; then printf "%s" "$PROMPT_RESULT"; else echo "PROMPT-ERROR[$VALIDATION_ERROR]" >&2; fi; }
+    tui_prompt() { if "$3" "$EDIT_VALUE"; then printf "%s" "$PROMPT_RESULT"; else echo "PROMPT-ERROR[$VALIDATION_ERROR]" >&2; fi; }
     tui_message() { printf "MESSAGE[%s] %s\n" "$1" "$2"; }
     tui_set_view() { :; }
     tui_handle_enter
@@ -1156,4 +1157,359 @@ tui_starts() {
   run hv db-switch lmdb --yes
   [ "$status" -eq 0 ]
   nothing_lost
+}
+
+# ---------- P4: hardening from the P3 security audit ----------
+
+# a host directory outside db/ that must never be touched: one database
+# directory with a foreign file, and an empty directory for a set-aside target
+host_dirs() {
+  mkdir -p "$TEST_DIR/host/private" "$TEST_DIR/hostaside"
+  printf 'foreign\n' > "$TEST_DIR/host/private/foreign"
+}
+host_untouched() {
+  [ "$(cat "$TEST_DIR/host/private/foreign")" = foreign ] || { echo "host/private changed"; return 1; }
+  [ -z "$(ls -A "$TEST_DIR/hostaside")" ] || { echo "hostaside got: $(ls -A "$TEST_DIR/hostaside")"; return 1; }
+  [ ! -e "$SB/db/private/foreign" ] || { echo "foreign file came into db/"; return 1; }
+}
+marker_with() { # <step> <aside name or empty>
+  printf 'kind=switch\nsource=badger\ntarget=lmdb\nstarted=%s\nbackup=haven-pre-switch-lmdb-%s.zip\nstash=.pre-switch-badger-%s\naside=%s\ndirs=%s\nrelay_was_running=0\nenv_set=1\nenv_line=DB_ENGINE="badger" # badger, lmdb\nstep=%s\n' \
+    "$TS" "$TS" "$TS" "$2" "$DIRS" "$1" > "$SB/db/.switch-in-progress"
+}
+
+@test "A1a --rollback with a crafted marker: a symlinked stash or set-aside directory is refused, nothing moves in or out of db/" {
+  host_dirs
+  fake_engine badger
+  snapshot
+  # stash -> host directory
+  ln -s "$TEST_DIR/host" "$SB/db/.pre-switch-badger-$TS"
+  marker_with moved ""
+  run hv db-switch --rollback
+  echo "$output"
+  [ "$status" -ne 0 ]
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" == *"db/.pre-switch-badger-$TS is not a directory db-switch made"* ]]
+  host_untouched
+  originals_in_place
+  cmp "$TEST_DIR/env.before" "$SB/.env"
+  [ -e "$SB/db/.switch-in-progress" ]
+  # set-aside -> host directory, stash real (step restored: db/ holds new lmdb dirs)
+  rm -f "$SB/db/.pre-switch-badger-$TS" "$SB/db/.switch-in-progress"
+  mkdir -m 700 "$SB/db/.pre-switch-badger-$TS"
+  local n
+  for n in $DIRS; do mv "$SB/db/$n" "$SB/db/.pre-switch-badger-$TS/$n"; mkdir "$SB/db/$n"; printf 'new %s\n' "$n" > "$SB/db/$n/data.mdb"; done
+  db_files > "$TEST_DIR/mid.files"
+  ln -s "$TEST_DIR/hostaside" "$SB/db/.failed-$TS"
+  marker_with restored ".failed-$TS"
+  run hv db-switch --rollback
+  echo "$output"
+  [ "$status" -ne 0 ]
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" == *"db/.failed-$TS is not a directory db-switch made"* ]]
+  host_untouched
+  db_files | cmp - "$TEST_DIR/mid.files"
+}
+
+wait_file() { # <path> — up to 10 s
+  local i
+  for ((i = 0; i < 200; i++)); do
+    [[ -e "$1" ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+@test "A1b stash name planted as a symlink while the backup runs: the switch ends without a rollback, marker gone, nothing moved" {
+  host_dirs
+  fake_engine badger
+  relay_running
+  snapshot
+  export MOCK_RUN_HOLD=1 MOCK_HOLD_AT=1 MOCK_HOLD_MAX=20
+  "$SB/haven" db-switch lmdb --yes </dev/null >"$TEST_DIR/out" 2>&1 &
+  local pid=$! st=0
+  wait_file "$MOCK_DOCKER_STATE_DIR/started"
+  ln -s "$TEST_DIR/host" "$SB/db/.pre-switch-badger-$TS"
+  : > "$MOCK_DOCKER_STATE_DIR/release"
+  wait "$pid" || st=$?
+  output="$(cat "$TEST_DIR/out")"
+  echo "$output"; calls
+  [ "$st" -ne 0 ]
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" == *"cannot create db/.pre-switch-badger-$TS"* ]]
+  [[ "$output" == *"Nothing was changed"* ]]
+  host_untouched
+  originals_in_place
+  [ ! -e "$SB/db/.switch-in-progress" ]
+  [ -L "$SB/db/.pre-switch-badger-$TS" ]
+  [ "$(env_engine)" = badger ]
+  relay_is_running
+}
+
+@test "A1c undo with the stash swapped for a symlink after selection: refused before any move, marker gone, relay back" {
+  host_dirs
+  fake_engine badger
+  relay_running
+  run hv db-switch lmdb --yes
+  [ "$status" -eq 0 ]
+  db_files > "$TEST_DIR/before.files"
+  cp -p "$SB/.env" "$TEST_DIR/env.before"
+  : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+  export MOCK_STOP_SLEEP=2
+  "$SB/haven" db-switch --rollback --yes </dev/null >"$TEST_DIR/out" 2>&1 &
+  local pid=$! st=0 i
+  for ((i = 0; i < 200; i++)); do
+    grep -q ' stop relay$' "$MOCK_DOCKER_STATE_DIR/calls.log" 2>/dev/null && break
+    sleep 0.05
+  done
+  mv "$SB/db/.pre-switch-badger-$TS" "$TEST_DIR/stash-moved"
+  ln -s "$TEST_DIR/host" "$SB/db/.pre-switch-badger-$TS"
+  wait "$pid" || st=$?
+  output="$(cat "$TEST_DIR/out")"
+  echo "$output"; calls
+  [ "$st" -ne 0 ]
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" == *"is not a directory db-switch made"* ]]
+  host_untouched
+  [ "$(disk_engine)" = lmdb ] && [ "$(env_engine)" = lmdb ]
+  [ -z "$(ls -A "$SB/db" | grep -E '^\.post-switch-')" ]
+  [ ! -e "$SB/db/.switch-in-progress" ]
+  cmp "$TEST_DIR/env.before" "$SB/.env"
+  relay_is_running
+}
+
+# A2 — the five layouts of the audit, .env lmdb; data badger where there is any
+layout_a2() { # <clean|one-unreadable|all-unreadable|one-neither|split>
+  local n
+  chmod -R u+rwX "$SB/db"
+  rm -rf "$SB/db/"*
+  case "$1" in
+    clean) fake_engine badger ;;
+    one-unreadable) fake_engine badger; chmod 000 "$SB/db/chat" ;;
+    all-unreadable) fake_engine badger; for n in $DIRS; do chmod 000 "$SB/db/$n"; done ;;
+    one-neither) fake_engine badger; rm -f "$SB/db/chat/"*; printf 'x\n' > "$SB/db/chat/notes.txt" ;;
+    split)
+      fake_engine badger
+      for n in outbox inbox blossom; do rm -f "$SB/db/$n/"*; printf 'd\n' > "$SB/db/$n/data.mdb"; done ;;
+  esac
+}
+start_ran() { grep -qE '^compose .* up -d' "$MOCK_DOCKER_STATE_DIR/calls.log" 2>/dev/null; }
+editor_edit() { # <value> — the TUI env editor writing DB_ENGINE=<value>
+  EDIT_VALUE="$1" bash -c '
+    source "$1"; set +e
+    DOCKER_COMPOSE=(docker compose)
+    TUI_ACTIVE=1 FOLLOW_LOGS=0 TUI_VIEW=env_item MENU_IDS=(edit) TUI_SEL=0 CURRENT_ENV_KEY=DB_ENGINE
+    tui_prompt() { if "$3" "$EDIT_VALUE"; then printf "%s" "$PROMPT_RESULT"; else echo "PROMPT-ERROR[$VALIDATION_ERROR]" >&2; fi; }
+    tui_confirm() { return 1; }
+    tui_message() { printf "MESSAGE[%s] %s\n" "$1" "$2"; }
+    tui_handle_enter
+  ' _ "$SB/haven" 2>&1
+}
+
+@test "A2 start gate per directory: blocks when readable data holds only the other engine (unreadable or foreign directories do not open it)" {
+  set_env_engine lmdb
+  local l
+  for l in clean one-unreadable one-neither; do
+    if [[ "$l" == one-unreadable && "$(id -u)" -eq 0 ]]; then continue; fi
+    layout_a2 "$l"
+    : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+    run hv start
+    echo "[$l] $output"
+    [ "$status" -ne 0 ]
+    ! start_ran
+    [[ "$output" == *"db/ holds badger data, but .env runs the relay on lmdb"* ]]
+    [[ "$output" == *"db-switch lmdb"* ]]
+  done
+  # split: a directory holds the engine .env runs: starts, with one warning line
+  layout_a2 split
+  : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+  run hv start
+  echo "[split] $output"
+  [ "$status" -eq 0 ]
+  start_ran
+  [ "$(printf '%s\n' "$output" | grep -c 'disagree about the engine')" -eq 1 ]
+  [[ "$output" == *"db-switch lmdb --from"* ]]
+}
+
+@test "A2 all directories unreadable: start and the env editor go ahead with one warning line each" {
+  [ "$(id -u)" -ne 0 ] || skip "uid 0 reads every directory"
+  set_env_engine lmdb
+  layout_a2 all-unreadable
+  run hv start
+  echo "$output"
+  [ "$status" -eq 0 ]
+  start_ran
+  [ "$(printf '%s\n' "$output" | grep -c 'Cannot tell which engine db/ holds')" -eq 1 ]
+  : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+  run editor_edit badger
+  echo "$output"
+  [ "$(printf '%s\n' "$output" | grep -c '^MESSAGE\[DB_ENGINE\] Cannot tell which engine db/ holds')" -eq 1 ]
+  grep -qx 'DB_ENGINE=badger' "$SB/.env"
+}
+
+@test "A2 env editor on the five layouts: refuses where the other engine's data is readable, warns only where nothing can be judged" {
+  set_env_engine badger
+  local l
+  for l in clean one-unreadable one-neither split; do
+    if [[ "$l" == one-unreadable && "$(id -u)" -eq 0 ]]; then continue; fi
+    layout_a2 "$l"
+    cp -p "$SB/.env" "$TEST_DIR/env.before"
+    run editor_edit lmdb
+    echo "[$l] $output"
+    [[ "$output" == *"PROMPT-ERROR[db/ holds "* ]]
+    [[ "$output" != *"Cannot tell"* ]]
+    cmp "$TEST_DIR/env.before" "$SB/.env"
+  done
+}
+
+@test "A3 undo refuses a stash thinned by hand and names what is missing; nothing changes" {
+  fake_engine badger
+  relay_running
+  run hv db-switch lmdb --yes
+  [ "$status" -eq 0 ]
+  mv "$SB/db/.pre-switch-badger-$TS/private" "$TEST_DIR/removed-private"
+  db_files > "$TEST_DIR/mid.files"
+  cp -p "$SB/.env" "$TEST_DIR/env.before"
+  : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+  run hv db-switch --rollback --yes
+  echo "$output"
+  [ "$status" -ne 0 ]
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" == *"private is missing"* ]]
+  [[ "$output" != *"Rolled back"* ]]
+  [ -z "$(state_changes)" ]
+  db_files | cmp - "$TEST_DIR/mid.files"
+  cmp "$TEST_DIR/env.before" "$SB/.env"
+  relay_is_running
+  # the note itself removed: refused as well
+  [ "$(cat "$SB/db/.pre-switch-badger-$TS/.switch-dirs")" = "dirs=$DIRS" ]
+  mv "$TEST_DIR/removed-private" "$SB/db/.pre-switch-badger-$TS/private"
+  rm "$SB/db/.pre-switch-badger-$TS/.switch-dirs"
+  run hv db-switch --rollback --yes
+  echo "$output"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *".switch-dirs is missing"* ]]
+  [ -z "$(state_changes)" ]
+}
+
+@test "A3 undo of a mixed switch whose stash was emptied by hand is refused (no 'Rolled back' onto an empty database)" {
+  reporter_state
+  run hv db-switch lmdb --from badger --yes
+  [ "$status" -eq 0 ]
+  local n
+  mkdir "$TEST_DIR/emptied"
+  for n in $DIRS; do mv "$SB/db/.pre-switch-mixed-$TS/$n" "$TEST_DIR/emptied/"; done
+  db_files > "$TEST_DIR/mid.files"
+  : > "$MOCK_DOCKER_STATE_DIR/calls.log"
+  echo 20260102-040000 > "$NOW_FILE"
+  run hv db-switch --rollback --yes
+  echo "$output"
+  [ "$status" -ne 0 ]
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" == *"private chat outbox inbox blossom is missing"* ]]
+  [ -z "$(state_changes)" ]
+  db_files | cmp - "$TEST_DIR/mid.files"
+  [ "$(disk_engine)" = lmdb ]
+}
+
+# a docker stand-in in front of the mock: on the step-7 `up -d relay` it runs
+# $UP_ACTION once (as the first such call), then hands over to the mock
+up_hook_docker() {
+  cat > "$TEST_DIR/bin/docker" <<SH
+#!/usr/bin/env bash
+if [[ " \$* " == *" up -d relay "* && ! -e "$TEST_DIR/up-hooked" ]]; then
+  : > "$TEST_DIR/up-hooked"
+  eval "\$UP_ACTION"
+fi
+exec "$REPO_ROOT/tests/mock/docker" "\$@"
+SH
+  chmod +x "$TEST_DIR/bin/docker"
+}
+
+@test "A4 SIGTERM during the step-7 relay start while the start fails: the result is not ok" {
+  fake_engine badger
+  relay_running
+  up_hook_docker
+  export MOCK_START_FAILS=1 UP_ACTION='kill -TERM $PPID'
+  local st=0
+  "$SB/haven" db-switch lmdb --yes </dev/null >"$TEST_DIR/out" 2>&1 || st=$?
+  output="$(cat "$TEST_DIR/out")"
+  echo "rc=$st"; echo "$output"; calls
+  [ -e "$TEST_DIR/up-hooked" ]
+  [ "$st" -eq 143 ]
+  grep -q 'Received SIGTERM during the engine switch' "$TEST_DIR/out"
+  ! relay_is_running
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" == *"is NOT running now"* ]]
+}
+
+@test "A4 control: SIGTERM during the step-7 relay start that succeeds ends ::result ok" {
+  fake_engine badger
+  relay_running
+  up_hook_docker
+  export UP_ACTION='kill -TERM $PPID'
+  local st=0
+  "$SB/haven" db-switch lmdb --yes </dev/null >"$TEST_DIR/out" 2>&1 || st=$?
+  output="$(cat "$TEST_DIR/out")"
+  echo "rc=$st"; echo "$output"
+  [ -e "$TEST_DIR/up-hooked" ]
+  relay_is_running
+  [ "$(result_line)" = "::result ok" ]
+}
+
+@test "A5 late failure without a rollback (start fails, marker cannot be written): the message says db/ holds the new database, and --rollback brings the old one back" {
+  [ "$(id -u)" -ne 0 ] || skip "uid 0 writes into a read-only directory"
+  fake_engine badger
+  relay_running
+  snapshot
+  up_hook_docker
+  export MOCK_START_FAILS=1 UP_ACTION="chmod a-w '$SB/db'"
+  run hv db-switch lmdb --yes
+  chmod u+w "$SB/db"
+  echo "$output"; calls
+  [ -e "$TEST_DIR/up-hooked" ]
+  [ "$status" -ne 0 ]
+  [ "$(result_line)" = "::result failed" ]
+  [[ "$output" != *"Nothing was changed"* ]]
+  [[ "$output" == *"Not rolled back: db/ holds the new lmdb database and DB_ENGINE=lmdb; the old directories are in db/.pre-switch-badger-$TS/."* ]]
+  [ "$(disk_engine)" = lmdb ] && [ "$(env_engine)" = lmdb ]
+  unset MOCK_START_FAILS
+  echo 20260102-040000 > "$NOW_FILE"
+  run hv db-switch --rollback --yes
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [ "$(disk_engine)" = badger ] && [ "$(env_engine)" = badger ]
+  originals_in_place
+}
+
+@test "A6 env-upgrade without a DB_ENGINE line: the added line names the engine on disk and says so; empty or mixed db/ keep the example value" {
+  printf 'DB_ENGINE="badger" # badger, lmdb\nRELAY_PORT=3355\nNEW_KEY=1\n' > "$SB/.env.example"
+  printf 'DOCKER_UID=%s\nRELAY_PORT=3355\n' "$(id -u)" > "$SB/.env"
+  fake_engine lmdb
+  run hv env-upgrade
+  echo "$output"
+  [ "$status" -eq 0 ]
+  grep -qx 'DB_ENGINE="lmdb" # badger, lmdb' "$SB/.env"
+  [[ "$output" == *"DB_ENGINE added as lmdb: db/ holds lmdb data"* ]]
+  # the start gate is satisfied afterwards
+  run hv start
+  [ "$status" -eq 0 ]
+  # empty db/: the example value, no note
+  rm -rf "$SB/db/"*
+  printf 'DOCKER_UID=%s\nRELAY_PORT=3355\n' "$(id -u)" > "$SB/.env"
+  run hv env-upgrade
+  echo "$output"
+  grep -qx 'DB_ENGINE="badger" # badger, lmdb' "$SB/.env"
+  [[ "$output" != *"DB_ENGINE added as"* ]]
+  # mixed db/: the example value, no note
+  fake_engine badger; fake_engine lmdb
+  printf 'DOCKER_UID=%s\nRELAY_PORT=3355\n' "$(id -u)" > "$SB/.env"
+  run hv env-upgrade
+  grep -qx 'DB_ENGINE="badger" # badger, lmdb' "$SB/.env"
+  [[ "$output" != *"DB_ENGINE added as"* ]]
+  # a line already there is never touched
+  rm -rf "$SB/db/"*; fake_engine lmdb
+  printf 'DOCKER_UID=%s\nDB_ENGINE=badger\n' "$(id -u)" > "$SB/.env"
+  run hv env-upgrade
+  grep -qx 'DB_ENGINE=badger' "$SB/.env"
+  [ "$(grep -c '^DB_ENGINE=' "$SB/.env")" -eq 1 ]
 }

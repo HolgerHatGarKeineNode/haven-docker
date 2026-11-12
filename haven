@@ -1808,6 +1808,7 @@ report_upstream_env_drift() {
   return 0
 }
 
+UPGRADE_ENV_NOTE=""
 upgrade_env_file() {
   local env_file="$ROOT_DIR/.env"
   local example_file="$ROOT_DIR/.env.example"
@@ -1819,10 +1820,25 @@ upgrade_env_file() {
     return 0
   fi
 
+  # A missing DB_ENGINE line means lmdb to the relay (upstream), while the
+  # example suggests badger: with data of one engine in db/ the added line
+  # names that engine, or the start gate would refuse the relay afterwards.
+  local engine=""
+  UPGRADE_ENV_NOTE=""
+  if [[ -z "$(env_key_lines DB_ENGINE)" ]] && grep -qE '^[[:blank:]]*(export[[:blank:]]+)?DB_ENGINE=' "$example_file"; then
+    db_disk_engine
+    case "$DISK_ENGINE" in
+      badger|lmdb)
+        engine="$DISK_ENGINE"
+        UPGRADE_ENV_NOTE="DB_ENGINE added as $engine: db/ holds $engine data ($DISK_DATA)."
+        ;;
+    esac
+  fi
+
   backup_config_file "$env_file"
 
   # shellcheck disable=SC2016  # an awk program: $0 belongs to awk, not to the shell
-  if ! replace_file_from "$env_file" awk '
+  if ! replace_file_from "$env_file" env UPG_ENGINE="$engine" awk '
     function extract_key(line,    tmp, ep, kp) {
       tmp = line
       sub(/^[ \t]*/, "", tmp)
@@ -1850,10 +1866,19 @@ upgrade_env_file() {
         } else {
           n_missing++
           insert_after[n_missing] = last_anchor
+          line = $0
+          if (key == "DB_ENGINE" && ENVIRON["UPG_ENGINE"] != "") {
+            # the value (double-quoted or bare) becomes the engine on disk;
+            # the comment after it stays
+            ep = index(line, "=")
+            rest = substr(line, ep + 1)
+            if (match(rest, /^"[^"]*"/) || match(rest, /^[^ \t#]*/)) rest = substr(rest, RLENGTH + 1)
+            line = substr(line, 1, ep) "\"" ENVIRON["UPG_ENGINE"] "\"" rest
+          }
           if (has_gap) {
-            insert_block[n_missing] = "\n" $0 "\n"
+            insert_block[n_missing] = "\n" line "\n"
           } else {
-            insert_block[n_missing] = $0 "\n"
+            insert_block[n_missing] = line "\n"
           }
           has_gap = 0
         }
@@ -2435,40 +2460,70 @@ start_blocked() {
   engine_mismatch_blocks
 }
 
-# engine_mismatch_blocks — 0 (with the reason and both ways out) when the
-# engine .env runs (unset or unknown counts as lmdb, as upstream) differs from
-# the ONLY engine found in db/: the relay would serve an empty database and
-# write a new one next to the data (measured, plan P1). Directories holding
-# both engines only warn, once per run — that layout is functional and may
-# hold events received since. An empty db/ never blocks.
+# engine_mismatch_blocks — 0 (with the reason and both ways out) when a
+# readable directory in db/ holds only the engine .env does NOT run (unset or
+# unknown counts as lmdb, as upstream) and no directory holds the one it runs:
+# the relay would serve an empty database and write a new one next to the data
+# (measured, plan P1). Judged per directory, like engine_change_allowed, so an
+# unreadable directory or one of neither engine next to the data does not open
+# the gate. Directories holding both engines (or disagreeing) only warn, once
+# per run — that layout is functional and may hold events received since. An
+# empty db/ never blocks; a db/ of which nothing can be judged warns.
 START_MIXED_WARNED=0
 MIXED_START_WARNING="db/ holds files of both engines"
 engine_mismatch_blocks() {
-  local state eff shown
+  local state eff other shown r
   db_disk_engine
   state="$(env_engine_state)"
   eff="lmdb"
   [[ "$state" != "badger" ]] || eff="badger"
+  other="badger"
+  [[ "$eff" != "badger" ]] || other="lmdb"
   case "$state" in
     unset) shown="DB_ENGINE is not set" ;;
     other) shown="DB_ENGINE='$(printable_text "$(env_value_or_empty DB_ENGINE)")'" ;;
     *) shown="DB_ENGINE=$state" ;;
   esac
-  case "$DISK_ENGINE" in
-    badger|lmdb)
-      [[ "$DISK_ENGINE" != "$eff" ]] || return 1
-      warn_plain "db/ holds $DISK_ENGINE data, but .env runs the relay on $eff ($shown). Started like this, the relay would serve an empty database and write a new $eff database next to your data, so it is not started."
-      warn "Either move the data to $eff with './$SCRIPT_NAME db-switch $eff', or set DB_ENGINE=$DISK_ENGINE in .env ('./$SCRIPT_NAME env'); then start again."
-      return 0
-      ;;
-    mixed)
-      if [[ "$START_MIXED_WARNED" != "1" ]]; then
+  r=" $DISK_REPORT "
+  if [[ "$r" == *"=$other "* && "$r" != *"=$eff "* && "$r" != *"=mixed "* ]]; then
+    warn_plain "db/ holds $other data, but .env runs the relay on $eff ($shown). Started like this, the relay would serve an empty database and write a new $eff database next to your data, so it is not started."
+    [[ -z "$DISK_BAD" ]] || warn_plain "Not readable or of neither engine: $DISK_BAD."
+    warn "Either move the data to $eff with './$SCRIPT_NAME db-switch $eff', or set DB_ENGINE=$other in .env ('./$SCRIPT_NAME env'); then start again."
+    return 0
+  fi
+  if [[ "$START_MIXED_WARNED" != "1" ]]; then
+    case "$DISK_ENGINE" in
+      mixed)
         START_MIXED_WARNED=1
         warn "$MIXED_START_WARNING ($DISK_BAD); the relay serves only its $eff side. For one clean database: './$SCRIPT_NAME db-switch $eff --from <badger|lmdb>'."
-      fi
-      ;;
-  esac
+        ;;
+      split)
+        START_MIXED_WARNED=1
+        warn "The directories in db/ disagree about the engine ($DISK_REPORT); the relay serves only its $eff directories. For one clean database: './$SCRIPT_NAME db-switch $eff --from <badger|lmdb>'."
+        ;;
+      unknown)
+        if engine_unjudgeable_note; then
+          START_MIXED_WARNED=1
+          warn "$ENGINE_UNKNOWN_NOTE"
+        fi
+        ;;
+    esac
+  fi
   return 1
+}
+
+# engine_unjudgeable_note — after db_disk_engine: 0 with ENGINE_UNKNOWN_NOTE
+# (one line) when no directory in db/ shows an engine but some cannot be read
+# or hold files of neither engine; then DB_ENGINE cannot be checked against
+# the data. Both gates (start and the env editor) say so instead of nothing.
+ENGINE_UNKNOWN_NOTE=""
+engine_unjudgeable_note() {
+  local r=" $DISK_REPORT "
+  ENGINE_UNKNOWN_NOTE=""
+  [[ -n "$DISK_BAD" ]] || return 1
+  [[ "$r" != *"=badger "* && "$r" != *"=lmdb "* && "$r" != *"=mixed "* ]] || return 1
+  ENGINE_UNKNOWN_NOTE="Cannot tell which engine db/ holds ($DISK_BAD: unreadable or files of neither engine); DB_ENGINE is not checked against the data."
+  return 0
 }
 
 # switch_marker_blocks <what> — 0 (with the reason) while db/.switch-in-progress
@@ -3108,7 +3163,11 @@ DBS_ERR=""
 # Inside a mixed stash: the DB_ENGINE line from before the switch, so that
 # --rollback after a completed switch puts the mixed layout back as it was.
 DBS_ENV_NOTE=".switch-env"
-DBS_ROLLED=0             # signal path: 1 rolled back, 2 rollback did not finish
+# Inside every stash: "dirs=<names>", the directories the switch moved into it.
+# An undo brings back exactly these and refuses when one is gone (or the note).
+DBS_DIRS_NOTE=".switch-dirs"
+DBS_ROLLED=0            # signal path: 1 rolled back, 2 rollback did not finish
+DBS_UNTOUCHED=0         # 1: dbs_restore_layout refused before it moved anything
 DISK_ENGINE=""
 DISK_REPORT=""
 DISK_DATA=""
@@ -3189,11 +3248,14 @@ db_disk_engine() {
 # count). Otherwise 1 with ENGINE_CHANGE_ERR naming the db-switch that moves
 # the data. Used by the env editor (validate_env_value).
 ENGINE_CHANGE_ERR=""
+ENGINE_CHANGE_WARN=""    # one line when nothing in db/ can be judged (allowed)
 engine_change_allowed() {
   local want="$1" other=badger
   [[ "$want" == badger ]] && other=lmdb
   ENGINE_CHANGE_ERR=""
+  ENGINE_CHANGE_WARN=""
   db_disk_engine
+  if engine_unjudgeable_note; then ENGINE_CHANGE_WARN="$ENGINE_UNKNOWN_NOTE"; fi
   if [[ " $DISK_REPORT " == *"=mixed "* ]] \
     || [[ " $DISK_REPORT " == *"=$other "* && " $DISK_REPORT " == *"=$want "* ]]; then
     ENGINE_CHANGE_ERR="db/ holds both engines: use ./$SCRIPT_NAME db-switch $want --from <engine>"
@@ -3204,6 +3266,15 @@ engine_change_allowed() {
     return 1
   fi
   return 0
+}
+
+# tui_engine_unknown_note <key> — before the env editor writes DB_ENGINE: one
+# line when the value cannot be checked against db/ (nothing there can be
+# judged); the write goes ahead.
+tui_engine_unknown_note() {
+  [[ "$1" == "DB_ENGINE" ]] || return 0
+  engine_change_allowed lmdb || true
+  [[ -z "$ENGINE_CHANGE_WARN" ]] || tui_message "DB_ENGINE" "$ENGINE_CHANGE_WARN"
 }
 
 # env_key_lines <key> — the .env lines that set <key>, matched as read_env_var does
@@ -3320,13 +3391,43 @@ dbs_unique() {
   printf '%s' "$c"
 }
 
-# dbs_move <from> <to> — a plain rename; never onto an existing path.
+# dbs_own_dir <path> — 0 when <path> is a real directory (not a symlink) owned
+# by the user running this script or by DOCKER_UID. A stash or set-aside
+# directory that is anything else was not made by db-switch: moving through it
+# would carry data into or out of a directory outside db/.
+dbs_own_dir() {
+  local p="$1" owner uid
+  [[ -d "$p" && ! -L "$p" ]] || return 1
+  owner="$(stat -c %u -- "$p" 2>/dev/null || stat -f %u -- "$p" 2>/dev/null)" || return 1
+  [[ "$owner" == "$(id -u)" ]] && return 0
+  uid="$(env_value_or_empty DOCKER_UID)"
+  [[ -n "$uid" ]] || uid="1000"
+  is_int "$uid" && [[ "$owner" == "$((10#$uid))" ]]
+}
+
+# dbs_dir_usable <name below db/> — dbs_own_dir for the stash or set-aside
+# directory when it exists (a missing one is fine); DBS_ERR says why not.
+dbs_dir_usable() {
+  local p="$ROOT_DIR/db/$1"
+  [[ -e "$p" || -L "$p" ]] || return 0
+  dbs_own_dir "$p" && return 0
+  DBS_ERR="db/$1 is not a directory db-switch made (a symlink, not a directory, or owned by another user); nothing is moved through it"
+  return 1
+}
+
+# GNU mv -T treats the target as the final name, never as a directory to move
+# into; -n never replaces it. Elsewhere (BSD) the existence check below remains.
+DBS_MV_FLAGS=()
+if mv --version 2>/dev/null | grep -q GNU; then DBS_MV_FLAGS=(-T -n); fi
+
+# dbs_move <from> <to> — a plain rename; never onto an existing path and never
+# into a directory that appeared there meanwhile.
 dbs_move() {
   if [[ -e "$2" || -L "$2" ]]; then
     DBS_ERR="${2#"$ROOT_DIR/"} already exists"
     return 1
   fi
-  mv -- "$1" "$2" 2>/dev/null
+  mv ${DBS_MV_FLAGS[@]+"${DBS_MV_FLAGS[@]}"} -- "$1" "$2" 2>/dev/null
   if [[ -e "$1" || -L "$1" ]] || [[ ! -e "$2" && ! -L "$2" ]]; then
     DBS_ERR="could not move ${1#"$ROOT_DIR/"} to ${2#"$ROOT_DIR/"}"
     return 1
@@ -3345,7 +3446,9 @@ dbs_set_aside() {
       return 1
     fi
   fi
-  if [[ ! -d "$db/$DBS_ASIDE" ]] && ! mkdir -m 700 -- "$db/$DBS_ASIDE" 2>/dev/null; then
+  if [[ -e "$db/$DBS_ASIDE" || -L "$db/$DBS_ASIDE" ]]; then
+    dbs_dir_usable "$DBS_ASIDE" || return 1
+  elif ! mkdir -m 700 -- "$db/$DBS_ASIDE" 2>/dev/null || ! dbs_own_dir "$db/$DBS_ASIDE"; then
     DBS_ERR="cannot create db/$DBS_ASIDE"
     return 1
   fi
@@ -3390,12 +3493,20 @@ dbs_env_put() {
 # did not exist before is set aside as well. Then DB_ENGINE, then a check that
 # the old layout is complete — only then the marker goes. Safe to repeat.
 dbs_restore_layout() {
-  local db="$ROOT_DIR/db" n stash
+  local db="$ROOT_DIR/db" n stash rest
   DBS_ERR=""
   stash="$db/$DBS_STASH"
+  # checked here, at the point of use, in every entry point (failed step,
+  # signal, --rollback with a marker, undo): the names in the marker are
+  # validated, but what sits under them may have been swapped since
+  DBS_UNTOUCHED=1
+  dbs_dir_usable "$DBS_STASH" || return 1
+  if [[ -n "$DBS_ASIDE" ]]; then dbs_dir_usable "$DBS_ASIDE" || return 1; fi
+  DBS_UNTOUCHED=0
   for n in "${DB_ENGINE_DIRS[@]}"; do
     if dbs_word_in "$n" "$DBS_DIRS"; then
       [[ -e "$stash/$n" || -L "$stash/$n" ]] || continue
+      dbs_dir_usable "$DBS_STASH" || return 1
       if [[ -e "$db/$n" || -L "$db/$n" ]]; then
         dbs_set_aside "$n" || return 1
       fi
@@ -3416,12 +3527,15 @@ dbs_restore_layout() {
       return 1
     fi
   done
-  # rmdir removes the stash only when it is empty; the .switch-env of a mixed
-  # stash is this script's own note and goes with it
-  if [[ -f "$stash/$DBS_ENV_NOTE" && -z "$(find "$stash" -mindepth 1 -maxdepth 1 ! -name "$DBS_ENV_NOTE" -print -quit 2>/dev/null)" ]]; then
-    rm -f -- "${stash:?}/$DBS_ENV_NOTE" 2>/dev/null
+  # rmdir removes the stash only when it is empty; its notes (.switch-env,
+  # .switch-dirs) are this script's own and go with it
+  if dbs_own_dir "$stash"; then
+    rest="$(find "$stash" -mindepth 1 -maxdepth 1 ! -name "$DBS_ENV_NOTE" ! -name "$DBS_DIRS_NOTE" -print -quit 2>/dev/null)" || rest="?"
+    if [[ -z "$rest" ]]; then
+      rm -f -- "${stash:?}/$DBS_ENV_NOTE" "${stash:?}/$DBS_DIRS_NOTE" 2>/dev/null
+    fi
+    rmdir -- "$stash" 2>/dev/null || true
   fi
-  rmdir -- "$stash" 2>/dev/null || true
   rm -f -- "$DB_SWITCH_MARKER" 2>/dev/null
   if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
     DBS_ERR="cannot remove db/.switch-in-progress"
@@ -3497,7 +3611,14 @@ dbs_signal_report() {
     dbs_result failed
   elif [[ "$DBS_STEP" == "done" ]]; then
     info "The switch had completed before the signal: db/ holds $DBS_TARGET data and DB_ENGINE=$DBS_TARGET; the old directories are in db/$DBS_STASH/." || true
-    dbs_result ok
+    # ok only when the relay is as the user had it: a relay that ran before and
+    # is down now is a failure, whatever the data looks like
+    if [[ "$DBS_RELAY_WAS_RUNNING" == "1" ]] && ! relay_container_running; then
+      warn "The relay ran before the switch and is NOT running now. Check './$SCRIPT_NAME logs relay', then start it with './$SCRIPT_NAME start' — or go back with './$SCRIPT_NAME db-switch --rollback'." || true
+      dbs_result failed
+    else
+      dbs_result ok
+    fi
   else
     info "Nothing was changed: db/ and DB_ENGINE are as before." || true
     [[ "$DBS_KIND" != "switch" || -z "$DBS_BACKUP" || ! -f "$BACKUP_DIR/$DBS_BACKUP" ]] || info_plain "The verified backup made before the switch stays: backups/$DBS_BACKUP" || true
@@ -3520,10 +3641,23 @@ dbs_fail() {
   fi
   oneshot_guard_off
   back="$(dbs_back_engine)"
+  # no rollback ran although the directories had already moved (step 7 could
+  # not put the marker back): the new database is in place, not the old one
+  local late=0
+  if [[ "$rolled" == "0" ]] && ! dbs_word_in "$DBS_STEP" "stop backup move"; then
+    late=1
+    back="$DBS_TARGET"
+  fi
 
   warn_plain "The engine switch failed: $why" || true
   case "$rolled" in
-    0) info "Nothing was changed: db/ and DB_ENGINE are as before." || true ;;
+    0)
+      if [[ "$late" == "1" ]]; then
+        warn "Not rolled back: db/ holds the new $DBS_TARGET database and DB_ENGINE=$DBS_TARGET; the old directories are in db/$DBS_STASH/. To go back: './$SCRIPT_NAME db-switch --rollback'." || true
+      else
+        info "Nothing was changed: db/ and DB_ENGINE are as before." || true
+      fi
+      ;;
     1)
       info "Rolled back: the $back directories are in db/ again and $(dbs_env_back_text)." || true
       [[ -z "$DBS_ASIDE" ]] || info_plain "What the failed run produced is kept in db/$DBS_ASIDE/ (remove it when you no longer need it)." || true
@@ -3925,7 +4059,14 @@ dbs_run() {
   fi
   DBS_ACTIVE=1
   if ! mkdir -m 700 -- "$db/$DBS_STASH" 2>/dev/null; then
+    # nothing has moved yet, and whatever holds the name now is not this run's:
+    # no rollback through it — the marker goes and the run ends here
     DBS_ERR="cannot create db/$DBS_STASH"
+    rm -f -- "$DB_SWITCH_MARKER" 2>/dev/null
+    if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+      DBS_ERR+=", and db/.switch-in-progress could not be removed (nothing was moved: remove it by hand)"
+    fi
+    DBS_ACTIVE=0
     dbs_fail "$compose_file" "$DBS_ERR."
     return 1
   fi
@@ -3934,8 +4075,13 @@ dbs_run() {
     dbs_fail "$compose_file" "cannot write db/$DBS_STASH/$DBS_ENV_NOTE."
     return 1
   fi
+  if ! printf 'dirs=%s\n' "$DBS_DIRS" > "$db/$DBS_STASH/$DBS_DIRS_NOTE" 2>/dev/null; then
+    dbs_fail "$compose_file" "cannot write db/$DBS_STASH/$DBS_DIRS_NOTE."
+    return 1
+  fi
   for n in "${DB_ENGINE_DIRS[@]}"; do
     dbs_word_in "$n" "$DBS_DIRS" || continue
+    dbs_dir_usable "$DBS_STASH" || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
     dbs_move "$db/$n" "$db/$DBS_STASH/$n" || { dbs_fail "$compose_file" "$DBS_ERR."; return 1; }
   done
   DBS_STEP="moved"
@@ -4147,6 +4293,45 @@ dbs_rolled_back_report() {
   dbs_result rolled-back
 }
 
+# dbs_stash_complete <stash name> — 0 when db/<stash>/.switch-dirs exists and
+# every directory it names is in the stash; sets DBS_NOTE_DIRS to those names.
+# Otherwise 1 with DBS_ERR naming what is missing. db-switch writes the note
+# into every stash; no released version wrote a stash without it.
+DBS_NOTE_DIRS=""
+dbs_stash_complete() {
+  local s="$ROOT_DIR/db/$1" l dirs="" seen=0 n gone="" names=""
+  local -a words=()
+  DBS_NOTE_DIRS=""
+  if [[ -f "$s/$DBS_DIRS_NOTE" && ! -L "$s/$DBS_DIRS_NOTE" && -r "$s/$DBS_DIRS_NOTE" ]]; then
+    while IFS= read -r l || [[ -n "$l" ]]; do
+      if [[ "$l" == dirs=* ]]; then dirs="${l#dirs=}"; seen=1; fi
+    done < "$s/$DBS_DIRS_NOTE"
+  fi
+  if [[ "$seen" != "1" ]]; then
+    DBS_ERR="db/$1/$DBS_DIRS_NOTE is missing or unreadable, so which directories the switch put there is unknown"
+    return 1
+  fi
+  IFS=' ' read -r -a words <<< "$dirs"
+  if [[ "${#words[@]}" -eq 0 ]]; then
+    DBS_ERR="db/$1/$DBS_DIRS_NOTE names no directory"
+    return 1
+  fi
+  for n in "${words[@]}"; do
+    if ! dbs_word_in "$n" "$DB_ENGINE_DIRS_TEXT"; then
+      DBS_ERR="db/$1/$DBS_DIRS_NOTE names an unknown directory"
+      return 1
+    fi
+    [[ -e "$s/$n" || -L "$s/$n" ]] || gone+="$n "
+    names+="$n "
+  done
+  if [[ -n "$gone" ]]; then
+    DBS_ERR="db/$1/ is incomplete: the switch put ${dirs} there, and ${gone% } is missing (removed by hand?)"
+    return 1
+  fi
+  DBS_NOTE_DIRS="${names% }"
+  return 0
+}
+
 # dbs_undo_last <compose_file> — no marker: put back the directories of the
 # last completed switch (the newest db/.pre-switch-<engine>-<ts>/), the current
 # ones go to db/.post-switch-<engine>-<ts>/.
@@ -4181,6 +4366,15 @@ dbs_undo_last() {
     dbs_result failed
     return 1
   fi
+  # what the switch put into the stash (its .switch-dirs note) must all still
+  # be there: an undo sets every current directory aside, so a stash thinned by
+  # hand would leave the relay with less than before — or with nothing
+  if ! dbs_stash_complete "$best"; then
+    warn_plain "$DBS_ERR; nothing was changed."
+    info "The current directories stay in use. To go back anyway, put the directories back by hand: move db/<name> aside, mv db/$best/<name> db/<name>, and set DB_ENGINE to the engine of that data."
+    dbs_result failed
+    return 1
+  fi
   if [[ "$e_old" == "mixed" ]]; then
     # a mixed stash is put back as it is; its DB_ENGINE line comes from the
     # note the switch left in it — without that note, refuse rather than guess
@@ -4206,11 +4400,7 @@ dbs_undo_last() {
       return 1
     fi
   fi
-  DBS_DIRS=""
-  for n in "${DB_ENGINE_DIRS[@]}"; do
-    [[ -e "$db/$best/$n" || -L "$db/$best/$n" ]] && DBS_DIRS+="$n "
-  done
-  DBS_DIRS="${DBS_DIRS% }"
+  DBS_DIRS="$DBS_NOTE_DIRS"
   db_disk_engine
   case "$DISK_ENGINE" in
     none)
@@ -4305,6 +4495,20 @@ dbs_undo_last() {
   dbs_progress 3 4 rollback
   trap '' INT TERM HUP
   if ! dbs_restore_layout; then
+    if [[ "$DBS_UNTOUCHED" == "1" ]]; then
+      # refused before the first move: the current layout is intact, so the
+      # marker goes and the relay comes back as it was
+      rm -f -- "$DB_SWITCH_MARKER" 2>/dev/null
+      if [[ ! -e "$DB_SWITCH_MARKER" && ! -L "$DB_SWITCH_MARKER" ]]; then
+        DBS_ACTIVE=0
+        relay_restart_after_oneshot "$compose_file" "$DBS_RELAY_WAS_RUNNING" || true
+        oneshot_guard_off
+        warn_plain "The undo did not run: $(printable_text "$DBS_ERR")." || true
+        info "Nothing was changed: db/ and DB_ENGINE are as before." || true
+        dbs_result failed
+        return 1
+      fi
+    fi
     oneshot_guard_off
     dbs_manual_steps
     warn "The relay was not started." || true
@@ -5341,7 +5545,9 @@ $(cat "$onion_torrc")"
           tui_message "Missing Variables" "$upgrade_count variable(s) found:\n\n$upgrade_preview"
           if tui_confirm "Add to .env?" "y"; then
             upgrade_env_file
-            tui_message "Upgrade .env" "$upgrade_count variable(s) added.\n\nPlease review and edit your\n.env file, then restart\nservices."
+            local upgrade_note=""
+            [[ -z "$UPGRADE_ENV_NOTE" ]] || upgrade_note="\n\n$UPGRADE_ENV_NOTE"
+            tui_message "Upgrade .env" "$upgrade_count variable(s) added.\n\nPlease review and edit your\n.env file, then restart\nservices.$upgrade_note"
           fi
           ;;
         help)
@@ -5419,6 +5625,7 @@ $(cat "$onion_torrc")"
           if [[ -z "$new_value" ]]; then
             return
           fi
+          tui_engine_unknown_note "$new_key"
           set_env_var "$new_key" "$new_value"
           restart_after_env_change
           ;;
@@ -5444,6 +5651,7 @@ $(cat "$onion_torrc")"
           if [[ -z "$new_value" ]]; then
             return
           fi
+          tui_engine_unknown_note "$CURRENT_ENV_KEY"
           set_env_var "$CURRENT_ENV_KEY" "$new_value"
           restart_after_env_change
           ;;
@@ -5464,6 +5672,7 @@ $(cat "$onion_torrc")"
             return
           fi
           if tui_confirm "Remove $CURRENT_ENV_KEY?" "n"; then
+            tui_engine_unknown_note "$CURRENT_ENV_KEY"
             remove_env_var "$CURRENT_ENV_KEY"
             restart_after_env_change
           fi
@@ -6040,6 +6249,7 @@ main() {
       printf "%s\n" "$missing_vars"
       upgrade_env_file
       success "$missing_count variable(s) added to .env."
+      [[ -z "$UPGRADE_ENV_NOTE" ]] || info "$UPGRADE_ENV_NOTE"
       info "Please review and edit your .env file, then restart services."
       ;;
     json)
