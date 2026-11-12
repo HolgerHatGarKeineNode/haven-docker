@@ -65,3 +65,25 @@ readme_shows() { grep -qE "\./haven $1( |\`|\$)" "$README"; }
   [ -s "$TEST_DIR/top" ]
   grep -qF '[#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15)' "$TEST_DIR/top"
 }
+
+@test "docs: the README describes the TUI's settings editor, flows, status view and keys" {
+  grep -q '^## The TUI$' "$README"
+  grep -qF '`/` finds settings by name or description' "$README"
+  grep -qF 'Undo interrupted switch' "$README"
+  grep -qF 'group and section rows do not count' "$README"
+  grep -qF '| `q` / `Q` | Back one view; from the main view, quit |' "$README"
+  grep -qF '| `Ctrl-C` | Quit the TUI' "$README"
+  grep -qF 'nothing in the main view' "$README"
+  grep -qF 'cursor (`TERM=dumb`) the TUI does not' "$README"
+  # the old claims are gone
+  ! grep -qF 'from the main view, quit |'$'\n''| `q` |' "$README"
+  ! grep -qF 'or `TERM=dumb`, it draws without colours' "$README"
+}
+
+@test "docs: the help screen names q, Q and Ctrl-C like the README" {
+  PATH="$REPO_ROOT/tests/mock:$PATH" run bash -c 'source '"$TEST_DIR"'/haven; set +e; TUI_ACTIVE=0; clear() { :; }; pause() { :; }; show_help_screen'
+  [[ "$output" == *"q Q       Back; quit in"* ]]
+  [[ "$output" == *"Ctrl-C    Quit"* ]]
+  [[ "$output" == *"Esc ←     Back"* ]]
+  [[ "$output" != *"Back, or quit"* ]]
+}

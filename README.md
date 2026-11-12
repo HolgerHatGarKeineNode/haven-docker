@@ -259,6 +259,33 @@ that upstream Haven ships inside the image and names any variable the relay
 supports but your `.env` leaves unset — it then runs on its built-in default.
 `./haven env-upgrade` adds the ones this repo documents.
 
+## The TUI
+
+`./haven` without arguments opens a full-screen menu on the left and the relay's
+log on the right. It runs the same commands as the CLI above; nothing in it
+works differently from the command line.
+
+- **Settings (.env)** lists your settings in the sections of `.env.example`,
+  each with a short name and its current value (secrets show only their last
+  four characters). The right side shows the selected setting in full: its
+  name, what it does, the example value, the rule a new value must follow and
+  the current value. `/` finds settings by name or description; `Esc` clears
+  the search. Settings that are only in your `.env` are listed under *Other*.
+- **Back up now**, **Restore a backup** and **Switch engine** run
+  `./haven backup`, `./haven restore` and `./haven db-switch` for you. Each asks
+  first (a switch asks you to type the engine name), then shows the command's
+  output while it runs and its result at the end. The relay is offline while
+  they run; `Esc` and `q` wait, `Ctrl-C` stops the command and the relay is
+  started again. If a switch was interrupted, *Undo interrupted switch* leads
+  the Data group and runs `./haven db-switch --rollback`.
+- **Tab** in the main view shows the status: relay state and uptime, Docker or
+  Tor, the relay address, the database engine on disk and the size of `db/`,
+  the size of `blossom/`, the newest backup (or *never*), the image and the
+  containers.
+
+On a terminal that cannot position the cursor (`TERM=dumb`) the TUI does not
+start; it names the CLI commands instead.
+
 ## Keyboard reference
 
 The interactive TUI (`./haven` without arguments) understands:
@@ -267,18 +294,19 @@ The interactive TUI (`./haven` without arguments) understands:
 |---|---|
 | `↑` `↓` or `k` `j` | Move the menu selection (group names are skipped) |
 | `g` / `G`, `Home` / `End` | Jump to the first / last menu entry |
-| `1`–`9` | Select the nth menu entry directly (Enter opens it) |
+| `1`–`9` | Select the nth menu entry directly (Enter opens it); group and section rows do not count |
 | `Enter` | Open the selected entry |
 | Letter in front of an entry | Open that main menu entry directly: `s` Start, `t` Start with Tor, `x` Stop, `r` Restart, `b` Back up now, `e` Restore a backup, `d` Switch engine, `i` Import notes, `c` Settings (.env), `l` Access lists (JSON), `u` Add missing settings, `o` Onion address, `?` Help, `a` About, `q` Quit |
-| `←` / `Esc` | Go back one view; from the main view, quit |
-| `q` | Back one view; from the main view, quit |
-| `Tab` | Switch the right panel between the log view and the status view |
+| `←` / `Esc` | Go back one view (in the settings list a search is cleared first); nothing in the main view |
+| `q` / `Q` | Back one view; from the main view, quit |
+| `Ctrl-C` | Quit the TUI; while a backup, restore or switch runs, stop that command instead (the relay is started again) |
+| `Tab` | Switch the right panel: log view and status view; in the settings, the restore list and the switch overview, the details of the selected entry and the log view |
 | `PgUp` / `PgDn` | Scroll the log panel backwards / forwards; `Paused` in the panel title marks the scroll position and new lines keep buffering |
-| `/` | Live filter for the log panel (case-insensitive substring) — the number of matching lines shows on the first panel row, an empty Enter clears the filter |
+| `/` | Live filter for the log panel (case-insensitive substring) — the number of matching lines shows on the first panel row, an empty Enter clears the filter. In the settings list: find settings by name or description |
 | Bottom row | Names the keys that work in the current view or dialog |
 
 The TUI honours [`NO_COLOR`](https://no-color.org): with `NO_COLOR` set to any
-value, or `TERM=dumb`, it draws without colours; the selection keeps its `▸`
+value it draws without colours; the selection keeps its `▸`
 marker in reverse video and shortcut letters are underlined. In a 16-colour
 terminal text keeps the terminal's own colour and shortcut letters are bold and
 underlined, so a light background reads as well as a dark one.
@@ -287,14 +315,14 @@ Inside an input prompt:
 
 | Key | Action |
 |---|---|
-| `←` / `→` | Move the cursor within the input |
-| `Ctrl-A` / `Ctrl-E` | Jump to the start / end of the input |
+| `←` / `→` | Move the cursor within the input; a long input scrolls, `…` marks text hidden at either end |
+| `Home` / `End`, `Ctrl-A` / `Ctrl-E` | Jump to the start / end of the input |
 | `Backspace` / `Delete` | Delete before / after the cursor |
 | `Ctrl-U` | Clear the input |
 | `Ctrl-W` | Delete the word before the cursor |
-| Paste | Pasted text inserts at the cursor position |
+| Paste | Pasted text inserts at the cursor position; an input takes up to 4096 characters |
 | `Enter` | Accept; invalid values show an inline error and keep editing |
-| `Esc` / `Ctrl-C` | Cancel with the previous value |
+| `Esc` | Cancel with the previous value |
 
 ## Backups and restore
 

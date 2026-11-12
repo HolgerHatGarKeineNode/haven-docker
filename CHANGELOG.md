@@ -43,6 +43,29 @@ images published so far still show the old text.
 - README: backup and restore, what a backup does not contain, switching the
   engine, what to do after changing `DB_ENGINE` by hand, and the same backup,
   restore and switch with plain `docker compose`
+- TUI: *Back up now*, *Restore a backup* and *Switch engine* run
+  `./haven backup`, `./haven restore` and `./haven db-switch` and show their
+  output while they run. Each asks first; a restore offers the zips in
+  `backups/` newest first; a switch shows the engine on disk, the target, the
+  size of `db/`, the free space and the age of the last backup, offers the two
+  `--from` sides when `db/` holds both engines, and runs only after you type
+  the engine name. The steps of a switch are listed as they pass, the title
+  row counts how long the relay has been offline, and the result box names a
+  failed step. `Esc` and `q` wait while a command runs; `Ctrl-C` stops it and
+  the relay is started again. After an interrupted switch, *Undo interrupted
+  switch* runs `./haven db-switch --rollback`
+- TUI settings editor: the settings in the sections of `.env.example` with a
+  short name and the value, a details pane with the full name, a
+  description, the example value, the rule for new values and the current
+  value; `/` finds settings by name or description; settings only in `.env`
+  are listed under *Other*
+- TUI status view (`Tab`): relay state and uptime, Docker or Tor, the relay
+  address (and the onion host on Tor), the engine on disk with the size of
+  `db/` (and a word when `.env` names another engine or `db/` holds both),
+  the size of `blossom/`, the newest backup or *never*, image and digest, the
+  containers
+- `.env.example`: a description above every setting, taken from upstream's
+  documentation and code for v1.2.2, and section names in sentence case
 
 ### Changed
 
@@ -66,11 +89,28 @@ images published so far still show the old text.
   a missing line as lmdb, so the example's `badger` would have hidden lmdb data
 - `.env.example`: the lmdb default map size is 256 GiB per database file (the
   comment said ~273GB); the file is sparse
+- TUI: the main menu is grouped into Relay, Data and Configure with a letter
+  for every entry; the relay state follows *Relay*, the engine follows
+  *Data*; row 1 names the view you are in; the bottom row names the keys that
+  work right now
+- TUI: only glyphs one cell wide; `NO_COLOR` turns off all colour (the
+  selection keeps its marker in reverse video); dim text is lighter
+- TUI: `Esc` and `←` in the main view no longer quit (`q` does); on
+  `TERM=dumb` the TUI does not start and names the CLI commands instead
+- TUI: message boxes longer than the pane scroll with `↑` `↓`
 
 ### Fixed
 
 - With a filter set in the TUI log panel, the first line of the filtered
   window was never drawn (a single match showed the count and no line)
+- TUI input prompts took only as many characters as fit beside their label
+  (about 15 at 80 columns), so an npub could be neither typed nor pasted; a
+  prompt now takes up to 4096 characters and scrolls
+- The TUI title row ran two cells past the terminal width
+- A finished TUI prompt left its row on screen; `PgUp` with a log filter
+  stopped one line short of the oldest match; a restart after an `.env`
+  change stopped the relay before asking its questions about missing JSON
+  lists; with Docker offline, Start, Stop, Restart and Import ended the TUI
 - `.gitignore` covers the timestamped config backups (`.env.bak.<time>`,
   `<list>.json.bak.<time>`) and `backups/`
 
