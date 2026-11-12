@@ -805,7 +805,8 @@ tui_print_right() {
 
 tui_wait_key() {
   local _=""
-  while ! IFS= read -rsn1 -t 0.1 _; do :; done
+  # each poll is a finished render pass for the test seam (the box is drawn)
+  while ! IFS= read -rsn1 -t 0.1 _; do tui_sync_mark; done
 }
 
 # Prompt validators: called by tui_prompt with the raw input; rc != 0 plus
@@ -1256,6 +1257,7 @@ tui_confirm() {
         "${TUI_BOLD}${TUI_FG_SELECTED}${TUI_BG_CONFIRM_NO}" "$no_label" "$CLR_RESET"
     fi
 
+    tui_sync_mark
     tui_read_key || continue
     case "$_KEY" in
       left|up) selection=0 ;;
@@ -1318,6 +1320,7 @@ tui_message() {
       fi
     done
     (( n > body_h )) || { tui_wait_key; break; }
+    tui_sync_mark
     tui_read_key || continue
     case "$_KEY" in
       down|j) (( top + body_h < n )) && top=$((top + 1)) ;;
@@ -6140,7 +6143,7 @@ tui_build_menu() {
         "Free space: $FLOW_FREE" "Last backup: $FLOW_BACKUP_AGE" "")
       if [[ "$FLOW_MIXED" == "1" ]]; then
         MENU_IDS+=(from:badger from:lmdb)
-        MENU_LABELS+=("Carry over the badger side" "Carry over the lmdb side")
+        MENU_LABELS+=("From the badger side" "From the lmdb side")
       else
         MENU_IDS+=(switch)
         MENU_LABELS+=("Switch to $FLOW_TARGET")
@@ -7484,7 +7487,7 @@ tui_loop() {
     fi
 
     _SPINNER_TICK=$((_SPINNER_TICK + 1))
-    if (( _SPINNER_TICK % 4 == 0 && FOLLOW_LOGS == 1 )) && [[ "$TUI_RIGHT_MODE" != details ]]; then
+    if (( _SPINNER_TICK % 4 == 0 && FOLLOW_LOGS == 1 )); then
       # With the 150 ms poll this fires every ~600 ms; draining pulls all
       # buffered lines per tick, so follow-logs stay visibly flowing.
       TUI_NEED_RIGHT=1

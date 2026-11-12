@@ -117,7 +117,7 @@ back|" ]]
     tui_flow_details; printf "%s " "${DETAIL_LINES[@]}" | tr -s " "; echo
     TYPED=lmdb tui_handle_enter'
   echo "$output"
-  [[ "$output" == *$'from:badger|Carry over the badger side\nfrom:lmdb|Carry over the lmdb side'* ]]
+  [[ "$output" == *$'from:badger|From the badger side\nfrom:lmdb|From the lmdb side'* ]]
   [[ "$output" == *"Carries the notes of the badger side over into a clean lmdb database; the notes of the lmdb side stay in the set-aside directory db/.pre-switch-mixed-<time>/"* ]]
   [ "$(grep '^run\[' <<<"$output")" = "run[db-switch lmdb --from badger --yes]" ]
 }
