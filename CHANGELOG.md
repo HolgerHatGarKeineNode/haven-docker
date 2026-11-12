@@ -72,6 +72,9 @@ images published so far still show the old text.
   containers
 - `.env.example`: a description above every setting, taken from upstream's
   documentation and code for v1.2.2, and section names in sentence case
+- TUI settings editor: a value that contains `$` outside single quotes gets a
+  note in the details pane and in the box after saving it: Docker Compose
+  expands `$NAME` and `${NAME}` there; single quotes keep the value literal
 
 ### Changed
 
@@ -131,6 +134,19 @@ images published so far still show the old text.
   lists; with Docker offline, Start, Stop, Restart and Import ended the TUI
 - `.gitignore` covers the timestamped config backups (`.env.bak.<time>`,
   `<list>.json.bak.<time>`) and `backups/`
+- A setting that is in `.env` more than once: the start checks and every
+  other place that reads a setting use its last assignment, the one Docker
+  Compose uses
+- After a setting is saved in the TUI, the box reports the relay's real state
+  as Docker shows it after the restart; a write that is refused or fails is
+  shown in the box and restarts nothing
+- A write to `.env` that is interrupted (Ctrl-C, `kill`, a closed terminal)
+  finishes first or cleans up after itself; its temporary files
+  (`.env.tmp.*`, `.env.pre.*`) are git-ignored
+- The TUI restores the terminal after Ctrl-C and after `kill`; echo and line
+  editing could stay off
+- An error inside a TUI menu action is shown in its box and no longer resets
+  the terminal under the running TUI
 
 ### Security
 
@@ -163,6 +179,11 @@ images published so far still show the old text.
 - A setting that is in `.env` more than once is shown with the value Compose
   uses (the last line), marked in the list and explained in the details;
   editing it changes that last line
+- Single-quoted values follow the same backslash rule as double-quoted ones
+  (`'a\'b'` is one value, `'My relay\'` is refused as unterminated), checked
+  against what Docker Compose parses
+- The TUI log pane removes terminal control sequences from log lines (one
+  could set the terminal's clipboard or window title)
 - A backup file name could carry terminal escape sequences through the TUI's
   restore flow (one crafted name set the terminal's clipboard). The restore
   list now shows only regular files whose names the restore command accepts;

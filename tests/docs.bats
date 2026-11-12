@@ -129,9 +129,49 @@ readme_shows() { grep -qE "\./haven $1( |\`|\$)" "$README"; }
 @test "docs: the README's masking sentence matches mask_env_value (… plus the last four above eight characters, … alone otherwise)" {
   local flat
   flat="$(tr '\n' ' ' < "$README" | tr -s ' ')"
-  [[ "$flat" == *'Credentials are masked: a value longer than eight characters shows `…` and its last four characters, a shorter one only `…`.'* ]]
+  [[ "$flat" == *'Credentials are masked: a value longer than eight characters shows `…` and its last four characters, a value of eight characters or fewer only `…`.'* ]]
   [[ "$flat" != *"show only their last four characters"* ]]
   run bash -c 'source "$1"; set +e; for v in 12345678 123456789; do mask_env_value "$v"; echo "$v=$_MASKED"; done' _ "$TEST_DIR/haven"
   [ "${lines[0]}" = "12345678=…" ]
   [ "${lines[1]}" = "123456789=…6789" ]
+}
+
+# C2: the masking sentence names the boundary exactly — derived from
+# mask_env_value, not written into the test: the longest value that shows `…`
+# alone (L) must be "of L characters or fewer", and "longer than L" shows the
+# last four
+@test "docs: the README's masking sentence states the boundary mask_env_value implements (C2)" {
+  local flat words=(zero one two three four five six seven eight nine ten eleven twelve) L
+  run bash -c 'source "$1"; set +e; v=""; for n in $(seq 1 20); do v+=x; mask_env_value "$v"; echo "$n $_MASKED"; done' _ "$TEST_DIR/haven"
+  L="$(printf '%s\n' "$output" | awk '$2 == "…" {l = $1} END {print l}')"
+  echo "longest value masked as … alone: $L"
+  [[ "$L" =~ ^[0-9]+$ ]] && (( L >= 1 && L < ${#words[@]} ))
+  printf '%s\n' "$output" | awk -v l="$L" '$1 > l && $2 != "…xxxx" {bad = 1} END {exit bad}'
+  flat="$(tr '\n' ' ' < "$README" | tr -s ' ')"
+  [[ "$flat" == *"a value longer than ${words[L]} characters shows \`…\` and its last four characters, a value of ${words[L]} characters or fewer only \`…\`."* ]]
+  # the old wording left the boundary itself undefined
+  [[ "$flat" != *"a shorter one only"* ]]
+}
+
+# C1: the top CHANGELOG entry carries the behaviour the P6 final rework added
+@test "docs: the top CHANGELOG entry names the duplicated-key, restart-box, \$-note, quoting, writer, log-pane and terminal changes (C1)" {
+  local top missing="" l
+  top="$(awk '/^## / {n++} n == 1' "$CHANGELOG" | tr '\n' ' ' | tr -s ' ')"
+  while IFS= read -r l; do
+    [[ -z "$l" || "$top" == *"$l"* ]] || missing+="[$l] "
+  done <<'LINES'
+the start checks and every other place that reads a setting use its last assignment, the one Docker Compose uses
+the box reports the relay's real state as Docker shows it after the restart; a write that is refused or fails is shown in the box and restarts nothing
+a value that contains `$` outside single quotes gets a note in the details pane and in the box after saving it: Docker Compose expands `$NAME` and `${NAME}` there
+Single-quoted values follow the same backslash rule as double-quoted ones
+checked against what Docker Compose parses
+A write to `.env` that is interrupted (Ctrl-C, `kill`, a closed terminal) finishes first or cleans up after itself; its temporary files (`.env.tmp.*`, `.env.pre.*`) are git-ignored
+The TUI log pane removes terminal control sequences from log lines
+The TUI restores the terminal after Ctrl-C and after `kill`
+An error inside a TUI menu action is shown in its box and no longer resets the terminal under the running TUI
+LINES
+  echo "missing: $missing"
+  [ -z "$missing" ]
+  # no internal names in the entry's new lines
+  ! grep -nE 'writer_guard|run_capture|read_env_var|env_dollar_note|tui_|TUI_ACTIVE|log_sanitize' <<<"$top"
 }

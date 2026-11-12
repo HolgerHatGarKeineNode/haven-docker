@@ -268,7 +268,8 @@ works differently from the command line.
 - **Settings (.env)** lists your settings in the sections of `.env.example`,
   each with a short name and its current value; the section stays at the top
   while the list scrolls. Credentials are masked: a value longer than eight
-  characters shows `…` and its last four characters, a shorter one only `…`.
+  characters shows `…` and its last four characters, a value of eight
+  characters or fewer only `…`.
   A credential is the value of a key with a word (split at `_` and at
   camelCase humps) that ends in KEY,
   KEYS, TOKEN, SECRET(S), PASSWORD(S), PASSWD, PASS, PASSPHRASE, PW or PWD,
