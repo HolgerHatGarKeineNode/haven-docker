@@ -152,34 +152,43 @@ PY
 
 # page_dumps <cols> <lines> [extra .env line] — the left pane of the settings
 # list, page by page, every row of the whole list once: "<entry index>\t<row>"
-# (the marker of the selected row taken out)
+# (the marker of the selected row taken out). A section row pinned in the
+# first row of a page (TUI_PIN) is listed under its own index, "P" marking it.
 page_dumps() {
   local c="$1" l="$2" n
   COLS="$c" ROWS="$l" in_haven '
     { tui_draw_frame 0; tui_render_left_menu; } >/dev/null
     vis=$((LEFT_CONTENT_HEIGHT - 3)); n=${#MENU_IDS[@]}; p=0
-    for ((off = 0; off < n; off += vis)); do
+    for ((off = 0; off < n; off += vis - 1)); do
       TUI_OFFSET=$off; TUI_SEL=$off
       while (( TUI_SEL < n )) && ! tui_menu_selectable "$TUI_SEL"; do TUI_SEL=$((TUI_SEL + 1)); done
       (( TUI_SEL < off + vis && TUI_SEL < n )) || TUI_SEL=$off
       { tui_draw_frame 0; tui_render_left_menu; } > "$S/page.$p"
-      echo "$off $p"; p=$((p + 1))
+      echo "$TUI_OFFSET $p $TUI_PIN"; p=$((p + 1))
     done' > "$TEST_DIR/pages"
-  while read -r off p; do
+  while read -r off p pin; do
+    printf 'PAGE\t\n'
     python3 -I "$EMU" "$c" "$l" dump < "$SB/page.$p" | sed -n "7,$((l - 2))p" \
-      | sed -E 's/^│ ?//; s/│.*$//; s/ +$//; s/^▸ /  /' | awk -v o="$off" '{printf "%d\t%s\n", o + NR - 1, $0}'
+      | sed -E 's/^│ ?//; s/│.*$//; s/ +$//; s/^▸ /  /' \
+      | awk -v o="$off" -v pin="$pin" '{ if (pin >= 0 && NR == 1) printf "%dP\t%s\n", pin, $0; else printf "%d\t%s\n", o + NR - 1 - (pin >= 0), $0 }'
   done < "$TEST_DIR/pages"
 }
 
-@test "settings: no two rows of the list are alike at 66x20, 80x24, 100x24, 120x30, 160x40" {
-  local size bad="" rows dups total
+@test "settings: every row can be told apart at 66x20, 80x24, 100x24, 120x30, 160x40" {
+  # Labels do not repeat their relay ("name", "npub" in four sections): no two
+  # rows of one section are alike, and every page starts with the section of
+  # its rows (the natural section row or the pinned one), or with Add setting.
+  local size bad="" dump rows dups total heads
   for size in 66x20 80x24 100x24 120x30 160x40; do
-    rows="$(page_dumps "${size%x*}" "${size#*x}" | sort -u -t $'\t' -k1,1n | awk -F'\t' '$2 != ""')"
+    dump="$(page_dumps "${size%x*}" "${size#*x}")"
+    rows="$(grep -v '^PAGE' <<<"$dump" | grep -v $'^[0-9]*P\t' | sort -u -t $'\t' -k1,1n | awk -F'\t' '$2 != ""')"
     total="$(wc -l <<<"$rows")"
-    dups="$(cut -f2 <<<"$rows" | sort | uniq -d)"
+    dups="$(awk -F'\t' '$2 !~ /^  / { sec = $2; next } { print sec "|" $2 }' <<<"$rows" | sort | uniq -d)"
+    heads="$(awk -F'\t' '/^PAGE/ { first = 1; next } first { first = 0; if ($2 ~ /^  / && $2 !~ /Add setting/) print $0 }' <<<"$dump")"
     echo "$size: $total rows"
     [[ "$total" -ge 93 ]] || bad+="$size: only $total rows seen; "
-    [[ -z "$dups" ]] || bad+="$size: alike: $(tr '\n' '|' <<<"$dups"); "
+    [[ -z "$dups" ]] || bad+="$size: alike in a section: $(tr '\n' '|' <<<"$dups"); "
+    [[ -z "$heads" ]] || bad+="$size: pages without their section: $(tr '\n' '|' <<<"$heads"); "
   done
   echo "bad=[$bad]"
   [ -z "$bad" ]
@@ -201,8 +210,8 @@ page_dumps() {
   keyrows="$(sed -n '4,8p' <<<"$screen" | sed -E 's/^.*│ //; s/ *│$//' | awk 'NF == 0 {exit} {printf "%s", $0}')"
   [ "$keyrows" = "$LONGEST" ]
   grep -q 'Default when' <<<"$screen"
-  grep -q 'Example: 3' <<<"$screen"
-  grep -q 'Rule: A whole number' <<<"$screen"
+  grep -q 'Example  3' <<<"$screen"
+  grep -q 'Allowed  A whole number' <<<"$screen"
 }
 
 @test "settings: /limiter lists exactly the keys whose name or description contains limiter (32)" {
@@ -222,13 +231,13 @@ page_dumps() {
 
 @test "settings: /zzz shows the empty-state row; Esc clears the filter first, then leaves" {
   run in_haven 'settings_set_filter zzz
-    rows=""; for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_IDS[$i]}" == key:* ]] && rows+="KEY "; [[ "${MENU_IDS[$i]}" == group:empty:* ]] && rows+="${MENU_LABELS[$i]}"; done
+    rows=""; for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_IDS[$i]}" == key:* ]] && rows+="KEY "; [[ "${MENU_IDS[$i]}" == group:empty:* ]] && rows+="${MENU_LABELS[$i]} "; done
     echo "[$rows]"
     tui_handle_key esc; echo "after esc: view=$TUI_VIEW filter=[$SETTINGS_FILTER]"
     tui_handle_key esc; echo "after esc: view=$TUI_VIEW"'
   [ "$status" -eq 0 ]
   echo "$output"
-  [[ "$output" == '[No setting matches "zzz". Esc clears the filter.]
+  [[ "$output" == '[No setting matches "zzz". Esc clears the filter. ]
 after esc: view=env_list filter=[]
 after esc: view=main' ]]
 }
@@ -264,7 +273,7 @@ after esc: view=main' ]]
     TUI_VIEW=main; TUI_RIGHT_MODE=status; tui_render_right_status'
   [ "$status" -eq 0 ]
   [[ "$output" != *CANARY* ]]
-  [[ "$output" == *'…042"'* ]]   # the mask: last four characters of the raw value, as before P6
+  [[ "$output" == *'…0042'* ]]   # the mask: last four characters of the value (quotes are not part of it)
   all="$(page_dumps 80 24; page_dumps 160 40)"
   [[ "$all" != *CANARY* ]]
   # control: with the mask stubbed out, the same details pane shows it
@@ -272,6 +281,46 @@ after esc: view=main' ]]
     for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_IDS[$i]}" == key:S3_SECRET_KEY ]] && TUI_SEL=$i; done
     tui_render_right_details'
   [[ "$output" == *"$CANARY"* ]]
+}
+
+@test "settings: masking hides credentials, not counts: limiter values shown, a canary in each masked key never shown" {
+  # The rule (env_key_is_sensitive): a whole "_"-separated word of the key is a
+  # credential word (SECRET, PASSWORD, TOKEN, KEY, ...), or the value is an
+  # nsec. Of .env.example's keys exactly these two are masked:
+  run in_haven 'for k in "${EX_KEYS[@]}"; do env_key_is_sensitive "$k" && echo "$k"; done; true'
+  [ "$status" -eq 0 ]
+  [ "$output" = $'S3_ACCESS_KEY_ID\nS3_SECRET_KEY' ]
+  # direction 1: a limiter count (its key contains TOKENS) is shown, in the
+  # list and in the details pane
+  sed -i 's/^PRIVATE_RELAY_EVENT_IP_LIMITER_TOKENS_PER_INTERVAL=.*/PRIVATE_RELAY_EVENT_IP_LIMITER_TOKENS_PER_INTERVAL=4711/; s/^CHAT_RELAY_EVENT_IP_LIMITER_MAX_TOKENS=.*/CHAT_RELAY_EVENT_IP_LIMITER_MAX_TOKENS=4712/' "$SB/.env"
+  local screen
+  screen="$(in_haven 'for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_IDS[$i]}" == key:PRIVATE_RELAY_EVENT_IP_LIMITER_TOKENS_PER_INTERVAL ]] && TUI_SEL=$i; done
+    tui_draw_frame 0; tui_render_left_menu; tui_render_right_details' | python3 -I "$EMU" 80 24 dump)"
+  echo "$screen"
+  grep -qE '▸ event refill +4711 │' <<<"$screen"
+  grep -q 'Current  4711' <<<"$screen"
+  [[ "$(page_dumps 80 24)" == *$'\t  event burst          4712'* ]]
+  # direction 2: a canary in each masked key, and an nsec in a key of no
+  # credential name, reach neither the list, the details pane nor the status view
+  sed -i "s/^S3_ACCESS_KEY_ID=.*/S3_ACCESS_KEY_ID=\"$CANARY-A\"/; s/^S3_SECRET_KEY=.*/S3_SECRET_KEY=\"$CANARY-S\"/" "$SB/.env"
+  printf 'ZZ_NOTE="nsec1%s"\n' "$CANARY" >> "$SB/.env"
+  local k all=""
+  for k in S3_ACCESS_KEY_ID S3_SECRET_KEY ZZ_NOTE; do
+    all+="$(in_haven 'for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_IDS[$i]}" == key:'"$k"' ]] && TUI_SEL=$i; done
+      tui_draw_frame 0; tui_render_left_menu; tui_render_right_details
+      TUI_VIEW=main; TUI_RIGHT_MODE=status; tui_render_right_status')"
+  done
+  all+="$(page_dumps 80 24; page_dumps 160 40)"
+  [[ "$all" == *"S3_SECRET_KEY"* && "$all" == *"zz note"* ]]
+  [[ "$all" != *CANARY* ]]
+  # control: with the rule switched off the same renders do show the canaries
+  all="$(in_haven 'env_key_is_sensitive() { return 1; }; tui_build_menu
+    for k in S3_SECRET_KEY ZZ_NOTE; do
+      for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do [[ "${MENU_IDS[$i]}" == "key:$k" ]] && TUI_SEL=$i; done
+      tui_setting_details; printf "%s" "${DETAIL_LINES[@]}"; echo
+    done')"
+  all="${all// /}"
+  [[ "$all" == *"$CANARY-S"* && "$all" == *"nsec1$CANARY"* ]]
 }
 
 @test "settings: a key only in .env is listed under Other, last" {

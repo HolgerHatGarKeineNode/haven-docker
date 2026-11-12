@@ -737,7 +737,14 @@ else
   tmx send-keys -t t11 -l "lmdb"
   wait_for t11 "lmdb"
   tmx send-keys -t t11 Enter
-  if wait_for t11 "use ./haven db-switch lmdb"; then
+  # the error wraps onto the rows above the prompt: judged on the joined left cells
+  t11_refused() {
+    local r all=""
+    while IFS= read -r r; do all+="$(left_cell "$r") "; done < <(capture t11 | sed -n '4,28p')
+    all="$(tr -s ' ' <<<"$all")"
+    [[ "$all" == *"use ./haven db-switch lmdb"* ]]
+  }
+  if poll_until "$WAIT_T" t11_refused; then
     ok "DB_ENGINE flip against the data on disk is refused inline, naming db-switch lmdb"
   else
     bad "DB_ENGINE flip not refused inline ($(capture t11 | tr '\n' '|' | head -c 200))"
@@ -1310,9 +1317,9 @@ tui_walk() { # <session>
   # the data flows, each left before anything runs: Back up at its confirm,
   # the restore list and the switch overview with Esc
   tmx send-keys -t "$s" b
-  wait_for "$s" "Back up now? The relay" || return 1
+  wait_for "$s" "Back up now? A verified" || return 1
   tmx send-keys -t "$s" Escape
-  wait_absent "$s" "Back up now? The relay" || return 1
+  wait_absent "$s" "Back up now? A verified" || return 1
   for k in e d; do
     case "$k" in
       e) text="backups/, newest first" ;;
@@ -1478,17 +1485,17 @@ if ! wait_for t18 "▸ s Start"; then
   bad "TUI did not start for the backup flow"
 else
   send_settled t18 b
-  wait_for t18 "Back up now? The relay"
+  wait_for t18 "Back up now? A verified"
   send_settled t18 Escape
-  if wait_absent t18 "Back up now? The relay" && [[ -z "$(state_calls "$SB")" ]]; then
+  if wait_absent t18 "Back up now? A verified" && [[ -z "$(state_calls "$SB")" ]]; then
     ok "back up: cancelled at the confirm, no state-changing call"
   else
     bad "back up: cancel at the confirm left calls: $(state_calls "$SB" | tr '\n' '|')"
   fi
   send_settled t18 b
-  wait_for t18 "Back up now? The relay"
+  wait_for t18 "Back up now? A verified"
   tmx send-keys -t t18 Enter
-  if wait_for t18 "Backup finished" && wait_for t18 "Backup written:"; then
+  if wait_for t18 "Backup finished" && wait_for t18 "Written and verified:"; then
     zip="$(find "$SB/backups" -maxdepth 1 -name 'haven-backup-*.zip' -print -quit)"
     if [[ -n "$zip" ]] && unzip -tq "$zip" >/dev/null 2>&1; then
       ok "back up: the box shows the verb's result and a verified zip exists ($(basename "$zip"))"
@@ -1507,13 +1514,15 @@ else
   chmod 600 "$SB/backups/"*.zip
   send_settled t18 e
   wait_for t18 "backups/, newest first"
-  order="$(capture t18 | grep -oE 'haven-backup-[0-9-]+\.zip' | tr '\n' ' ')"
-  if [[ "$order" == "$(basename "$zip") haven-backup-20250101-000000.zip " ]]; then
+  # a row is the name without "haven-" and ".zip" (the details pane has it whole)
+  order="$(left_rows t18 4 28 | grep -oE 'backup-[0-9]{8}-[0-9]{6}' | tr '\n' ' ')"
+  zrow="$(basename "$zip" .zip)"
+  if [[ "$order" == "${zrow#haven-} backup-20250101-000000 " ]]; then
     ok "restore: the list shows backups/ newest first ($order)"
   else
     bad "restore: list order is '$order'"
   fi
-  goto_item t18 "haven-backup-20250101-000000.zip"
+  goto_item t18 "backup-20250101-000000"
   send_settled t18 Enter
   wait_for t18 "Restore haven-backup-20250101"
   send_settled t18 Escape
@@ -1687,7 +1696,7 @@ flow_sandbox t19c
 flow_pane t19c 80 24 "MOCK_RUN_HOLD=1 MOCK_HOLD_MAX=60"
 if wait_for t19c "▸ s Start"; then
   send_settled t19c b
-  wait_for t19c "Back up now? The relay"
+  wait_for t19c "Back up now? A verified"
   tmx send-keys -t t19c Enter
   poll_until "$WAIT_T" test -e "$SB/.rig/started"
   wait_for t19c "Backing up"

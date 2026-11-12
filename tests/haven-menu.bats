@@ -185,7 +185,7 @@ TRACE_STUBS='
     done'
   [ "$status" -eq 0 ]
   echo "$output"
-  [[ "$output" == "confirm[Back up now? The relay is offline while the backup runs; the file goes to backups/ in this directory.]
+  [[ "$output" == "confirm[Back up now? A verified copy of the relay database goes to backups/ in this directory. A running relay stops while it runs and starts again afterwards.]
 message[Restore a backup|There is no backup in backups/ yet. Make one with Back up now, or with ./haven backup in a terminal.]
 view[switch]" ]]
 }

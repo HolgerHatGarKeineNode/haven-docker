@@ -44,14 +44,14 @@ badger() { local n; for n in private chat outbox inbox blossom; do mkdir -p "$SB
 @test "flows: back up asks first; No runs nothing, Yes runs ./haven backup" {
   run in_haven 'tui_flow_backup; echo ---; CONFIRM=y tui_flow_backup'
   echo "$output"
-  [[ "$output" == "confirm[Back up now? The relay is offline while the backup runs; the file goes to backups/ in this directory.]
+  [[ "$output" == "confirm[Back up now? A verified copy of the relay database goes to backups/ in this directory. A running relay stops while it runs and starts again afterwards.]
 ---
-confirm[Back up now? The relay is offline while the backup runs; the file goes to backups/ in this directory.]
+confirm[Back up now? A verified copy of the relay database goes to backups/ in this directory. A running relay stops while it runs and starts again afterwards.]
 run[backup]
 finish[Backup finished|]" ]]
 }
 
-@test "flows: restore lists backups/ newest first with size and age; .partial and others left out" {
+@test "flows: restore lists backups/ newest first with their age; .partial and others left out" {
   mkdir -m 700 "$SB/backups"
   printf 'x%.0s' $(seq 2048) > "$SB/backups/b.zip"; touch -d '2 hours ago' "$SB/backups/b.zip"
   : > "$SB/backups/a.zip"; touch -d '3 days ago' "$SB/backups/a.zip"
@@ -61,9 +61,9 @@ finish[Backup finished|]" ]]
     for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do echo "${MENU_IDS[$i]}|${MENU_VALUES[$i]}"; done'
   echo "$output"
   [[ "$output" == "view=restore_list
-file:c.zip|0B 5m
-file:b.zip|2.0K 2h
-file:a.zip|0B 3d
+file:c.zip|5m
+file:b.zip|2h
+file:a.zip|3d
 back|" ]]
 }
 
@@ -118,7 +118,9 @@ back|" ]]
     TYPED=lmdb tui_handle_enter'
   echo "$output"
   [[ "$output" == *$'from:badger|From the badger side\nfrom:lmdb|From the lmdb side'* ]]
-  [[ "$output" == *"Carries the notes of the badger side over into a clean lmdb database; the notes of the lmdb side stay in the set-aside directory db/.pre-switch-mixed-<time>/"* ]]
+  [[ "$output" == *"2. A verified backup of the badger data goes to backups/."* ]]
+  [[ "$output" == *"3. All database directories move to db/.pre-switch-mixed-<time>/ and are kept."* ]]
+  [[ "$output" == *"the badger side is restored into a clean lmdb database; the lmdb side stays set aside, not merged."* ]]
   [ "$(grep '^run\[' <<<"$output")" = "run[db-switch lmdb --from badger --yes]" ]
 }
 
@@ -154,7 +156,7 @@ back|" ]]
     tui_render_left_task | python3 -I '"$REPO_ROOT"'/tests/term-emu.py 80 24 dump | sed -n "4,10p" | sed -E "s/^  //; s/ *$//"'
   echo "$output"
   [[ "$output" == "Switching to lmdb
-Step 3 of 5 · 0m 0"?"s
+Step 3 of 5, 0m 0"?"s
 ───────────────────────────
 ✓ alpha
 ✓ beta-step

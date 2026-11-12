@@ -189,6 +189,7 @@ RIGHT_CONTENT_HEIGHT=0
 TUI_VIEW="main"
 TUI_SEL=0
 TUI_OFFSET=0
+TUI_PIN=-1               # settings list: the section row pinned in the first row, or -1
 TUI_NEED_FRAME=1
 TUI_NEED_LEFT=1
 TUI_NEED_RIGHT=1
@@ -648,7 +649,7 @@ tui_footer_hints() {
     message-scroll) _HINTS=$'↑↓|Scroll\nOther key|Continue' ;;
     confirm) _HINTS=$'←→|Choose\n⏎|Confirm\nEsc|Cancel' ;;
     prompt) _HINTS=$'⏎|Confirm\nEsc|Cancel' ;;
-    task) _HINTS=$'Ctrl-C|Stop it (the relay is started again)' ;;
+    task) _HINTS="Ctrl-C|${TASK_CTRLC_HINT:-Stop}"$'\nOther keys|Wait' ;;
     *)
       local tab="Status" settings=0
       tui_view_has_details && settings=1
@@ -805,8 +806,13 @@ tui_print_right() {
 
 tui_wait_key() {
   local _=""
-  # each poll is a finished render pass for the test seam (the box is drawn)
-  while ! IFS= read -rsn1 -t 0.1 _; do tui_sync_mark; done
+  # each poll is a finished render pass for the test seam (the box is drawn);
+  # false when the terminal was resized meanwhile (the caller lays out again)
+  while ! IFS= read -rsn1 -t 0.1 _; do
+    tui_sync_mark
+    [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]] && return 1
+  done
+  return 0
 }
 
 # Prompt validators: called by tui_prompt with the raw input; rc != 0 plus
@@ -1060,7 +1066,7 @@ tui_prompt() {
   tui_update_layout
   local prompt_row=$((TUI_LINES - 3))
   local err_row=$((TUI_LINES - 2))
-  PI_TEXT="" PI_CUR=0 PI_VIEW=0
+  PI_TEXT="" PI_CUR=0 PI_VIEW=0 PROMPT_ERR_ROWS=0
   tui_prompt_widths
 
   # Flush any pending input
@@ -1164,11 +1170,23 @@ tui_prompt() {
           [[ -n "$PROMPT_RESULT" ]] && PI_TEXT="$PROMPT_RESULT"
           break
         fi
+        # the error wraps onto the rows just above the prompt (the menu's,
+        # repainted when the prompt closes), never onto the frame
         {
-          tput cup "$err_row" "$LEFT_X"
-          printf "%-*s" "$LEFT_CONTENT_W" ""
-          tput cup "$err_row" "$LEFT_X"
-          printf "%b✗ %s%b" "${TUI_FG_LOG_ERROR}" "$VALIDATION_ERROR" "$CLR_RESET"
+          local -a err_lines=()
+          local el er
+          while IFS= read -r el; do err_lines+=("$el"); done < <(printf '✗ %s\n' "$VALIDATION_ERROR" | tui_wrap "$LEFT_CONTENT_W")
+          (( ${#err_lines[@]} > 3 )) && err_lines=("${err_lines[@]:0:3}")
+          for ((er = 1; er <= ${PROMPT_ERR_ROWS:-0}; er++)); do
+            tput cup $((prompt_row - er)) "$LEFT_X"
+            printf "%-*s" "$LEFT_CONTENT_W" ""
+          done
+          PROMPT_ERR_ROWS=${#err_lines[@]}
+          for ((er = 0; er < PROMPT_ERR_ROWS; er++)); do
+            tput cup $((prompt_row - PROMPT_ERR_ROWS + er)) "$LEFT_X"
+            tui_pad_to "${err_lines[$er]}" "$LEFT_CONTENT_W"
+            printf "%b%s%b" "${TUI_FG_LOG_ERROR}" "$_PADDED" "$CLR_RESET"
+          done
         } >/dev/tty
         continue
       fi
@@ -1232,7 +1250,7 @@ tui_confirm() {
   while IFS= read -r qline; do
     tui_print_left_styled $((LEFT_CONTENT_ROW + qrows)) "${TUI_BOLD}${TUI_FG_ACCENT}" "$qline"
     qrows=$((qrows + 1))
-  done < <(printf '%s\n' "${prompt//\\n/$'\n'}" | fold -s -w "$LEFT_CONTENT_W")
+  done < <(printf '%s\n' "${prompt//\\n/$'\n'}" | tui_wrap "$LEFT_CONTENT_W")
   local row=$((LEFT_CONTENT_ROW + qrows + 1))
 
   # May run inside a $() subshell with reset traps — re-arm SIGWINCH locally.
@@ -1277,51 +1295,62 @@ tui_confirm() {
 tui_message() {
   local title="$1"
   local text="$2"
-  local row="$LEFT_CONTENT_ROW"
   # callers write line breaks as "\n" inside double quotes, which bash keeps as
   # backslash + n: turn them into real ones, or they show up as text
   text="${text//\\n/$'\n'}"
 
-  # Fresh geometry — messages may open after the frame was last laid out.
-  tui_update_layout
-
-  TUI_FOOTER="message"
-  tui_draw_frame 1
-  tui_render_right_panel
-
-  # Bold accent title
-  tui_print_left_styled "$row" "${TUI_BOLD}${TUI_FG_ACCENT}" "$title"
-  row=$((row + 1))
-
-  # Thin separator
-  tui_print_left_styled "$row" "$TUI_FG_SEPARATOR" "$_HLINE_SEP"
-  row=$((row + 1))
-
   # Body text; a text taller than the pane scrolls with ↑↓ (the last row of
   # the page then says how many lines are hidden below), any other key
-  # continues
-  local line top=0 i body_h n
+  # continues. A resize lays the box out again at the new size (fresh
+  # geometry, the text wrapped anew), also while it waits for its key.
+  local line top=0 i body_h=0 n=0 row redraw=1 paint=1
   local -a body=()
-  while IFS= read -r line; do body+=("$line"); done < <(printf "%s\n" "$text" | fold -s -w "$LEFT_CONTENT_W")
-  n=${#body[@]}
-  body_h=$((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT - row))
-  if (( n > body_h )); then
-    TUI_FOOTER="message-scroll"
-    tui_draw_status_bar
-  fi
   while :; do
-    for ((i = 0; i < body_h; i++)); do
-      line=""
-      (( top + i < n )) && line="${body[$((top + i))]}"
-      if (( n > body_h && i == body_h - 1 && top + body_h < n )); then
-        tui_print_left_styled $((row + i)) "${TUI_DIM}${TUI_ITALIC}" "↓ $((n - top - body_h + 1)) more lines"
-      else
-        tui_print_left $((row + i)) "$line"
-      fi
-    done
-    (( n > body_h )) || { tui_wait_key; break; }
+    if (( redraw )); then
+      tui_update_layout
+      body=()
+      while IFS= read -r line; do body+=("$line"); done < <(printf "%s\n" "$text" | tui_wrap "$LEFT_CONTENT_W")
+      n=${#body[@]}
+      row=$((LEFT_CONTENT_ROW + 2))
+      body_h=$((LEFT_CONTENT_ROW + LEFT_CONTENT_HEIGHT - row))
+      TUI_FOOTER="message"
+      (( n > body_h )) && TUI_FOOTER="message-scroll"
+      (( top > n - body_h )) && top=$((n - body_h))
+      (( top < 0 )) && top=0
+      tui_draw_frame 1
+      tui_render_right_panel
+      tui_print_left_styled "$LEFT_CONTENT_ROW" "${TUI_BOLD}${TUI_FG_ACCENT}" "$title"
+      tui_print_left_styled $((LEFT_CONTENT_ROW + 1)) "$TUI_FG_SEPARATOR" "$_HLINE_SEP"
+      tui_draw_status_bar
+      redraw=0 paint=1
+    fi
+    if (( paint )); then
+      for ((i = 0; i < body_h; i++)); do
+        line=""
+        (( top + i < n )) && line="${body[$((top + i))]}"
+        if (( n > body_h && i == body_h - 1 && top + body_h < n )); then
+          tui_print_left_styled $((row + i)) "${TUI_DIM}${TUI_ITALIC}" "↓ $((n - top - body_h + 1)) more lines"
+        else
+          tui_print_left $((row + i)) "$line"
+        fi
+      done
+      paint=0
+    fi
+    if (( n <= body_h )); then
+      # any key continues (tui_wait_key: a resize meanwhile lays out again)
+      tui_wait_key && break
+      TUI_NEED_RESIZE=0
+      redraw=1
+      continue
+    fi
     tui_sync_mark
-    tui_read_key || continue
+    if ! tui_read_key; then
+      if [[ "${TUI_NEED_RESIZE:-0}" -eq 1 ]]; then
+        TUI_NEED_RESIZE=0
+        redraw=1
+      fi
+      continue
+    fi
     case "$_KEY" in
       down|j) (( top + body_h < n )) && top=$((top + 1)) ;;
       up|k) (( top > 0 )) && top=$((top - 1)) ;;
@@ -1330,6 +1359,7 @@ tui_message() {
       unknown|paste) : ;;
       *) break ;;
     esac
+    paint=1
   done
   TUI_FOOTER=""
 }
@@ -1675,13 +1705,22 @@ is_date() {
   [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
 }
 
+# is_duration <value> — true for what upstream's getEnvDuration accepts and
+# time.NewTicker can run: Go's time.ParseDuration syntax in whole hours,
+# minutes and seconds ("24h", "90m", "1h30m"), greater than zero. Go has no
+# day unit: "1d" makes ParseDuration fail and Haven panic at start (v1.2.2
+# config.go getEnvDuration; pkg/wot PeriodicRefresh -> time.NewTicker).
 is_duration() {
-  [[ "$1" =~ ^[0-9]+[smhd]$ ]]
+  [[ "$1" =~ ^([0-9]+[hms])+$ ]] || return 1
+  [[ "$1" =~ [1-9] ]]
 }
 
+# is_log_level <value> — the levels upstream's getLogLevelFromConfig knows
+# (v1.2.2 main.go: DEBUG, INFO, WARN, ERROR; anything else logs at INFO). The
+# editor upper-cases what is typed: upstream compares case-sensitively.
 is_log_level() {
   case "${1^^}" in
-    DEBUG|INFO|WARNING|ERROR) return 0 ;;
+    DEBUG|INFO|WARN|ERROR) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1839,8 +1878,12 @@ validate_env_value() {
       VALIDATION_VALUE="${value,,}"
       ;;
     WOT_REFRESH_INTERVAL)
+      if [[ "$value" =~ ^[0-9]+d$ ]]; then
+        VALIDATION_ERROR="Haven has no day unit: use hours (${value%d}d = $(( 10#${value%d} * 24 ))h). Units: h, m, s."
+        return 1
+      fi
       if ! is_duration "$value"; then
-        VALIDATION_ERROR="WOT_REFRESH_INTERVAL must look like 24h, 30m, or 10s."
+        VALIDATION_ERROR="A duration above zero in h, m and s, e.g. 24h, 90m or 1h30m."
         return 1
       fi
       ;;
@@ -1902,8 +1945,12 @@ validate_env_value() {
       fi
       ;;
     HAVEN_LOG_LEVEL)
+      if [[ "${value^^}" == WARNING ]]; then
+        VALIDATION_ERROR="Haven reads WARN, not WARNING (WARNING logs at INFO). Type WARN."
+        return 1
+      fi
       if ! is_log_level "$value"; then
-        VALIDATION_ERROR="HAVEN_LOG_LEVEL must be DEBUG, INFO, WARNING, or ERROR."
+        VALIDATION_ERROR="HAVEN_LOG_LEVEL must be DEBUG, INFO, WARN or ERROR."
         return 1
       fi
       VALIDATION_VALUE="$(wrap_like_raw "$raw" "${value^^}")"
@@ -1929,7 +1976,7 @@ env_rule_text() {
     BLOSSOM_PATH) _RULE="Not empty." ;;
     *_ICON) _RULE="An http:// or https:// URL, or empty." ;;
     *_ALLOW_EMPTY_FILTERS|*_ALLOW_COMPLEX_FILTERS) _RULE="true or false." ;;
-    WOT_REFRESH_INTERVAL) _RULE="A number followed by s, m, h or d, e.g. 24h." ;;
+    WOT_REFRESH_INTERVAL) _RULE="A duration above zero in hours, minutes and seconds (h, m, s), e.g. 24h, 90m or 1h30m. No days: 1d is 24h." ;;
     BACKUP_INTERVAL_HOURS) _RULE="A whole number, 0 or more." ;;
     *_TOKENS_PER_INTERVAL|*_INTERVAL|*_MAX_TOKENS|*_INTERVAL_SECONDS|*_TIMEOUT_SECONDS|*_DEPTH|*_MINIMUM_FOLLOWERS)
       _RULE="A whole number, 0 or more." ;;
@@ -1940,8 +1987,37 @@ env_rule_text() {
     S3_ACCESS_KEY_ID|S3_SECRET_KEY|S3_REGION) _RULE="Not empty when BACKUP_PROVIDER is s3." ;;
     S3_ENDPOINT) _RULE="A host or URL; not empty when BACKUP_PROVIDER is s3." ;;
     S3_BUCKET_NAME) _RULE="3 to 63 characters: lower-case letters, digits, dot, dash; not empty when BACKUP_PROVIDER is s3." ;;
-    HAVEN_LOG_LEVEL) _RULE="DEBUG, INFO, WARNING or ERROR." ;;
+    HAVEN_LOG_LEVEL) _RULE="DEBUG, INFO, WARN or ERROR." ;;
     *) _RULE="" ;;
+  esac
+}
+
+# env_stored_value_note <key> <raw value> — _STORED_NOTE: for a value already
+# in .env that upstream does not read the way it looks, what Haven does with
+# it (the details pane shows it under Current); empty otherwise. Only for the
+# two settings whose rule changed with upstream v1.2.2 (log level, duration).
+env_stored_value_note() {
+  local v
+  _STORED_NOTE=""
+  v="$(strip_quotes "$2")"
+  [[ -n "$v" ]] || return 0
+  case "$1" in
+    HAVEN_LOG_LEVEL)
+      case "$v" in
+        DEBUG|INFO|WARN|ERROR) ;;
+        WARNING) _STORED_NOTE="Haven does not know WARNING and logs at INFO; WARN is its warnings level." ;;
+        *) _STORED_NOTE="Haven does not know $v and logs at INFO; it reads DEBUG, INFO, WARN or ERROR in capitals." ;;
+      esac
+      ;;
+    WOT_REFRESH_INTERVAL)
+      # Go's syntax in full (decimals, ms/us/ns): only what ParseDuration
+      # refuses, or a zero NewTicker refuses, stops Haven
+      if [[ ! "$v" =~ ^(([0-9]+(\.[0-9]*)?|\.[0-9]+)(ns|us|ms|s|m|h))+$ ]]; then
+        _STORED_NOTE="Haven cannot read $v as a duration and stops at start; use h, m or s, e.g. 24h."
+      elif [[ ! "$v" =~ [1-9] ]]; then
+        _STORED_NOTE="Haven stops at start with an interval of zero."
+      fi
+      ;;
   esac
 }
 
@@ -5182,6 +5258,44 @@ tui_render_right_panel() {
   esac
 }
 
+# tui_wrap <cells> — stdin wrapped to <cells> per line: at spaces; a word wider
+# than that (a path, a file name) breaks after its last "/", "-", "_" or "."
+# that fits, and only where there is none in the middle of a run of letters.
+# No line starts with a space; empty lines stay. Used for the dialogs, result
+# boxes and details, where fold -s cut "lmdb" into "lm" and "db".
+tui_wrap() {
+  awk -v w="$1" '
+    function brk(s, room,    i, c) {   # length of the longest prefix of s ending in a break char, <= room
+      for (i = (room < length(s) ? room : length(s)); i > 1; i--) {
+        c = substr(s, i, 1)
+        if (c == "/" || c == "-" || c == "_" || c == ".") return i
+      }
+      return 0
+    }
+    {
+      n = split($0, words, / +/); line = ""
+      for (j = 1; j <= n; j++) {
+        word = words[j]
+        if (word == "") continue
+        cand = (line == "" ? word : line " " word)
+        if (length(cand) <= w) { line = cand; continue }
+        if (line != "" && length(word) <= w) { print line; line = word; continue }
+        if (line != "") {
+          p = brk(word, w - length(line) - 1)
+          if (p >= 4) { print line " " substr(word, 1, p); word = substr(word, p + 1) }
+          else print line
+          line = ""
+        }
+        while (length(word) > w) {
+          p = brk(word, w); if (p == 0) p = w
+          print substr(word, 1, p); word = substr(word, p + 1)
+        }
+        line = word
+      }
+      print line
+    }'
+}
+
 # tui_wrap_key <key> <cells> — the key name on as many lines as it needs,
 # broken after an underscore where possible, never cut.
 tui_wrap_key() {
@@ -5207,15 +5321,36 @@ tui_wrap_key() {
 
 # tui_setting_details — DETAIL_LINES: what the details pane shows for the
 # selected entry of the settings list (or the key of the setting view), wrapped
-# to the pane: the full key name, its description, the example value of
-# .env.example, the rule the editor checks, the current value (masked like the
-# list for sensitive keys). DETAIL_BOLD: how many leading lines are the key.
+# to the pane: the full key name, its description, then three labelled fields
+# in a column — Current (the value now, masked like the list for credentials,
+# and in bold: it is what the user came for), Allowed (the rule the editor
+# checks) and Example (the value of .env.example). DETAIL_BOLD: how many
+# leading lines are the key; DETAIL_STYLE: the style of a line, by index.
 DETAIL_LINES=()
 DETAIL_BOLD=0
+DETAIL_STYLE=()
+DETAIL_LABEL_W=9
+# detail_field <label> <text> [style] — one labelled field: the label in its
+# column, the text wrapped beside it, continuation lines indented under it.
+detail_field() {
+  local label="$1" text="$2" style="${3:-}" line first=1 pad
+  printf -v pad '%*s' "$DETAIL_LABEL_W" ''
+  while IFS= read -r line; do
+    if (( first )); then
+      DETAIL_LINES+=("$(printf '%-*s%s' "$DETAIL_LABEL_W" "$label" "$line")")
+    else
+      DETAIL_LINES+=("$pad$line")
+    fi
+    [[ -z "$style" ]] || DETAIL_STYLE[${#DETAIL_LINES[@]} - 1]="$style"
+    first=0
+  done < <(printf '%s\n' "$text" | tui_wrap $((RIGHT_CONTENT_W - DETAIL_LABEL_W)))
+}
+
 tui_setting_details() {
   local id="" key="" w="$RIGHT_CONTENT_W" v line
   DETAIL_LINES=()
   DETAIL_BOLD=0
+  DETAIL_STYLE=()
   if [[ "$TUI_VIEW" == "env_item" ]]; then
     key="$CURRENT_ENV_KEY"
   elif (( ${#MENU_IDS[@]} > 0 && TUI_SEL < ${#MENU_IDS[@]} )); then
@@ -5226,10 +5361,10 @@ tui_setting_details() {
     case "$id" in
       add) v="Adds a line to .env: you type the key, then its value. Saving restarts a running relay." ;;
       back) v="Back to the main menu." ;;
-      group:*) v="No setting matches the filter." ;;
+      group:*) v="Esc clears the filter; / starts a new one." ;;
       *) v="" ;;
     esac
-    while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | fold -s -w "$w")
+    while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | tui_wrap "$w")
     return 0
   fi
   env_example_load
@@ -5243,24 +5378,28 @@ tui_setting_details() {
   else
     v="Not in .env.example: Haven does not document this setting."
   fi
-  while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | fold -s -w "$w")
+  while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | tui_wrap "$w")
   DETAIL_LINES+=("")
-  if [[ -n "${EX_SEC[$key]+x}" ]]; then
-    v="Example: ${EX_EXAMPLE[$key]}"
-    [[ "${EX_COMMENTED[$key]:-0}" == "1" ]] && v+=" (commented out in .env.example)"
-    while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | fold -s -w "$w")
-  fi
-  env_rule_text "$key"
-  if [[ -n "$_RULE" ]]; then
-    while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf 'Rule: %s\n' "$_RULE" | fold -s -w "$w")
-  fi
   v="$(read_env_var "$key" 2>/dev/null | head -n 1 || true)"
-  if env_key_is_sensitive "$key"; then
-    mask_env_value "$v"
-    v="$_MASKED (hidden; Enter, then Reveal value shows it)"
+  env_stored_value_note "$key" "$v"
+  settings_shown_value "$key" "$v"
+  v="$_SHOWN"
+  if [[ -z "$v" ]]; then
+    v="(empty)"
+  elif (( _SHOWN_MASKED )); then
+    v+=" (hidden; Enter, then Reveal value shows it)"
   fi
-  [[ -n "$v" ]] || v="(empty)"
-  while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf 'Current: %s\n' "$v" | fold -s -w "$w")
+  detail_field "Current" "$v" "$TUI_BOLD"
+  [[ -z "$_STORED_NOTE" ]] || detail_field "" "$_STORED_NOTE" "$TUI_FG_LOG_WARN"
+  env_rule_text "$key"
+  [[ -z "$_RULE" ]] || detail_field "Allowed" "$_RULE"
+  if [[ -n "${EX_SEC[$key]+x}" ]]; then
+    settings_shown_value "$key" "${EX_EXAMPLE[$key]}"
+    v="$_SHOWN"
+    [[ -n "$v" ]] || v="(empty)"
+    [[ "${EX_COMMENTED[$key]:-0}" == "1" ]] && v+=" (commented out in .env.example)"
+    detail_field "Example" "$v"
+  fi
 }
 
 tui_render_right_details() {
@@ -5283,10 +5422,11 @@ tui_render_right_details() {
     line="" style=""
     if (( row < n )); then
       line="${DETAIL_LINES[$row]}"
+      style="${DETAIL_STYLE[$row]:-}"
       (( row < DETAIL_BOLD )) && style="${TUI_BOLD}${TUI_FG_ACCENT}"
     fi
     if (( row == RIGHT_CONTENT_HEIGHT - 1 && n > RIGHT_CONTENT_HEIGHT )); then
-      line="… (more: a taller terminal shows it)"
+      line="… (more in a taller terminal)"
       style="${TUI_DIM}${TUI_ITALIC}"
     fi
     tui_truncate "$line" "$RIGHT_CONTENT_W"
@@ -5327,7 +5467,7 @@ tui_render_right_status() {
       fi
       styles+=("$style")
       first=0
-    done < <(printf '%s\n' "$value" | fold -s -w "$vw")
+    done < <(printf '%s\n' "$value" | tui_wrap "$vw")
   done
   local row line st
   for ((row=0; row<RIGHT_CONTENT_HEIGHT; row++)); do
@@ -5419,7 +5559,7 @@ tui_collect_status() {
   elif (( ${#FLOW_FILES[@]} )); then
     f="${FLOW_FILES[0]}"
     tui_flow_age "${FLOW_FILE_TIME[$f]}"
-    TUI_STATUS_CACHE+=("Last backup|$f, $_AGE")
+    TUI_STATUS_CACHE+=("Last backup|$_AGE, $f")
   else
     TUI_STATUS_CACHE+=("Last backup|never|warn")
   fi
@@ -5758,11 +5898,40 @@ mask_env_value() {
   fi
 }
 
+# settings_shown_value <key> <raw value> — _SHOWN: the value as the settings
+# editor shows it: without the quotes around it ("" stays for an empty quoted
+# value), masked for a credential (env_key_is_sensitive).
+settings_shown_value() {
+  local v="$2"
+  _SHOWN_MASKED=0
+  if (( ${#v} > 2 )) && { [[ "$v" == \"*\" ]] || [[ "$v" == \'*\' ]]; }; then
+    v="${v:1:${#v}-2}"
+  fi
+  if env_key_is_sensitive "$1" "$v"; then
+    mask_env_value "$v"
+    v="$_MASKED"
+    _SHOWN_MASKED=1
+  fi
+  _SHOWN="$v"
+}
+
+# env_key_is_sensitive <key> [value] — true for a credential: a key with one of
+# the words below as a whole "_"-separated word of its name, or any value that
+# is a Nostr secret key (nsec1…). Whole words, so the rate limiters'
+# *_TOKENS_PER_INTERVAL and *_MAX_TOKENS (counts, not credentials) stay visible
+# while S3_SECRET_KEY, S3_ACCESS_KEY_ID, an API_TOKEN or a DB_PASSWORD are
+# masked. Of .env.example's keys this masks S3_ACCESS_KEY_ID and S3_SECRET_KEY.
+ENV_SECRET_WORDS=" SECRET SECRETS PASSWORD PASSWD PASS PASSPHRASE TOKEN KEY APIKEY NSEC CREDENTIAL CREDENTIALS AUTH "
 env_key_is_sensitive() {
-  case "$1" in
-    *SECRET*|*PASSWORD*|*TOKEN*|*KEY*) return 0 ;;
-    *) return 1 ;;
-  esac
+  local word v="${2:-}"
+  local -a words=()
+  v="${v#[\"\']}"
+  [[ "${v,,}" == nsec1* ]] && return 0
+  IFS=_ read -ra words <<<"$1"
+  for word in "${words[@]}"; do
+    [[ "$ENV_SECRET_WORDS" == *" ${word^^} "* ]] && return 0
+  done
+  return 1
 }
 
 # --- settings editor: structure and descriptions from .env.example ----------
@@ -5890,24 +6059,50 @@ env_section_prefix() {
   _PREFIX="$p"
 }
 
-# env_label_base <key> <prefix> — _LABEL: the key without the section prefix
-# and without the _LIMITER infix, lower case, words apart.
+# env_label_base <key> <prefix> — _LABEL: the readable name of a setting in
+# the list: the key without its section's prefix (and without a RELAY_ left
+# behind by it: INBOX_RELAY_NAME is the inbox section's "name"), lower case,
+# words apart, units as "(s)", "(m)", "(h)". The section row above names the
+# relay, so the label does not repeat it. The rate limiters and a few long
+# names have a short name of their own (ENV_LABEL_NAMES) that fits next to
+# its value at 80 columns; the details pane always shows the full key.
+declare -A ENV_LABEL_NAMES=(
+  [EVENT_IP_LIMITER_TOKENS_PER_INTERVAL]="event refill"
+  [EVENT_IP_LIMITER_INTERVAL]="event interval (m)"
+  [EVENT_IP_LIMITER_MAX_TOKENS]="event burst"
+  [CONNECTION_RATE_LIMITER_TOKENS_PER_INTERVAL]="connection refill"
+  [CONNECTION_RATE_LIMITER_INTERVAL]="connection interval (m)"
+  [CONNECTION_RATE_LIMITER_MAX_TOKENS]="connection burst"
+  [ALLOW_EMPTY_FILTERS]="empty filters"
+  [ALLOW_COMPLEX_FILTERS]="complex filters"
+  [RELAY_BIND_ADDRESS]="bind address"
+  [HAVEN_LOG_LEVEL]="log level"
+  [OWNER_NOTES_FETCH_TIMEOUT_SECONDS]="own notes timeout (s)"
+  [TAGGED_NOTES_FETCH_TIMEOUT_SECONDS]="mentions timeout (s)"
+  [WHITELISTED_NPUBS_FILE]="whitelist file"
+  [BLACKLISTED_NPUBS_FILE]="blacklist file"
+)
 env_label_base() {
   local k="${1#"$2"}"
-  k="${k//_LIMITER_/_}"
-  k="${k%_LIMITER}"
+  [[ -n "$2" && "$k" == RELAY_?* ]] && k="${k#RELAY_}"
+  if [[ -n "${ENV_LABEL_NAMES[$k]:-}" ]]; then
+    _LABEL="${ENV_LABEL_NAMES[$k]}"
+    return 0
+  fi
+  case "$k" in
+    *_SECONDS) k="${k%_SECONDS}_(S)" ;;
+    *_HOURS) k="${k%_HOURS}_(H)" ;;
+  esac
   k="${k,,}"
   _LABEL="${k//_/ }"
 }
 
 # env_labels — SET_LABEL (key -> label) for every key of .env.example and of
-# .env: the base label; where two keys get the same one (four relays share
-# their setting names), the first word of the section prefix leads ("chat
-# name"); a key only in .env keeps its whole name.
+# .env: the base label within its section; a key only in .env keeps its
+# whole name (lower case, words apart).
 declare -A SET_LABEL=()
 env_labels() {
   local i k
-  local -A base=() qual=() uses=()
   local -a keys=()
   SET_LABEL=()
   for ((i = 0; i < ${#EX_SECTIONS[@]}; i++)); do
@@ -5919,26 +6114,13 @@ env_labels() {
     env_section_prefix "${keys[@]}"
     for k in "${keys[@]}"; do
       env_label_base "$k" "$_PREFIX"
-      base[$k]="$_LABEL"
-      qual[$k]="${_PREFIX%%_*}"
-      qual[$k]="${qual[$k],,}"
+      SET_LABEL[$k]="$_LABEL"
     done
   done
   for k in "${ENV_ORDER[@]}"; do
-    [[ -n "${base[$k]+x}" ]] && continue
+    [[ -n "${SET_LABEL[$k]+x}" ]] && continue
     env_label_base "$k" ""
-    base[$k]="$_LABEL"
-    qual[$k]=""
-  done
-  for k in "${!base[@]}"; do
-    uses[${base[$k]}]=$(( ${uses[${base[$k]}]:-0} + 1 ))
-  done
-  for k in "${!base[@]}"; do
-    if (( uses[${base[$k]}] > 1 )) && [[ -n "${qual[$k]}" ]]; then
-      SET_LABEL[$k]="${qual[$k]} ${base[$k]}"
-    else
-      SET_LABEL[$k]="${base[$k]}"
-    fi
+    SET_LABEL[$k]="$_LABEL"
   done
 }
 
@@ -5973,12 +6155,12 @@ tui_truncate_middle() {
 }
 
 # settings_match <key> — true when the settings filter is empty or found,
-# case-insensitive, in the key name or its description.
+# case-insensitive, in the key name, its label in the list or its description.
 SETTINGS_FILTER=""
 settings_match() {
   [[ -z "$SETTINGS_FILTER" ]] && return 0
-  local f="${SETTINGS_FILTER,,}" k="${1,,}" d="${EX_DESC[$1]:-}"
-  [[ "$k" == *"$f"* || "${d,,}" == *"$f"* ]]
+  local f="${SETTINGS_FILTER,,}" k="${1,,}" d="${EX_DESC[$1]:-}" l="${SET_LABEL[$1]:-}"
+  [[ "$k" == *"$f"* || "${d,,}" == *"$f"* || "$l" == *"$f"* ]]
 }
 
 # settings_rows — the settings list into MENU_IDS / MENU_LABELS / MENU_VALUES:
@@ -6004,8 +6186,8 @@ settings_rows() {
     (( ${#here[@]} )) || continue
     MENU_IDS+=("group:sec:$i") MENU_LABELS+=("${EX_SECTIONS[$i]}") MENU_VALUES+=("")
     for k in "${here[@]}"; do
-      v="${ENV_VALUE[$k]}"
-      if env_key_is_sensitive "$k"; then mask_env_value "$v"; v="$_MASKED"; fi
+      settings_shown_value "$k" "${ENV_VALUE[$k]}"
+      v="$_SHOWN"
       MENU_IDS+=("key:$k") MENU_LABELS+=("${SET_LABEL[$k]}") MENU_VALUES+=("$v")
       n=$((n + 1))
     done
@@ -6017,8 +6199,8 @@ settings_rows() {
   if (( ${#other[@]} )); then
     MENU_IDS+=("group:sec:other") MENU_LABELS+=("Other") MENU_VALUES+=("")
     for k in "${other[@]}"; do
-      v="${ENV_VALUE[$k]}"
-      if env_key_is_sensitive "$k"; then mask_env_value "$v"; v="$_MASKED"; fi
+      settings_shown_value "$k" "${ENV_VALUE[$k]}"
+      v="$_SHOWN"
       MENU_IDS+=("key:$k") MENU_LABELS+=("${SET_LABEL[$k]}") MENU_VALUES+=("$v")
       n=$((n + 1))
     done
@@ -6029,7 +6211,7 @@ settings_rows() {
     while IFS= read -r line; do
       MENU_IDS+=("group:empty:$j") MENU_LABELS+=("$line") MENU_VALUES+=("")
       j=$((j + 1))
-    done < <(printf 'No setting matches "%s". Esc clears the filter.\n' "$SETTINGS_FILTER" | fold -s -w "$LEFT_CONTENT_W")
+    done < <(printf 'No setting matches "%s". Esc clears the filter.\n' "$SETTINGS_FILTER" | tui_wrap "$LEFT_CONTENT_W")
   fi
   if [[ -z "$SETTINGS_FILTER" ]]; then
     MENU_IDS+=(back) MENU_LABELS+=("Back") MENU_VALUES+=("")
@@ -6037,12 +6219,15 @@ settings_rows() {
   tui_fit_setting_rows
 }
 
-# tui_fit_setting_rows — fit every key row into the pane: the value right-aligned
-# (cut at the end to a third of the row), the label cut in the middle to the rest.
-# Where two rows would still read the same, the cut of the later one moves until
-# it differs (more of the start, then less), so no two rows look alike.
+# tui_fit_setting_rows — fit every key row into the pane: the label keeps its
+# width, the value right-aligned gets the rest (at least a third of the row;
+# what does not fit is cut at its end — the details pane shows it whole), and
+# only a label that still does not fit is cut in the middle. Where two rows of
+# one section would still read the same, the cut of the later one moves until
+# it differs (more of the start, then less). Sections may repeat a label: the
+# section row above (pinned while the list scrolls) tells them apart.
 tui_fit_setting_rows() {
-  local i j h avail vw lw v try text
+  local i h avail vw lw v try text vmax
   local -A seen=()
   local -a full=()
   avail=$((LEFT_CONTENT_W - 2))
@@ -6051,10 +6236,13 @@ tui_fit_setting_rows() {
     [[ "${MENU_IDS[$i]}" == key:* || "${MENU_IDS[$i]}" == file:* ]] || continue
     v="${MENU_VALUES[$i]}"
     if [[ -n "$v" ]]; then
+      tui_str_width "${full[$i]}"
+      vmax=$((avail - _WIDTH - 1))
+      (( vmax < avail / 3 )) && vmax=$((avail / 3))
       tui_str_width "$v"
       vw=$_WIDTH
-      if (( vw > avail / 3 )); then
-        tui_truncate "$v" $((avail / 3))
+      if (( vw > vmax )); then
+        tui_truncate "$v" "$vmax"
         v="${_TRUNC%...}…"
         tui_str_width "$v"
         vw=$_WIDTH
@@ -6068,6 +6256,7 @@ tui_fit_setting_rows() {
   done
   for ((i = 0; i < ${#MENU_IDS[@]}; i++)); do
     if [[ "${MENU_IDS[$i]}" != key:* && "${MENU_IDS[$i]}" != file:* ]]; then
+      [[ "${MENU_IDS[$i]}" == group:sec:* ]] && seen=()
       seen["${MENU_LABELS[$i]}"]=1
       continue
     fi
@@ -6124,12 +6313,15 @@ tui_build_menu() {
       TUI_LEFT_TITLE="Haven / Restore a backup"
       MENU_TITLE="Restore a backup"
       MENU_SUBTITLE="backups/, newest first"
-      local fname
+      # a row is the name without the "haven-" every backup of this script
+      # starts with and without ".zip", and its age: at 80 columns that keeps
+      # the whole date and time readable; name and size are in the details
+      local fname lab
       for fname in "${FLOW_FILES[@]+"${FLOW_FILES[@]}"}"; do
-        tui_flow_short_size "${FLOW_FILE_SIZE[$fname]:-0}"
-        local short="$_SHORT"
         tui_flow_age "${FLOW_FILE_TIME[$fname]:-0}" short
-        MENU_IDS+=("file:$fname") MENU_LABELS+=("$fname") MENU_VALUES+=("$short $_AGE")
+        lab="${fname%.zip}"
+        lab="${lab#haven-}"
+        MENU_IDS+=("file:$fname") MENU_LABELS+=("$lab") MENU_VALUES+=("$_AGE")
       done
       MENU_IDS+=(back) MENU_LABELS+=("Back") MENU_VALUES+=("")
       tui_fit_setting_rows
@@ -6182,7 +6374,14 @@ tui_build_menu() {
       MENU_TITLE="Settings (.env)"
       settings_rows
       if [[ -n "$SETTINGS_FILTER" ]]; then
-        MENU_SUBTITLE="Filter \"$SETTINGS_FILTER\": $SETTINGS_SHOWN found"
+        # a filter longer than the row is cut in its middle, inside the
+        # quotes: the count at the end of the row always stays readable
+        local fterm="$SETTINGS_FILTER" fpre="Filter " fbudget
+        tui_str_width "$fpre\"\": $SETTINGS_SHOWN found"
+        fbudget=$((LEFT_CONTENT_W - _WIDTH))
+        if (( fbudget < 6 )); then fpre=""; fbudget=$((fbudget + 7)); fi
+        tui_truncate_middle "$fterm" "$fbudget" $(( (fbudget - 1) / 2 ))
+        MENU_SUBTITLE="$fpre\"$_TRUNC\": $SETTINGS_SHOWN found"
       else
         MENU_SUBTITLE="Select a setting"
       fi
@@ -6295,10 +6494,29 @@ tui_render_left_menu() {
   if [[ "$TUI_SEL" -ge $((TUI_OFFSET + visible_rows)) ]]; then
     TUI_OFFSET=$((TUI_SEL - visible_rows + 1))
   fi
+  # Settings list: when the window starts inside a section, that section's
+  # row stays pinned in the first row (the labels do not repeat the relay
+  # they belong to); the window below it is one row shorter.
+  local j
+  TUI_PIN=-1
+  while [[ "$TUI_VIEW" == env_list ]]; do
+    TUI_PIN=-1
+    if (( TUI_OFFSET > 0 )) && [[ "${MENU_IDS[$TUI_OFFSET]}" != group:* ]]; then
+      for ((j = TUI_OFFSET - 1; j >= 0; j--)); do
+        [[ "${MENU_IDS[$j]}" == group:sec:* ]] && { TUI_PIN=$j; break; }
+      done
+    fi
+    (( TUI_PIN >= 0 && TUI_SEL >= TUI_OFFSET + visible_rows - 1 )) || break
+    TUI_OFFSET=$((TUI_OFFSET + 1))
+  done
 
   local i idx label menu_id key key_w label_w
   for ((i=0; i<visible_rows; i++)); do
     idx=$((TUI_OFFSET + i))
+    if (( TUI_PIN >= 0 )); then
+      idx=$((TUI_OFFSET + i - 1))
+      (( i == 0 )) && idx=$TUI_PIN
+    fi
     label=""
     menu_id=""
     key=""
@@ -6434,7 +6652,8 @@ TASK_PID=""
 TASK_FD=""
 TASK_DIR=""
 TASK_KIND=""
-TASK_HEAD=""            # first line of the task pane ("Backing up…")
+TASK_TITLE=""           # the flow's name, for the title row of its result box
+TASK_HEAD=""            # first line of the task pane ("Backing up")
 TASK_T0=0
 TASK_RC=0
 TASK_INT=0
@@ -6444,7 +6663,58 @@ TASK_STEP_TOTAL=0
 TASK_STEPS=()           # step names as the verb printed them, by number
 TASK_LINES=()           # the verb's output, protocol lines included
 TASK_CARRY=""           # a line the verb has not finished yet
+TASK_RELAY_TEXT=""      # running state: what happens to the relay
+TASK_KEYS_TEXT=""       # running state: what the keys do
+TASK_CTRLC_HINT=""      # the bottom row's word for Ctrl-C
 TUI_TASK_ACTIVE=0
+FLOW_RELAY="unknown"    # running | stopped | unknown: the relay when the flow began
+
+# tui_flow_relay_now — FLOW_RELAY from the state the main view last showed
+# (MENU_STATE, read from Docker by tui_state_line): the flows ask nothing of
+# their own, and the verb's output stays the last word on the relay.
+tui_flow_relay_now() {
+  case "$MENU_STATE" in
+    "● Running"*) FLOW_RELAY="running" ;;
+    "○ Stopped"*) FLOW_RELAY="stopped" ;;
+    *) FLOW_RELAY="unknown" ;;
+  esac
+}
+
+# tui_flow_relay_sentence — _SENTENCE: what a backup, restore or undo does to
+# the relay, for its confirmation (the verbs stop a running relay and start
+# it again; a stopped one stays stopped).
+tui_flow_relay_sentence() {
+  case "$FLOW_RELAY" in
+    running) _SENTENCE="The relay stops while it runs and starts again afterwards." ;;
+    stopped) _SENTENCE="The relay is not running and stays stopped." ;;
+    *) _SENTENCE="A running relay stops while it runs and starts again afterwards." ;;
+  esac
+}
+
+# tui_flow_task_texts <kind> — the running state's words: TASK_RELAY_TEXT,
+# TASK_KEYS_TEXT, TASK_CTRLC_HINT, true to what the verb does on Ctrl-C (its
+# signal guard stops the one-shot, a switch puts the old layout back, a relay
+# that ran is started again).
+tui_flow_task_texts() {
+  local what="$1" back=""
+  case "$1" in
+    switch) what="switch"; back=" and puts everything back as it was" ;;
+    rollback) what="undo" ;;
+  esac
+  case "$FLOW_RELAY" in
+    running) TASK_RELAY_TEXT="The relay is offline until the $what ends; then it starts again." ;;
+    stopped) TASK_RELAY_TEXT="The relay is not running and stays stopped." ;;
+    *) TASK_RELAY_TEXT="A running relay is offline until the $what ends; then it starts again." ;;
+  esac
+  TASK_CTRLC_HINT="Stop the $what"
+  TASK_KEYS_TEXT="Other keys wait. Ctrl-C stops the $what$back."
+  [[ "$1" == switch ]] && TASK_CTRLC_HINT="Stop and put back"
+  if [[ "$1" == rollback ]]; then
+    TASK_CTRLC_HINT="Stop"
+    TASK_KEYS_TEXT="Other keys wait until it ends."
+  fi
+  return 0
+}
 
 # tui_flow_elapsed — _ELAPSED: "<m>m <ss>s" since the task started
 tui_flow_elapsed() {
@@ -6499,7 +6769,7 @@ tui_render_left_task() {
   lines+=("$TASK_HEAD") styles+=("${TUI_BOLD}${TUI_FG_ACCENT}")
   if [[ "$TASK_KIND" == switch || "$TASK_KIND" == rollback ]]; then
     if (( TASK_STEP_TOTAL > 0 )); then
-      lines+=("Step $TASK_STEP of $TASK_STEP_TOTAL · $_ELAPSED") styles+=("$TUI_FG_SUBTITLE")
+      lines+=("Step $TASK_STEP of $TASK_STEP_TOTAL, $_ELAPSED") styles+=("$TUI_FG_SUBTITLE")
     else
       lines+=("$_ELAPSED") styles+=("$TUI_FG_SUBTITLE")
     fi
@@ -6523,9 +6793,14 @@ tui_render_left_task() {
     lines+=("$_HLINE_SEP") styles+=("$TUI_FG_SEPARATOR")
   fi
   lines+=("") styles+=("")
+  # what is happening to the relay, then what the keys do: bold, then dim
+  while IFS= read -r line; do
+    lines+=("$line") styles+=("$TUI_BOLD")
+  done < <(printf '%s\n' "$TASK_RELAY_TEXT" | tui_wrap "$LEFT_CONTENT_W")
+  lines+=("") styles+=("")
   while IFS= read -r line; do
     lines+=("$line") styles+=("${TUI_DIM}${TUI_FG_MENU_DIM}")
-  done < <(printf '%s\n' "The relay is offline while this runs. Esc and q wait; Ctrl-C stops it, and the relay is started again." | fold -s -w "$LEFT_CONTENT_W")
+  done < <(printf '%s\n' "$TASK_KEYS_TEXT" | tui_wrap "$LEFT_CONTENT_W")
   for ((i = 0; i < LEFT_CONTENT_HEIGHT; i++)); do
     line="" ; local st=""
     if (( i < ${#lines[@]} )); then line="${lines[$i]}"; st="${styles[$i]}"; fi
@@ -6546,7 +6821,7 @@ tui_render_right_task() {
   local line row
   for line in "${TASK_LINES[@]+"${TASK_LINES[@]}"}"; do
     [[ "$line" == ::* ]] && continue
-    while IFS= read -r row; do out_rows+=("$row"); done < <(printf '%s\n' "$line" | fold -s -w "$RIGHT_CONTENT_W")
+    while IFS= read -r row; do out_rows+=("$row"); done < <(printf '%s\n' "$line" | tui_wrap "$RIGHT_CONTENT_W")
   done
   local start=$(( ${#out_rows[@]} > RIGHT_CONTENT_HEIGHT ? ${#out_rows[@]} - RIGHT_CONTENT_HEIGHT : 0 ))
   for ((row = 0; row < RIGHT_CONTENT_HEIGHT; row++)); do
@@ -6572,7 +6847,8 @@ tui_flow_run() {
   [[ "$MODE" == tor ]] && cmd+=(--tor)
   [[ "$MODE" == plain ]] && cmd+=(--plain)
   cmd+=("$@")
-  TASK_KIND="$kind" TASK_HEAD="$head"
+  TASK_KIND="$kind" TASK_HEAD="$head" TASK_TITLE="$title"
+  tui_flow_task_texts "$kind"
   TASK_LINES=() TASK_STEPS=() TASK_STEP=0 TASK_STEP_TOTAL=0 TASK_RESULT="" TASK_RC=0 TASK_INT=0 TASK_CARRY=""
   if [[ "$FOLLOW_LOGS" == "1" ]]; then stop_log_stream; fi
   TASK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/haven-task.XXXXXX")"
@@ -6633,13 +6909,17 @@ tui_flow_run() {
   TUI_LEFT_TITLE="$saved_left"
 }
 
-# tui_flow_finish <box title> <first line> — the result box (the verb's own
-# closing lines), then back to the main view with the log stream resumed.
+# tui_flow_finish <box title> <first line> — the result box, then back to the
+# main view with the log stream resumed. The box is written to be read at
+# 80x24 without scrolling: what happened, the relay's state, where the data
+# is, the one next step (tui_flow_box); the verb's whole output stays in the
+# right pane beside it.
 tui_flow_finish() {
   local title="$1" first="$2" text
-  tui_flow_summary
+  tui_flow_box
   text="$_SUMMARY"
   [[ -z "$first" ]] || text="$first"$'\n\n'"$text"
+  TUI_LEFT_TITLE="Haven / ${TASK_TITLE:-$title}"
   tui_message "$title" "$text"
   TUI_RIGHT_MODE="${TUI_RIGHT_PREV_TASK:-logs}"
   [[ "$TUI_RIGHT_MODE" == task || "$TUI_RIGHT_MODE" == details ]] && TUI_RIGHT_MODE="logs"
@@ -6650,7 +6930,8 @@ tui_flow_finish() {
 
 # tui_flow_summary — _SUMMARY: the verb's closing lines: those after its last
 # ::step line and after its last progress line (one that ends in "..."),
-# protocol lines left out, the INFO and OK words dropped.
+# protocol lines left out, the INFO and OK words dropped, paths inside this
+# directory written relative to it (backups/…, db/…).
 tui_flow_summary() {
   local i from=0 line
   _SUMMARY=""
@@ -6663,9 +6944,103 @@ tui_flow_summary() {
     [[ "$line" == ::* || -z "$line" ]] && continue
     line="${line#INFO }"
     line="${line#OK }"
+    line="${line//"$ROOT_DIR/"/}"
     _SUMMARY+="${_SUMMARY:+$'\n'}$line"
   done
   [[ -n "$_SUMMARY" ]] || _SUMMARY="The command printed nothing more (exit status $TASK_RC); its output is on the right."
+}
+
+# tui_flow_find <ERE> — _FOUND: the first output line of the verb that
+# matches (INFO/OK/WARN word dropped, paths relative), BASH_REMATCH set by
+# the match against it; false when there is none.
+tui_flow_find() {
+  local line
+  _FOUND=""
+  for line in "${TASK_LINES[@]+"${TASK_LINES[@]}"}"; do
+    [[ "$line" == ::* ]] && continue
+    line="${line#INFO }"; line="${line#OK }"; line="${line#WARN }"
+    line="${line//"$ROOT_DIR/"/}"
+    if [[ "$line" =~ $1 ]]; then
+      _FOUND="$line"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# tui_flow_relay_note — _RELAY_NOTE: the relay's state after the run, in the
+# verb's own terms (its last word on the relay wins: a relay that did not come
+# back is said first). Empty when the verb said nothing about it.
+tui_flow_relay_note() {
+  _RELAY_NOTE=""
+  if tui_flow_find 'relay is NOT running|relay did not start|relay was not started'; then
+    if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
+      # an unfinished switch blocks every start until it is undone
+      _RELAY_NOTE="The relay is NOT running; it can start once the switch is undone."
+    else
+      _RELAY_NOTE="The relay is NOT running: start it with s in the main view."
+    fi
+  elif tui_flow_find 'The relay is running on ([a-z]+)\.|The relay is running \(([a-z]+)\)'; then
+    _RELAY_NOTE="The relay is running on ${BASH_REMATCH[1]:-${BASH_REMATCH[2]}}."
+  elif tui_flow_find '^The relay is running\.$|^Starting the relay again'; then
+    _RELAY_NOTE="The relay is running again."
+  elif tui_flow_find 'relay was not running'; then
+    _RELAY_NOTE="The relay was not running and stays stopped."
+  elif ! tui_flow_find '^Stopping the relay'; then
+    _RELAY_NOTE="The relay was not touched."
+  fi
+}
+
+# tui_flow_box — _SUMMARY: the body of the result box. For the outcomes whose
+# lines are known (backup and restore finished, switch done, switch rolled
+# back or stopped half-way) a short text built from the verb's own lines;
+# for any other outcome, or when a line is not where it is expected, the
+# verb's closing lines (tui_flow_summary). The relay's state is always said.
+tui_flow_box() {
+  local nl=$'\n' box="" path size
+  tui_flow_relay_note
+  case "$TASK_KIND:$TASK_RC:$TASK_RESULT" in
+    backup:0:*)
+      if tui_flow_find '^Backup written: ([^ ]+) \(([^,]+),'; then
+        path="${BASH_REMATCH[1]}" size="${BASH_REMATCH[2]}"
+        box="Written and verified:${nl}$path ($size).${nl}${nl}$_RELAY_NOTE${nl}${nl}Not in the backup: the media in blossom/, .env and the JSON lists. Copy those separately."
+      fi
+      ;;
+    restore:0:*)
+      if tui_flow_find '^Restore finished: the events from ([^ ]+) that were missing'; then
+        box="Added the events of ${BASH_REMATCH[1]} that were missing; nothing was deleted or duplicated.${nl}${nl}$_RELAY_NOTE${nl}${nl}Media files are not in a backup: copy blossom/ back if some are missing."
+      fi
+      ;;
+    switch:*:ok)
+      if tui_flow_find '^Switched the relay database from ([a-z]+) to ([a-z]+)\.'; then
+        local from="${BASH_REMATCH[1]}" to="${BASH_REMATCH[2]}"
+        box="The relay database moved from $from to $to.${nl}$_RELAY_NOTE"
+        if tui_flow_find 'directories are kept in (db/[^ ]+)'; then
+          box+="${nl}${nl}The old $from data is kept in ${BASH_REMATCH[1]%.}"
+        fi
+        if tui_flow_find '^Backup of the old [a-z]+ database: ([^ ]+)'; then
+          box+="${nl}Backup from before: ${BASH_REMATCH[1]}"
+        fi
+        box+="${nl}${nl}Next: check that the relay serves your notes. To go back: ./$SCRIPT_NAME db-switch --rollback"
+      fi
+      ;;
+    switch:*:rolled-back|switch:*:failed)
+      if (( TASK_STEP > 1 )); then
+        tui_flow_find 'The engine switch failed: (.+)$' && box="Cause: ${BASH_REMATCH[1]}${nl}"
+        box+="$_RELAY_NOTE"
+        if tui_flow_find 'failed run produced is kept in (db/[^ ]+)'; then
+          box+="${nl}${nl}What the failed run made is kept in ${BASH_REMATCH[1]%.}"
+        fi
+        [[ "$TASK_RESULT" == rolled-back ]] && box+="${nl}${nl}Next: fix the cause, then switch again."
+      fi
+      ;;
+  esac
+  if [[ -z "$box" ]]; then
+    tui_flow_summary
+    box="$_SUMMARY"
+    [[ -z "$_RELAY_NOTE" || "$box" == *"relay is"* || "$box" == *"relay was"* ]] || box+="${nl}${nl}$_RELAY_NOTE"
+  fi
+  _SUMMARY="$box"
 }
 
 # tui_flow_outcome <noun> — _TITLE for a backup or restore box from the exit status
@@ -6680,8 +7055,10 @@ tui_flow_outcome() {
 }
 
 tui_flow_backup() {
-  tui_confirm "Back up now? The relay is offline while the backup runs; the file goes to backups/ in this directory." "y" || return 0
-  tui_flow_run backup "Back up now" "Backing up…" backup
+  tui_flow_relay_now
+  tui_flow_relay_sentence
+  tui_confirm "Back up now? A verified copy of the relay database goes to backups/ in this directory. $_SENTENCE" "y" || return 0
+  tui_flow_run backup "Back up now" "Backing up" backup
   tui_flow_outcome "Backup"
   tui_flow_finish "$_TITLE" ""
 }
@@ -6746,6 +7123,7 @@ tui_flow_short_size() {
 }
 
 tui_flow_restore() {
+  tui_flow_relay_now
   tui_flow_backups_list
   if [[ -n "$FLOW_LIST_ERR" ]]; then
     tui_message "Restore a backup" "$FLOW_LIST_ERR"
@@ -6760,8 +7138,9 @@ tui_flow_restore() {
 
 tui_flow_restore_pick() {
   local name="$1"
-  tui_confirm "Restore $name? It adds the events of this backup that are missing; it never deletes or duplicates anything, and events that exist only in the database stay. The relay is offline while it runs." "n" || return 0
-  tui_flow_run restore "Restore a backup" "Restoring…" restore "$name" --yes
+  tui_flow_relay_sentence
+  tui_confirm "Restore $name? It adds the events of this backup that are missing; it never deletes or duplicates anything, and events that exist only in the database stay. $_SENTENCE" "n" || return 0
+  tui_flow_run restore "Restore a backup" "Restoring" restore "$name" --yes
   tui_flow_outcome "Restore"
   tui_flow_finish "$_TITLE" ""
 }
@@ -6802,6 +7181,7 @@ tui_flow_switch_facts() {
 }
 
 tui_flow_switch() {
+  tui_flow_relay_now
   tui_flow_switch_facts
   tui_set_view switch
 }
@@ -6842,7 +7222,9 @@ tui_flow_switch_go() {
 }
 
 tui_flow_rollback() {
-  tui_confirm "Undo the interrupted switch? It puts the previous engine and its data back as the switch recorded them; nothing in db/ is deleted. The relay is offline while it runs." "n" || return 0
+  tui_flow_relay_now
+  tui_flow_relay_sentence
+  tui_confirm "Undo the interrupted switch? It puts the previous engine and its data back as the switch recorded them; nothing in db/ is deleted. $_SENTENCE" "n" || return 0
   tui_flow_run rollback "Undo interrupted switch" "Undoing the switch" db-switch --rollback
   case "$TASK_RESULT" in
     rolled-back) tui_flow_finish "Switch undone" "" ;;
@@ -6853,27 +7235,44 @@ tui_flow_rollback() {
 # tui_flow_details — DETAIL_LINES for the restore list and the switch overview
 tui_flow_details() {
   local id="" v="" t
-  DETAIL_LINES=() DETAIL_BOLD=0
+  DETAIL_LINES=() DETAIL_BOLD=0 DETAIL_STYLE=()
   (( ${#MENU_IDS[@]} > 0 && TUI_SEL < ${#MENU_IDS[@]} )) && id="${MENU_IDS[$TUI_SEL]}"
   case "$id" in
     file:*)
       t="${id#file:}"
-      while IFS= read -r v; do DETAIL_LINES+=("$v"); done < <(printf '%s\n' "$t" | fold -w "$RIGHT_CONTENT_W")
+      while IFS= read -r v; do DETAIL_LINES+=("$v"); done < <(printf '%s\n' "$t" | tui_wrap "$RIGHT_CONTENT_W")
       DETAIL_BOLD=${#DETAIL_LINES[@]}
       tui_flow_age "${FLOW_FILE_TIME[$t]:-0}"
-      v="$(human_size "${FLOW_FILE_SIZE[$t]:-0}")"
-      DETAIL_LINES+=("" "Size: $v" "Written: $(date -d "@${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null) ($_AGE)" "")
+      DETAIL_LINES+=("")
+      detail_field "Written" "$(date -d "@${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null) ($_AGE)"
+      detail_field "Size" "$(human_size "${FLOW_FILE_SIZE[$t]:-0}")"
+      DETAIL_LINES+=("")
       v="A restore adds the events of this backup that are missing; it never deletes or duplicates anything. Enter asks before anything runs."
       ;;
-    switch) v="Moves the $FLOW_FOUND data into a new $FLOW_TARGET database: a verified backup first, then the old directories are set aside in db/.pre-switch-$FLOW_FOUND-<time>/ and kept; ./$SCRIPT_NAME db-switch --rollback goes back. You confirm by typing $FLOW_TARGET." ;;
-    from:*)
-      t="${id#from:}"
-      local o=badger
-      [[ "$t" == badger ]] && o=lmdb
-      v="Carries the notes of the $t side over into a clean $FLOW_TARGET database; the notes of the $o side stay in the set-aside directory db/.pre-switch-mixed-<time>/ and are not merged. You confirm by typing $FLOW_TARGET." ;;
+    switch|from:*)
+      # the verb's steps in order (stop, backup, move, restore, start), in
+      # words, with what happens to the relay: said before the typed name
+      local src="$FLOW_FOUND" aside="db/.pre-switch-$FLOW_FOUND-<time>/" o="" r1 r2
+      if [[ "$id" == from:* ]]; then
+        src="${id#from:}" aside="db/.pre-switch-mixed-<time>/" o=badger
+        [[ "$src" == badger ]] && o=lmdb
+      fi
+      case "$FLOW_RELAY" in
+        running) r1="The relay stops (it is running now)."; r2="The relay starts again on $FLOW_TARGET." ;;
+        stopped) r1="The relay is not running and stays stopped."; r2="" ;;
+        *) r1="A running relay stops."; r2="A relay that ran starts again on $FLOW_TARGET." ;;
+      esac
+      v="What happens:"$'\n'"1. $r1"$'\n'"2. A verified backup of the $src data goes to backups/."$'\n'
+      if [[ -n "$o" ]]; then
+        v+="3. All database directories move to $aside and are kept."$'\n'"4. DB_ENGINE becomes $FLOW_TARGET and the $src side is restored into a clean $FLOW_TARGET database; the $o side stays set aside, not merged."$'\n'
+      else
+        v+="3. The $src directories move to $aside and are kept."$'\n'"4. DB_ENGINE becomes $FLOW_TARGET and the data is restored into a new $FLOW_TARGET database."$'\n'
+      fi
+      [[ -z "$r2" ]] || v+="5. $r2"$'\n'
+      v+=$'\n'"If a step fails, the switch rolls back to the old data (where it cannot finish, Undo interrupted switch appears in the Data group). To go back later: ./$SCRIPT_NAME db-switch --rollback."$'\n\n'"Enter asks you to type $FLOW_TARGET." ;;
     back) v="Back to the main menu." ;;
   esac
-  while IFS= read -r t; do DETAIL_LINES+=("$t"); done < <(printf '%s\n' "$v" | fold -s -w "$RIGHT_CONTENT_W")
+  while IFS= read -r t; do DETAIL_LINES+=("$t"); done < <(printf '%s\n' "$v" | tui_wrap "$RIGHT_CONTENT_W")
 }
 # tui_flow_end — end of the flow code (see the comment at its start)
 

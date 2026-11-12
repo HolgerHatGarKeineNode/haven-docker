@@ -51,7 +51,53 @@ teardown() {
   run bash -c 'source haven; set +e; validate_env_value WOT_REFRESH_INTERVAL banana; echo "rc=$? err=$VALIDATION_ERROR"'
   [ "$status" -eq 0 ]
   [[ "$output" == *"rc=1"* ]]
-  [[ "$output" == *"must look like 24h, 30m, or 10s"* ]]
+  [[ "$output" == *"A duration above zero in h, m and s, e.g. 24h, 90m or 1h30m."* ]]
+}
+
+# Upstream v1.2.2, main.go getLogLevelFromConfig: case "DEBUG", "INFO", "WARN",
+# "ERROR", default slog.LevelInfo — WARN is a level, WARNING is not.
+@test "validate_env_value: HAVEN_LOG_LEVEL accepts WARN (upstream's level) and refuses WARNING with a message naming WARN" {
+  run bash -c 'source haven; set +e
+    for v in WARN warn DEBUG INFO ERROR; do validate_env_value HAVEN_LOG_LEVEL "$v"; echo "$v rc=$? val=$VALIDATION_VALUE"; done
+    validate_env_value HAVEN_LOG_LEVEL WARNING; echo "WARNING rc=$? err=$VALIDATION_ERROR"
+    validate_env_value HAVEN_LOG_LEVEL TRACE; echo "TRACE rc=$? err=$VALIDATION_ERROR"
+    env_rule_text HAVEN_LOG_LEVEL; echo "rule=$_RULE"'
+  echo "$output"
+  [[ "$output" == *"WARN rc=0 val=WARN"* ]]
+  [[ "$output" == *"warn rc=0 val=WARN"* ]]
+  [[ "$output" == *"ERROR rc=0 val=ERROR"* ]]
+  [[ "$output" == *"WARNING rc=1 err=Haven reads WARN, not WARNING (WARNING logs at INFO). Type WARN."* ]]
+  [[ "$output" == *"TRACE rc=1 err=HAVEN_LOG_LEVEL must be DEBUG, INFO, WARN or ERROR."* ]]
+  [[ "$output" == *"rule=DEBUG, INFO, WARN or ERROR."* ]]
+}
+
+@test "settings details: a stored WARNING (or lower-case level) is said to log at INFO; WARN is not flagged" {
+  run bash -c 'source haven; set +e
+    for v in "\"WARNING\"" warn WARN "\"INFO\""; do env_stored_value_note HAVEN_LOG_LEVEL "$v"; echo "$v: [$_STORED_NOTE]"; done'
+  echo "$output"
+  [[ "$output" == *'"WARNING": [Haven does not know WARNING and logs at INFO; WARN is its warnings level.]'* ]]
+  [[ "$output" == *'warn: [Haven does not know warn and logs at INFO'* ]]
+  [[ "$output" == *'WARN: []'* ]]
+  [[ "$output" == *'"INFO": []'* ]]
+}
+
+# Upstream v1.2.2, config.go getEnvDuration: time.ParseDuration(value), panic
+# on error — Go has no day unit; pkg/wot PeriodicRefresh: time.NewTicker(interval),
+# which panics on a duration of zero.
+@test "validate_env_value: WOT_REFRESH_INTERVAL refuses days with a message naming h, m, s; refuses zero; takes Go durations" {
+  run bash -c 'source haven; set +e
+    for v in 24h 90m 10s 1h30m; do validate_env_value WOT_REFRESH_INTERVAL "$v"; echo "$v rc=$?"; done
+    for v in 1d 7d 0h 0m0s; do validate_env_value WOT_REFRESH_INTERVAL "$v"; echo "$v rc=$? err=$VALIDATION_ERROR"; done
+    env_rule_text WOT_REFRESH_INTERVAL; echo "rule=$_RULE"
+    env_stored_value_note WOT_REFRESH_INTERVAL "\"1d\""; echo "note=$_STORED_NOTE"'
+  echo "$output"
+  [[ "$output" == *"24h rc=0"* && "$output" == *"90m rc=0"* && "$output" == *"10s rc=0"* && "$output" == *"1h30m rc=0"* ]]
+  [[ "$output" == *"1d rc=1 err=Haven has no day unit: use hours (1d = 24h). Units: h, m, s."* ]]
+  [[ "$output" == *"7d rc=1 err=Haven has no day unit: use hours (7d = 168h). Units: h, m, s."* ]]
+  [[ "$output" == *"0h rc=1 err=A duration above zero"* ]]
+  [[ "$output" == *"0m0s rc=1 err=A duration above zero"* ]]
+  [[ "$output" == *"rule=A duration above zero in hours, minutes and seconds (h, m, s), e.g. 24h, 90m or 1h30m. No days: 1d is 24h."* ]]
+  [[ "$output" == *"note=Haven cannot read 1d as a duration and stops at start"* ]]
 }
 
 @test "validate_env_value: BACKUP_INTERVAL_HOURS gets its own error message" {

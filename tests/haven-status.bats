@@ -63,7 +63,7 @@ badger() { local n; for n in private chat outbox inbox blossom; do mkdir -p "$SB
   touch -d '3 days ago' "$SB/backups/haven-backup-old.zip"
   touch -d '2 hours ago' "$SB/backups/haven-backup-new.zip"
   run fields
-  [[ "$output" == *$'\nLast backup|haven-backup-new.zip, 2 h ago\n'* ]]
+  [[ "$output" == *$'\nLast backup|2 h ago, haven-backup-new.zip\n'* ]]
   [ "$(id -u)" -ne 0 ] || skip "root reads any directory"
   chmod 000 "$SB/backups"
   run fields

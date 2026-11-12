@@ -68,7 +68,7 @@ readme_shows() { grep -qE "\./haven $1( |\`|\$)" "$README"; }
 
 @test "docs: the README describes the TUI's settings editor, flows, status view and keys" {
   grep -q '^## The TUI$' "$README"
-  grep -qF '`/` finds settings by name or description' "$README"
+  grep -qF '`/` finds settings by name, short name' "$README"
   grep -qF 'Undo interrupted switch' "$README"
   grep -qF 'group and section rows do not count' "$README"
   grep -qF '| `q` / `Q` | Back one view; from the main view, quit |' "$README"
