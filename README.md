@@ -124,14 +124,21 @@ A host bind-mount **replaces** the image copy entirely — an empty `./templates
 ## CLI
 
 ```bash
+./haven tui               # Interactive TUI (same as ./haven alone)
 ./haven start             # Start (Docker Compose)
 ./haven start --tor       # Start with Tor hidden service
 ./haven stop              # Stop services
 ./haven restart           # Restart services
 ./haven logs              # Stream logs
+./haven status            # Show container status
 ./haven onion             # Show Tor .onion address
+./haven env               # Edit .env in TUI
 ./haven json              # Edit JSON lists in TUI
 ./haven env-upgrade       # Add missing vars from .env.example
+./haven import            # Import old notes once
+./haven backup [file]     # Back up the relay data to backups/
+./haven restore <file>    # Restore a backup from backups/
+./haven db-switch <badger|lmdb>  # Move the data to the other engine
 ./haven help              # Full usage info
 ```
 
@@ -150,6 +157,9 @@ and `docker compose up -d` is a supported way to run it.
 | `./haven logs` | `docker compose logs -f` |
 | `./haven start --tor` | `docker compose -f docker-compose.tor.yml up -d` |
 | `./haven import` | the three commands below |
+| `./haven backup [file]` | [backup with plain Compose](#without-the-cli-backup-and-restore-with-plain-docker-compose) |
+| `./haven restore <file>` | [restore with plain Compose](#without-the-cli-backup-and-restore-with-plain-docker-compose) |
+| `./haven db-switch <badger\|lmdb>` | [the same steps by hand](#without-the-cli-backup-and-restore-with-plain-docker-compose) |
 
 ```bash
 docker compose stop relay
@@ -280,6 +290,114 @@ Inside an input prompt:
 
 ## Backups and restore
 
+### Relay data: `./haven backup` and `./haven restore`
+
+```bash
+./haven backup                 # writes backups/haven-backup-<date>-<time>.zip
+./haven backup my-relay.zip    # same, with a name you choose
+./haven restore my-relay.zip   # reads backups/my-relay.zip
+```
+
+Both stop the relay while they run and start it again afterwards. The database
+allows only one writer, so this is not optional.
+
+Where the file lands: always in `backups/` inside this checkout. The directory
+is created with mode `700`, the zip with mode `600`. You give a file name, not a
+path. A backup never overwrites an existing file. Every zip is checked with
+`unzip -t` before it is called a backup.
+
+What a backup contains: the events of all five relay databases (private, chat,
+inbox, outbox, and the Blossom index), as five `.jsonl` files in one zip.
+
+What a backup does **not** contain:
+
+- the media files in `blossom/`
+- your `.env`
+- the JSON lists (`relays_import.json`, `relays_blastr.json`,
+  `blacklisted_npubs.json`, `whitelisted_npubs.json`)
+
+Copy those yourself. If you restore the Blossom index without the files in
+`blossom/`, the list entries are there, but downloading them returns 404 until
+the files are back.
+
+A restore adds the events that are missing from the database. It never
+deletes anything and never creates duplicates; events that exist only in the
+database stay. If the database already holds data, `./haven restore` asks
+first. In a script without a terminal, add `--yes`.
+
+### Switching the database engine
+
+Haven stores its data with one of two engines, `badger` or `lmdb`, set by
+`DB_ENGINE` in `.env`. Changing that line alone does not move your data. To
+switch, run one command:
+
+```bash
+./haven db-switch lmdb      # or: ./haven db-switch badger
+```
+
+It asks once, then:
+
+1. stops the relay and writes a verified backup to `backups/haven-pre-switch-<engine>-<time>.zip`
+2. moves the old database directories to `db/.pre-switch-<old engine>-<time>/`
+3. sets `DB_ENGINE` in `.env`
+4. restores the backup into a new database and checks it against the first backup
+5. starts the relay again, if it was running
+
+If a step fails, it puts the old directories back and sets `DB_ENGINE` to
+match them; if it cannot, it tells you what to do. Your old data stays in `db/.pre-switch-<old engine>-<time>/`. `./haven` never
+deletes it. Once you are sure the relay serves everything, deleting that
+directory is your own step.
+
+To go back after a switch:
+
+```bash
+./haven db-switch --rollback
+```
+
+This brings the old directories back and sets `DB_ENGINE` to match them. The
+current directories are kept in `db/.post-switch-<engine>-<time>/`. Notes the
+relay received after the switch are in there and are not carried back. If a
+switch was interrupted (power loss, a killed terminal), the same command
+finishes putting the old state back; until then `./haven start` refuses to
+start the relay.
+
+`db-switch` asks for confirmation. Without a terminal (in a script), add
+`--yes`.
+
+About lmdb's files: each of the five lmdb directories holds a `data.mdb` that
+shows up as 256 GiB in `ls -l`. The file is sparse; only the space your data
+needs is used on disk (`du -sh db` shows the real size). If you copy `db/`
+yourself, use a tool that keeps sparse files sparse, such as
+`cp --sparse=always`, `rsync --sparse` or `tar --sparse`. A plain copy can
+try to write the full 256 GiB per directory.
+
+#### If you already changed DB_ENGINE by hand
+
+If you changed `DB_ENGINE` in `.env` and started the relay, the relay shows
+none of your old notes. Nothing is lost. The relay did not move your data: it
+started a new, empty database next to it. Both engines now have files side by
+side in the same directories, and the relay reads only the files of the engine
+in `.env`.
+
+`./haven start` still starts the relay in this state, with a warning.
+`./haven db-switch` without more options refuses and explains the choice. Pick
+the side whose notes you want to keep with `--from`:
+
+```bash
+./haven db-switch lmdb --from badger
+```
+
+This makes a clean `lmdb` database from the `badger` side, which holds the
+notes from before your change. Notes the relay received after your change are
+on the other side. They are not copied over. All files of both engines are
+kept in `db/.pre-switch-mixed-<time>/`, and `./haven db-switch --rollback`
+puts that state back if you change your mind.
+
+To keep the notes received since the change instead, take that side:
+`./haven db-switch lmdb --from lmdb` when `.env` now says `lmdb`.
+
+### Config backups (`.env.bak.<time>`)
+
 Every write to `.env` or the JSON lists (add, edit, remove, clear,
 `env-upgrade`) first copies the file to a timestamped backup next to it —
 `.env.bak.20260920153000` — and keeps the 10 most recent backups. To undo
@@ -292,6 +410,57 @@ cp .env.bak.20260920153000 .env # restore it
 
 The relay picks the restored values up on the next restart
 (`./haven restart`).
+
+### Without the CLI: backup and restore with plain `docker compose`
+
+The same backup without `./haven`. Run it in the directory that holds your
+`docker-compose.yml`. `backups/` must exist and belong to the user the
+container runs as (`DOCKER_UID`, normally you), or the backup cannot be
+written:
+
+<!-- recipe:backup — run verbatim by tests/real-docker/p4-readme-recipe.sh -->
+```bash
+mkdir -p -m 700 backups
+docker compose stop relay
+docker compose run --rm --no-deps -v ./backups:/app/backups --entrypoint /app/haven relay backup /app/backups/haven-backup.zip
+docker compose start relay
+unzip -t backups/haven-backup.zip
+```
+
+`unzip -t` must end with `No errors detected`. Do not rely on the exit code of
+the backup alone: on a full disk it can report success and leave a broken zip.
+The zip itself is written with mode `644`; the `700` on `backups/` is what
+keeps it private.
+
+Restore:
+
+<!-- recipe:restore — run verbatim by tests/real-docker/p4-readme-recipe.sh -->
+```bash
+docker compose stop relay
+docker compose run --rm --no-deps -v ./backups:/app/backups --entrypoint /app/haven relay restore /app/backups/haven-backup.zip
+docker compose start relay
+```
+
+Switching the engine by hand is the same steps in this order: stop the relay,
+make a backup and check it, move the old directories aside, change
+`DB_ENGINE`, restore, start. For a switch to `lmdb`:
+
+<!-- recipe:switch — run verbatim by tests/real-docker/p4-readme-recipe.sh -->
+```bash
+docker compose stop relay
+docker compose run --rm --no-deps -v ./backups:/app/backups --entrypoint /app/haven relay backup /app/backups/before-switch.zip
+unzip -t backups/before-switch.zip
+mkdir db/old-engine
+mv db/private db/chat db/outbox db/inbox db/blossom db/old-engine/
+# now edit .env and set DB_ENGINE="lmdb"
+docker compose run --rm --no-deps -v ./backups:/app/backups --entrypoint /app/haven relay restore /app/backups/before-switch.zip
+docker compose up -d
+```
+
+The last step is `up -d`, not `start`: `start` restarts the existing container
+with the settings it was created with, so it would still run the old engine on
+the new directories and serve nothing. `up -d` recreates the container with
+the new `DB_ENGINE`.
 
 ## Acknowledgements
 

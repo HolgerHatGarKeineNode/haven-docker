@@ -1,5 +1,89 @@
 # Changelog
 
+## CLI — unreleased (backup, restore and database engine switch)
+
+Changes to the `./haven` CLI on the host only. No new image is needed: the new
+verbs run the relay binary of the image you already have (tested with
+`v1.2.2-6`) through `docker compose run`, with no change to `entrypoint.sh` or
+the compose files. Moving from badger to lmdb, or back, is what
+[#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15) asked
+for.
+
+### Added
+
+- `./haven backup [file]` writes the relay data to a zip in `backups/` (default
+  name `haven-backup-<date>-<time>.zip`). The zip is only called a backup after
+  it was checked: complete, `unzip -t` clean, exactly five `.jsonl` entries.
+  The exit code of the backup alone is not trusted, because on a full disk it
+  reports success with a truncated zip. The output says what a backup does not
+  contain: the media files in `blossom/`, `.env` and the JSON lists
+- `./haven restore <file>` restores a zip from `backups/` after checking it
+  first. It adds the events that are missing and never deletes anything; when
+  the database already holds data it asks first (`--yes` without a terminal)
+- `./haven db-switch <badger|lmdb>` moves the data to the other engine: stop,
+  verified backup, old directories renamed to `db/.pre-switch-<engine>-<time>/`,
+  `DB_ENGINE` set, restore, a second backup compared entry by entry with the
+  first, relay started again. A failure or a signal after the move puts the old
+  directories and a matching `DB_ENGINE` back. The old directories are never
+  deleted; removing them is left to you
+- `./haven db-switch <target> --from <badger|lmdb>` for a `db/` whose
+  directories hold files of both engines, the state a hand-edited `DB_ENGINE`
+  leaves behind: it makes a clean database from the chosen side and keeps all
+  files of both engines in `db/.pre-switch-mixed-<time>/`
+- `./haven db-switch --rollback` finishes an interrupted switch, or undoes the
+  last completed one; the directories it replaces are kept in
+  `db/.post-switch-<engine>-<time>/`
+- Machine-readable progress lines from `db-switch` (`::step <n>/<total>
+  <name>`, `::result ok|rolled-back|failed`)
+- README: backup and restore, what a backup does not contain, switching the
+  engine, what to do after changing `DB_ENGINE` by hand, and the same backup,
+  restore and switch with plain `docker compose`
+
+### Changed
+
+- Every start path (`start`, `restart`, the TUI menu, the restart after an
+  `.env` edit) refuses to start the relay while an engine switch is unfinished,
+  while a one-shot container (backup, restore, import) exists, and when
+  `DB_ENGINE` names the other engine than the data in `db/` — started like
+  that, the relay serves an empty database. Directories that hold both engines
+  or disagree start with one warning line; when nothing in `db/` can be read,
+  start says so in one line
+- The `.env` editor in the TUI refuses to change or remove `DB_ENGINE` away
+  from the data in `db/` and names the `db-switch` command instead
+- Every write to `.env` keeps the file's mode and owner; a `0600` `.env` no
+  longer becomes `0644`
+- `./haven import`, `backup` and `restore` handle Ctrl-C, `kill` and a closed
+  terminal while the relay is stopped: the one-shot container is stopped and
+  the relay is started again before the script exits
+- `./haven env-upgrade` adds a missing `DB_ENGINE` line with the engine found
+  in `db/` when the data there is of one engine, and says so; the relay treats
+  a missing line as lmdb, so the example's `badger` would have hidden lmdb data
+- `.env.example`: the lmdb default map size is 256 GiB per database file (the
+  comment said ~273GB); the file is sparse
+
+### Fixed
+
+- With a filter set in the TUI log panel, the first line of the filtered
+  window was never drawn (a single match showed the count and no line)
+- `.gitignore` covers the timestamped config backups (`.env.bak.<time>`,
+  `<list>.json.bak.<time>`) and `backups/`
+
+### Security
+
+- `backups/` is created with mode `700` and the zip is written with mode
+  `600`; backup and restore refuse a `backups/` that other users can write to
+  or that is not owned by the container user
+- Backup file names stay inside `backups/` (no `/`, no `..`, `.zip` only) and
+  never overwrite a file; a restore reads only a regular file owned by the
+  container user, never a symlink
+- File names and arguments are printed with non-printable bytes replaced
+- `db-switch` moves directories only through real directories it made itself:
+  a symlinked stash or set-aside directory is refused, and (with GNU `mv`) a
+  move never lands inside a directory that appeared at the target name
+- `db-switch --rollback` refuses to undo from a stash that is missing some of
+  the directories the switch put there, instead of reporting success on less
+  data than before
+
 ## Image v1.2.2-6 — 2026-11-10 (Blossom BUD-11 fix)
 
 ### Fixed
