@@ -222,8 +222,8 @@ COMPOSE_FILE_TOR="$ROOT_DIR/docker-compose.tor.yml"
 # can run against a differently named (or mocked) container.
 RELAY_CONTAINER="${HAVEN_CONTAINER_NAME:-haven-relay}"
 
-# backup/restore run the upstream binary in a one-shot container with this
-# fixed name, so a leftover from an aborted run is found instead of running as
+# backup, restore and import run the upstream binary in a one-shot container
+# with this fixed name, so a leftover from an aborted run is found instead of running as
 # a second writer next to the next one.
 ONESHOT_CONTAINER="${RELAY_CONTAINER}-oneshot"
 BACKUP_DIR="$ROOT_DIR/backups"
@@ -1011,6 +1011,27 @@ success() {
 
 warn() {
   printf "%b\n" "${CLR_YELLOW}WARN${CLR_RESET} $*"
+}
+
+# The *_plain variants print the message with %s: for text that carries file
+# names, paths or tool output, where %b would turn a literal "\033" into an
+# escape sequence. Pass foreign strings through printable_text first.
+info_plain() {
+  printf "%b%s\n" "${CLR_BLUE}INFO${CLR_RESET} " "$*"
+}
+
+success_plain() {
+  printf "%b%s\n" "${CLR_GREEN}OK${CLR_RESET} " "$*"
+}
+
+warn_plain() {
+  printf "%b%s\n" "${CLR_YELLOW}WARN${CLR_RESET} " "$*"
+}
+
+# printable_text <string> — every byte outside printable ASCII becomes '?', so
+# a crafted name cannot carry a raw escape sequence to the terminal.
+printable_text() {
+  printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'
 }
 
 die() {
@@ -2036,11 +2057,13 @@ ensure_data_dirs() {
   # Compose also accepts a user *name*; we cannot resolve that to a host uid, so
   # create the directories but say out loud that the check was skipped.
   if ! is_int "$container_uid" || ! is_int "$container_gid"; then
-    warn "DOCKER_UID/DOCKER_GID are not numeric (${container_uid}:${container_gid}) — skipping the ownership check for db/, blossom/ and backups/."
+    warn "DOCKER_UID/DOCKER_GID are not numeric (${container_uid}:${container_gid}) — skipping the ownership check for db/ and blossom/."
     check_owner=0
   fi
 
-  for dir in db blossom backups; do
+  # backups/ is not part of the start path: only backup and restore need it, and
+  # they check it themselves (backup_dir_check), strictly.
+  for dir in db blossom; do
     path="$ROOT_DIR/$dir"
     if [[ -L "$path" && ! -e "$path" ]]; then
       die "$dir is a broken symlink. Point $path at an existing directory or remove it."
@@ -2139,11 +2162,135 @@ relay_stop_for_oneshot() {
   return 0
 }
 
+# Returns 1 with a warning when the relay does not come back, so a caller never
+# reports success while the relay is down.
 relay_restart_after_oneshot() {
-  local compose_file="$1" was_running="$2"
+  local compose_file="$1" was_running="$2" rc=0
   [[ "$was_running" == "1" ]] || return 0
   info "Starting the relay again..."
-  dc "$compose_file" start relay >/dev/null 2>&1 || dc "$compose_file" up -d
+  dc "$compose_file" start relay >/dev/null 2>&1 || dc "$compose_file" up -d || rc=$?
+  if [[ "$rc" -ne 0 ]] || ! relay_container_running; then
+    warn "The relay did not start again; it is NOT running. Check './$SCRIPT_NAME logs relay', then start it with './$SCRIPT_NAME start'."
+    return 1
+  fi
+  return 0
+}
+
+# Last line of a one-shot verb whose relay did not come back: the warning has
+# to be the final word, after any result line of the one-shot itself.
+relay_down_final_warning() {
+  warn "The relay is NOT running. Start it with './$SCRIPT_NAME start'."
+}
+
+# --- one-shot signal guard ---------------------------------------------------
+# Between relay_stop_for_oneshot and the relay restart, INT/TERM/HUP must not
+# leave the relay stopped. oneshot_run starts compose in the background and
+# waits for it, so a trapped signal is handled at once instead of after the
+# one-shot has finished. The handler stops the one-shot container first (a
+# relay started next to it would hit the database lock), then restarts the
+# relay if it was running, prints the relay state and re-raises the signal.
+ONESHOT_PID=""
+ONESHOT_GUARD_FILE=""
+ONESHOT_GUARD_WHAT=""
+ONESHOT_GUARD_PARTIAL=""
+ONESHOT_SAVED_TRAPS=""
+
+# Armed BEFORE relay_stop_for_oneshot, so the stop window is covered too; the
+# handler reads ONESHOT_RELAY_WAS_RUNNING, which the stop sets first.
+oneshot_guard_on() { # <compose_file> <what>
+  ONESHOT_GUARD_FILE="$1"
+  ONESHOT_GUARD_WHAT="$2"
+  ONESHOT_RELAY_WAS_RUNNING=0
+  ONESHOT_GUARD_PARTIAL=""
+  ONESHOT_PID=""
+  # The TUI's own INT/TERM trap is put back by oneshot_guard_off.
+  ONESHOT_SAVED_TRAPS="$(trap -p INT TERM HUP)"
+  trap 'oneshot_on_signal INT' INT
+  trap 'oneshot_on_signal TERM' TERM
+  trap 'oneshot_on_signal HUP' HUP
+}
+
+oneshot_guard_off() {
+  trap - INT TERM HUP
+  if [[ -n "$ONESHOT_SAVED_TRAPS" ]]; then
+    eval "$ONESHOT_SAVED_TRAPS"
+  fi
+  ONESHOT_PID=""
+}
+
+# oneshot_run <compose args...> — compose in the background, waited for. Returns
+# its exit status. Stdin is passed on explicitly: an asynchronous command would
+# otherwise read /dev/null (the import is interactive output, not input, but
+# compose decides on a TTY from stdin).
+oneshot_run() {
+  local rc=0
+  "${DOCKER_COMPOSE[@]}" "$@" <&0 &
+  ONESHOT_PID=$!
+  while :; do
+    rc=0
+    wait "$ONESHOT_PID" || rc=$?
+    # wait also returns > 128 when a trapped signal interrupts it; the handler
+    # never returns, so a live pid here only means a spurious wakeup.
+    kill -0 "$ONESHOT_PID" 2>/dev/null || break
+  done
+  ONESHOT_PID=""
+  return "$rc"
+}
+
+oneshot_on_signal() {
+  local sig="$1" i
+  trap '' INT TERM HUP
+  printf '\n' >&2
+  warn "Received SIG$sig during the $ONESHOT_GUARD_WHAT — stopping the one-shot container before the relay is started again."
+  if [[ -n "$ONESHOT_PID" ]] && kill -0 "$ONESHOT_PID" 2>/dev/null; then
+    docker stop -t 10 "$ONESHOT_CONTAINER" >/dev/null 2>&1 || true
+    kill -TERM "$ONESHOT_PID" 2>/dev/null || true
+    for ((i = 0; i < 150; i++)); do
+      kill -0 "$ONESHOT_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$ONESHOT_PID" 2>/dev/null; then
+      kill -KILL "$ONESHOT_PID" 2>/dev/null || true
+    fi
+    wait "$ONESHOT_PID" 2>/dev/null || true
+  fi
+  ONESHOT_PID=""
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
+    warn "The one-shot container $ONESHOT_CONTAINER is still running; the relay is NOT started next to it (database lock)."
+    warn "Stop it with 'docker stop $ONESHOT_CONTAINER', then start the relay with './$SCRIPT_NAME start'."
+  elif [[ "$ONESHOT_RELAY_WAS_RUNNING" == "1" ]]; then
+    relay_restart_after_oneshot "$ONESHOT_GUARD_FILE" 1 || true
+  fi
+  # compose run --rm cannot remove the container when compose itself was
+  # killed; a stopped leftover would block the next one-shot and ./haven start.
+  docker rm "$ONESHOT_CONTAINER" >/dev/null 2>&1 || true
+
+  if [[ -n "$ONESHOT_GUARD_PARTIAL" && ( -e "$ONESHOT_GUARD_PARTIAL" || -L "$ONESHOT_GUARD_PARTIAL" ) ]]; then
+    warn_plain "The incomplete file $ONESHOT_GUARD_PARTIAL is not a usable backup; delete it."
+  fi
+  if relay_container_running; then
+    info "The relay is running."
+  else
+    warn "The relay is NOT running. Start it with './$SCRIPT_NAME start'."
+  fi
+
+  # Back to the disposition from before the guard (default, or the TUI's own
+  # trap) and re-raise, so the caller sees the signal.
+  oneshot_guard_off
+  kill -s "$sig" "$$"
+  # Not reached when the signal is fatal; a TUI trap put back above exits.
+  exit $((128 + $(kill -l "$sig")))
+}
+
+# ./haven start/restart: the relay must not run next to a one-shot container.
+oneshot_blocks_start() {
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qxF -- "$ONESHOT_CONTAINER"; then
+    warn "A one-shot container (backup, restore or import) exists: $ONESHOT_CONTAINER — the relay cannot share db/ with it."
+    warn "If it still runs, wait for it ('docker logs -f $ONESHOT_CONTAINER'); if it is stopped, remove it with 'docker rm $ONESHOT_CONTAINER'. Then start again."
+    return 0
+  fi
+  return 1
 }
 
 # The note import is a separate one-shot run of the same binary, not something
@@ -2153,7 +2300,7 @@ relay_restart_after_oneshot() {
 # exclusive lock on db/, so two writers cannot share it.
 run_import_once() {
   local mode="$1"
-  local compose_file status=0 was_running=0
+  local compose_file status=0 was_running=0 relay_rc=0
 
   compose_file="$(compose_file_for "$mode")"
   require_compose_file "$compose_file"
@@ -2162,18 +2309,33 @@ run_import_once() {
   ensure_data_dirs
   ensure_example_jsons
   warn_import_flag
+  # The import runs under the fixed one-shot name, so the signal guard can stop
+  # it and ./haven start can see it.
+  oneshot_leftover_check || return 1
 
-  relay_stop_for_oneshot "$compose_file" "import" || return 1
+  oneshot_guard_on "$compose_file" "import"
+  if ! relay_stop_for_oneshot "$compose_file" "import"; then
+    oneshot_guard_off
+    return 1
+  fi
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
   info "Importing notes ($mode). This runs once and exits; it can take a while."
-  dc "$compose_file" run --rm --no-deps -e HAVEN_IMPORT_FLAG=true relay || status=$?
+  oneshot_run -f "$compose_file" run --rm --no-deps --name "$ONESHOT_CONTAINER" \
+    -e HAVEN_IMPORT_FLAG=true relay || status=$?
 
-  relay_restart_after_oneshot "$compose_file" "$was_running"
+  relay_restart_after_oneshot "$compose_file" "$was_running" || relay_rc=1
+  oneshot_guard_off
 
   if [[ "$status" -ne 0 ]]; then
     warn "Import exited with status $status."
+    [[ "$relay_rc" -eq 0 ]] || relay_down_final_warning
     return "$status"
+  fi
+  if [[ "$relay_rc" -ne 0 ]]; then
+    info "Import finished."
+    relay_down_final_warning
+    return 1
   fi
   success "Import finished."
   return 0
@@ -2206,19 +2368,19 @@ backup_normalize_name() {
     return 1
   fi
   if [[ "$name" == /* ]]; then
-    warn "Absolute paths are not allowed: $1 — backups always live in backups/; give a file name only."
+    warn_plain "Absolute paths are not allowed: $(printable_text "$1") — backups always live in backups/; give a file name only."
     return 1
   fi
   if [[ "$name" == */* || "$name" == *..* ]]; then
-    warn "Not a plain file name: $1 — backups always live in backups/; '/' and '..' are not allowed."
+    warn_plain "Not a plain file name: $(printable_text "$1") — backups always live in backups/; '/' and '..' are not allowed."
     return 1
   fi
   if [[ "$name" != ?*.zip ]]; then
-    warn "Backup file names must end in .zip: $1"
+    warn_plain "Backup file names must end in .zip: $(printable_text "$1")"
     return 1
   fi
   if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
-    warn "Backup file names may contain only letters, digits and . _ + - : $1"
+    warn_plain "Backup file names may contain only letters, digits and . _ + - : $(printable_text "$1")"
     return 1
   fi
   BACKUP_NAME="$name"
@@ -2229,13 +2391,13 @@ list_backups() {
   for f in "$BACKUP_DIR"/*.zip; do
     [[ -f "$f" ]] || continue
     if [[ "$found" == "0" ]]; then
-      info "Backups in $BACKUP_DIR:"
+      info_plain "Backups in $BACKUP_DIR:"
       found=1
     fi
-    printf '  %s\n' "${f##*/}"
+    printf '  %s\n' "$(printable_text "${f##*/}")"
   done
   if [[ "$found" == "0" ]]; then
-    info "No backups found in $BACKUP_DIR (create one with './$SCRIPT_NAME backup')."
+    info_plain "No backups found in $BACKUP_DIR (create one with './$SCRIPT_NAME backup')."
   fi
 }
 
@@ -2250,26 +2412,104 @@ oneshot_leftover_check() {
   return 0
 }
 
-# The container writes the zip, so backups/ must be writable by DOCKER_UID.
-# ensure_data_dirs has already compared the owner; this adds the mode bits.
-backup_dir_writable() {
-  local uid owner
+# path_mode <path> — permission bits in octal ("700"), following symlinks;
+# empty when unknown. GNU coreutils first, BSD/macOS second.
+path_mode() {
+  stat -L -c %a "$1" 2>/dev/null || stat -L -f %Lp "$1" 2>/dev/null || printf ''
+}
+
+# backup_dir_check <create:0|1>
+# backups/ holds full copies of the database, and the one-shot container writes
+# into it by name. Another account that can write there could plant a symlink
+# that the write follows (into db/, say), so backup and restore REFUSE unless
+# backups/ belongs to the uid the container runs as and is writable by nobody
+# else. A missing backups/ is created with mode 700 when create=1; with
+# create=0 (restore) it is left to the caller to report the missing file.
+# Only backup and restore call this; the start path never looks at backups/.
+backup_dir_check() {
+  local create="$1" uid gid owner mode
+  uid="$(env_value_or_empty DOCKER_UID)"
+  gid="$(env_value_or_empty DOCKER_GID)"
+  [[ -n "$uid" ]] || uid="1000"
+  [[ -n "$gid" ]] || gid="1000"
+  if ! is_int "$uid"; then
+    warn_plain "DOCKER_UID is not numeric ($(printable_text "$uid")); backup and restore cannot check who owns backups/ and do not run. Set a numeric DOCKER_UID in .env."
+    return 1
+  fi
+  if [[ -L "$BACKUP_DIR" && ! -e "$BACKUP_DIR" ]]; then
+    warn_plain "backups is a broken symlink. Point $BACKUP_DIR at an existing directory or remove it."
+    return 1
+  fi
+  if [[ -e "$BACKUP_DIR" && ! -d "$BACKUP_DIR" ]]; then
+    warn_plain "backups exists but is not a directory. Remove $BACKUP_DIR and try again."
+    return 1
+  fi
+  if [[ ! -d "$BACKUP_DIR" ]]; then
+    [[ "$create" == "1" ]] || return 0
+    if ! mkdir -m 700 -- "$BACKUP_DIR"; then
+      warn_plain "Cannot create $BACKUP_DIR"
+      return 1
+    fi
+    success "Created backups/ (mode 700)."
+  fi
+
+  owner="$(path_owner_uid "$BACKUP_DIR")"
+  # 10# forces base 10, as in ensure_data_dirs.
+  if ! is_int "$owner" || [[ $((10#$owner)) -ne $((10#$uid)) ]]; then
+    warn_plain "backups/ is owned by uid ${owner:-unknown}, but the container runs as uid $uid; backup and restore only use a backups/ owned by that uid. Fix with: sudo chown ${uid}:${gid} $BACKUP_DIR && chmod 700 $BACKUP_DIR"
+    return 1
+  fi
+  mode="$(path_mode "$BACKUP_DIR")"
+  if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    warn_plain "Cannot read the permissions of $BACKUP_DIR; backup and restore do not run without checking them."
+    return 1
+  fi
+  if (( (8#$mode & 8#022) != 0 )); then
+    warn_plain "backups/ is writable by other accounts (mode $mode): another user could redirect the backup into db/ or swap the file a restore reads. Fix with: chmod go-w $BACKUP_DIR (700 is best)."
+    return 1
+  fi
+  if (( (8#$mode & 8#300) != 8#300 )); then
+    warn_plain "backups/ is not writable for uid $uid, the user the container runs as. Fix with: chmod u+rwx $BACKUP_DIR"
+    return 1
+  fi
+  return 0
+}
+
+# backup_file_owned <path> — regular file (not a symlink) owned by the uid the
+# container runs as. Warns and returns 1 otherwise.
+backup_file_owned() {
+  local f="$1" uid owner
   uid="$(env_value_or_empty DOCKER_UID)"
   [[ -n "$uid" ]] || uid="1000"
-  if ! is_int "$uid"; then
-    return 0   # ensure_data_dirs warned already; the verification still catches a missing file
+  if [[ -L "$f" ]]; then
+    warn_plain "${f##*/} is a symbolic link, not a file in backups/; it is not used. Check where it points ('ls -l $f') and remove it."
+    return 1
   fi
-  if [[ $((10#$uid)) -eq "$(id -u)" ]]; then
-    [[ -w "$BACKUP_DIR" && -x "$BACKUP_DIR" ]] && return 0
-  else
-    owner="$(path_owner_uid "$BACKUP_DIR")"
-    if is_int "$owner" && [[ $((10#$owner)) -eq $((10#$uid)) ]] \
-      && [[ -n "$(find -H "$BACKUP_DIR" -maxdepth 0 -perm -u+wx -print 2>/dev/null || true)" ]]; then
-      return 0
-    fi
+  if [[ ! -f "$f" ]]; then
+    warn_plain "${f##*/} is not a regular file; it is not used."
+    return 1
   fi
-  warn "backups/ is not writable for uid $uid, the user the container runs as. Fix with: chmod u+rwx $BACKUP_DIR"
-  return 1
+  owner="$(stat -c %u -- "$f" 2>/dev/null || stat -f %u -- "$f" 2>/dev/null || printf '')"
+  if ! is_int "$uid" || ! is_int "$owner" || [[ $((10#$owner)) -ne $((10#$uid)) ]]; then
+    warn_plain "${f##*/} is owned by uid ${owner:-unknown}, not by uid $uid, the user the container runs as; it is not used. If you trust it: chown $uid $f"
+    return 1
+  fi
+  return 0
+}
+
+# A random suffix for the .partial file, so its name cannot be guessed ahead of
+# the run.
+random_suffix() {
+  local r
+  r="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+  [[ "$r" =~ ^[0-9a-f]{16}$ ]] || r="$(printf '%04x%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM" "$$")"
+  printf '%s' "$r"
+}
+
+# oneshot_fail <relay_rc> — the "relay is not running" warning goes last.
+oneshot_fail() {
+  [[ "$1" -eq 0 ]] || relay_down_final_warning
+  return 0
 }
 
 # Free space in backups/ against the allocated size of db/ (du counts allocated
@@ -2291,8 +2531,14 @@ backup_space_check() {
   return 0
 }
 
+# Fails closed: a db/ the host user cannot read or search, or a find that
+# fails, counts as holding data — "empty" would skip the confirmation.
 db_has_data() {
-  [[ -n "$(find -H "$ROOT_DIR/db" -mindepth 1 ! -name .gitignore -print -quit 2>/dev/null || true)" ]]
+  local db="$ROOT_DIR/db" out=""
+  [[ -e "$db" || -L "$db" ]] || return 1
+  [[ -d "$db" && -r "$db" && -x "$db" ]] || return 0
+  out="$(find -H "$db" -mindepth 1 ! -name .gitignore -print -quit 2>/dev/null)" || return 0
+  [[ -n "$out" ]]
 }
 
 # little-endian hex ("0500") to decimal
@@ -2375,7 +2621,7 @@ verify_backup_zip() {
   fi
   entries="$(printf '%s\n' "$listing" | awk 'NF == 4 && $1 ~ /^[0-9]+$/ {print $4}' | LC_ALL=C sort)"
   if [[ "$entries" != "$BACKUP_ENTRIES" ]]; then
-    warn "${f##*/} is not a complete Haven backup: expected the entries ${BACKUP_ENTRIES//$'\n'/ }, found: ${entries//$'\n'/ }"
+    warn_plain "${f##*/} is not a complete Haven backup: expected the entries ${BACKUP_ENTRIES//$'\n'/ }, found: $(printable_text "${entries//$'\n'/ }")"
     return 1
   fi
   return 0
@@ -2393,7 +2639,7 @@ human_size() {
 # backup_relay_db <mode> [file]
 backup_relay_db() {
   local mode="$1" requested="$2"
-  local compose_file name target partial status=0 was_running vrc=0 size
+  local compose_file name target partial status=0 was_running vrc=0 size relay_rc=0
 
   compose_file="$(compose_file_for "$mode")"
   require_compose_file "$compose_file"
@@ -2406,73 +2652,104 @@ backup_relay_db() {
     name="haven-backup-$(date +%Y%m%d-%H%M%S).zip"
   fi
   target="$BACKUP_DIR/$name"
-  partial="$target.partial"
+  partial="$target.partial-$(random_suffix)"
 
   ensure_docker_uid
   ensure_data_dirs
   ensure_example_jsons
-  backup_dir_writable || return 1
+  backup_dir_check 1 || return 1
   if [[ -e "$target" || -L "$target" ]]; then
     warn "backups/$name already exists; a backup never overwrites a file. Choose another name."
     return 1
   fi
   if [[ -e "$partial" || -L "$partial" ]]; then
-    warn "backups/$name.partial is left over from an earlier, failed run. Remove it or choose another name."
+    warn_plain "$partial already exists; try again."
     return 1
   fi
   oneshot_leftover_check || return 1
   backup_space_check || return 1
 
   # --- run ---
-  relay_stop_for_oneshot "$compose_file" "backup" || return 1
+  oneshot_guard_on "$compose_file" "backup"
+  ONESHOT_GUARD_PARTIAL="$partial"
+  if ! relay_stop_for_oneshot "$compose_file" "backup"; then
+    oneshot_guard_off
+    return 1
+  fi
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
   info "Writing backups/$name ($mode)..."
-  dc "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
-    -v "$BACKUP_DIR:/app/backups" --entrypoint /app/haven \
-    relay backup "/app/backups/$name.partial" || status=$?
+  # umask 077 inside the container: the zip is a full copy of the database
+  # (badger keeps db/<relay>/ at 0700), so it is created 0600 for whatever uid
+  # the container runs as. --entrypoint sh keeps entrypoint.sh out, as before.
+  # shellcheck disable=SC2016  # $1 expands inside the container's sh, not here
+  oneshot_run -f "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+    -v "$BACKUP_DIR:/app/backups" --entrypoint sh relay \
+    -c 'umask 077; exec /app/haven backup "$1"' sh "/app/backups/${partial##*/}" || status=$?
 
   # The relay comes back before the verification: it does not need db/ quiet.
-  relay_restart_after_oneshot "$compose_file" "$was_running"
+  relay_restart_after_oneshot "$compose_file" "$was_running" || relay_rc=1
+  oneshot_guard_off
 
   if [[ "$status" -ne 0 ]]; then
     warn "The backup exited with status $status; no backup was written."
-    if [[ -e "$partial" ]]; then
-      warn "The incomplete file is kept for inspection: $partial — it is not a usable backup; delete it when done."
+    if [[ -e "$partial" && ! -L "$partial" ]]; then
+      warn_plain "The incomplete file is kept for inspection: $partial — it is not a usable backup; delete it when done."
     fi
+    oneshot_fail "$relay_rc"
+    return 1
+  fi
+  if [[ ! -e "$partial" && ! -L "$partial" ]]; then
+    warn "The backup reported success but wrote no file; no backup was written."
+    oneshot_fail "$relay_rc"
+    return 1
+  fi
+  # Something other than the container put this path there (a symlink planted
+  # during the run, a foreign file): it is neither verified nor renamed.
+  if ! backup_file_owned "$partial"; then
+    warn "No backup was written."
+    oneshot_fail "$relay_rc"
     return 1
   fi
   if [[ ! -s "$partial" ]]; then
-    warn "The backup reported success but wrote no file; no backup was written."
+    warn "The backup reported success but wrote an empty file; no backup was written."
+    oneshot_fail "$relay_rc"
     return 1
   fi
 
   verify_backup_zip "$compose_file" "$partial" || vrc=$?
   if [[ "$vrc" -ne 0 ]]; then
-    warn "No backup was written. The unverified file is kept for inspection: $partial — it is not a usable backup; delete it when done."
+    warn_plain "No backup was written. The unverified file is kept for inspection: $partial — it is not a usable backup; delete it when done."
+    oneshot_fail "$relay_rc"
     return 1
   fi
 
-  if [[ -e "$target" ]]; then
-    warn "backups/$name appeared while the backup ran; the verified file stays as $partial."
+  if [[ -e "$target" || -L "$target" ]]; then
+    warn_plain "backups/$name appeared while the backup ran; the verified file stays as $partial."
+    oneshot_fail "$relay_rc"
     return 1
   fi
   mv -n -- "$partial" "$target"
-  if [[ -e "$partial" || ! -f "$target" ]]; then
-    warn "Could not rename $partial to $name; the verified file stays as $partial."
+  if [[ -e "$partial" || -L "$target" || ! -f "$target" ]]; then
+    warn_plain "Could not rename $partial to $name; the verified file stays as $partial."
+    oneshot_fail "$relay_rc"
     return 1
   fi
 
   size="$(stat -L -c %s "$target" 2>/dev/null || stat -L -f %z "$target" 2>/dev/null || printf '?')"
-  success "Backup written: $target ($(human_size "$size"), five entries verified with $BACKUP_VERIFIED_BY)."
+  success_plain "Backup written: $target ($(human_size "$size"), five entries verified with $BACKUP_VERIFIED_BY)."
   info "It does not contain the media files in blossom/, your .env or the JSON lists (relays_import.json, relays_blastr.json, blacklisted_npubs.json, whitelisted_npubs.json) — copy those separately."
+  if [[ "$relay_rc" -ne 0 ]]; then
+    relay_down_final_warning
+    return 1
+  fi
   return 0
 }
 
 # restore_relay_db <mode> <file>
 restore_relay_db() {
   local mode="$1" requested="$2"
-  local compose_file name file status=0 was_running vrc=0
+  local compose_file name file status=0 was_running vrc=0 relay_rc=0
 
   compose_file="$(compose_file_for "$mode")"
   require_compose_file "$compose_file"
@@ -2486,15 +2763,19 @@ restore_relay_db() {
   backup_normalize_name "$requested" || return 1
   name="$BACKUP_NAME"
   file="$BACKUP_DIR/$name"
-  if [[ ! -f "$file" ]]; then
-    warn "backups/$name not found."
-    list_backups
-    return 1
-  fi
 
   ensure_docker_uid
   ensure_data_dirs
   ensure_example_jsons
+  backup_dir_check 0 || return 1
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    warn "backups/$name not found."
+    list_backups
+    return 1
+  fi
+  # Upstream imports a backup without any signature check: only a regular file
+  # of the container user is read, never a symlink to somewhere else.
+  backup_file_owned "$file" || { warn "Nothing was restored; the relay was not touched."; return 1; }
   oneshot_leftover_check || return 1
 
   verify_backup_zip "$compose_file" "$file" || vrc=$?
@@ -2505,7 +2786,7 @@ restore_relay_db() {
   info "backups/$name verified with $BACKUP_VERIFIED_BY: intact, five entries."
 
   if db_has_data; then
-    info "db/ already holds data. A restore adds the events from backups/$name that are missing; it never deletes or duplicates anything, and events that exist only in the database stay."
+    info "db/ already holds data (or cannot be read to check). A restore adds the events from backups/$name that are missing; it never deletes or duplicates anything, and events that exist only in the database stay."
     if [[ "$ASSUME_YES" == "1" ]]; then
       :
     elif [[ -t 0 ]]; then
@@ -2520,19 +2801,30 @@ restore_relay_db() {
   fi
 
   # --- run ---
-  relay_stop_for_oneshot "$compose_file" "restore" || return 1
+  oneshot_guard_on "$compose_file" "restore"
+  if ! relay_stop_for_oneshot "$compose_file" "restore"; then
+    oneshot_guard_off
+    return 1
+  fi
   was_running="$ONESHOT_RELAY_WAS_RUNNING"
 
   info "Restoring from backups/$name ($mode)..."
-  dc "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+  oneshot_run -f "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
     -v "$BACKUP_DIR:/app/backups" --entrypoint /app/haven \
     relay restore "/app/backups/$name" || status=$?
 
-  relay_restart_after_oneshot "$compose_file" "$was_running"
+  relay_restart_after_oneshot "$compose_file" "$was_running" || relay_rc=1
+  oneshot_guard_off
 
   if [[ "$status" -ne 0 ]]; then
     warn "The restore exited with status $status. The database may now be partially restored."
     warn "Running the same restore again is safe: it adds what is missing and skips what is already there."
+    oneshot_fail "$relay_rc"
+    return 1
+  fi
+  if [[ "$relay_rc" -ne 0 ]]; then
+    info "Restore finished: the events from backups/$name that were missing are now in the database."
+    relay_down_final_warning
     return 1
   fi
   success "Restore finished: the events from backups/$name that were missing are now in the database; nothing was deleted or duplicated."
@@ -4114,6 +4406,7 @@ main() {
       ;;
     start)
       ensure_docker
+      if oneshot_blocks_start; then exit 1; fi
       start_services "$(resolve_mode "start")"
       ;;
     stop)
@@ -4122,6 +4415,7 @@ main() {
       ;;
     restart)
       ensure_docker
+      if oneshot_blocks_start; then exit 1; fi
       restart_services "$(resolve_mode "restart")"
       ;;
     logs)

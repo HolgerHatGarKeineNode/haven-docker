@@ -14,6 +14,8 @@
 #   started     touched by a held `run`, release: touch `release` to let it go
 # Knobs (environment):
 #   MOCK_STOP_FAILS=1   `compose stop` returns 0 but leaves `running` untouched
+#   MOCK_START_FAILS=1  `compose start|up|restart` exit 1 and leave `running`
+#                       untouched (a relay that does not come back)
 #   MOCK_RUN_EXIT=<n>   exit status of every `compose run` (default 0)
 #   MOCK_FAIL_AT=<n>    the n-th `compose run` (1-based) exits MOCK_RUN_EXIT if
 #                       that is non-zero, else 1
@@ -21,9 +23,16 @@
 #                       host side of the `-v <host>:/app/backups` mount
 #                       (content: $MOCK_RUN_PAYLOAD or "mock-backup"; with
 #                       MOCK_RUN_PAYLOAD_FILE set, a copy of that file instead —
-#                       for binary payloads such as a real zip)
+#                       for binary payloads such as a real zip). The container
+#                       form `--entrypoint sh relay -c '... exec /app/haven
+#                       backup "$1"' sh /app/backups/<f>` counts as well; a
+#                       `umask NNN` in that -c script is applied to the write,
+#                       so the file mode on the host follows the umask the
+#                       caller really passed (the mock's own umask otherwise)
 #   MOCK_RUN_HOLD=1     `run` touches `started`, then polls up to MOCK_HOLD_MAX
-#                       seconds (default 10) for `release` before it continues
+#                       seconds (default 10) for `release` before it continues;
+#                       `docker stop|rm|kill <name>` touches `release` (the
+#                       one-shot container ends, so its held `run` returns)
 #   HAVEN_CONTAINER_NAME  name that start/up/restart mark as running
 #                         (default haven-relay)
 #   MOCK_LOG_COUNT=<n>  `compose logs` emits exactly n lines (MOCKLOG COUNTER=0 ..
@@ -82,6 +91,10 @@ mock_scripted() {
       exit 0
       ;;
     compose) ;;
+    stop|rm|kill)
+      : > "$d/release"
+      exit 0
+      ;;
     *) exit 0 ;;
   esac
 
@@ -115,6 +128,7 @@ mock_scripted() {
       exit 0
       ;;
     start|up|restart)
+      [[ "${MOCK_START_FAILS:-0}" == "1" ]] && exit 1
       printf '%s\n' "$name" > "$d/running"
       exit 0
       ;;
@@ -136,23 +150,31 @@ mock_scripted() {
         done
       fi
       if [[ "${MOCK_RUN_WRITES:-0}" == "1" ]]; then
-        local i host="" target="" verb_seen=0 a
+        local i host="" target="" verb_seen=0 a um=""
+        # shellcheck disable=SC2016  # a literal $1: the container's sh expands it
+        local sh_backup='exec /app/haven backup "$1"'
         for ((i = 0; i < ${#args[@]}; i++)); do
           a="${args[$i]}"
           if [[ "$a" == "-v" ]]; then
             [[ "${args[$((i + 1))]:-}" == *":/app/backups" ]] && host="${args[$((i + 1))]%:/app/backups}"
           elif [[ "$a" == "backup" ]]; then
             verb_seen=1
+          elif [[ "$a" == *"$sh_backup"* ]]; then
+            verb_seen=1
+            [[ "$a" =~ umask\ ([0-7]+) ]] && um="${BASH_REMATCH[1]}"
           elif (( verb_seen )) && [[ "$a" == /app/backups/* ]]; then
             target="$a"
           fi
         done
         if [[ -n "$host" && -n "$target" ]]; then
-          if [[ -n "${MOCK_RUN_PAYLOAD_FILE:-}" ]]; then
-            cp -- "$MOCK_RUN_PAYLOAD_FILE" "$host/${target#/app/backups/}"
-          else
-            printf '%s' "${MOCK_RUN_PAYLOAD:-mock-backup}" > "$host/${target#/app/backups/}"
-          fi
+          (
+            [[ -z "$um" ]] || umask "$um"
+            if [[ -n "${MOCK_RUN_PAYLOAD_FILE:-}" ]]; then
+              cp -- "$MOCK_RUN_PAYLOAD_FILE" "$host/${target#/app/backups/}"
+            else
+              printf '%s' "${MOCK_RUN_PAYLOAD:-mock-backup}" > "$host/${target#/app/backups/}"
+            fi
+          )
         fi
       fi
       local rc="${MOCK_RUN_EXIT:-0}"
