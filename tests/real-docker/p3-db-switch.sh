@@ -35,6 +35,15 @@
 #              restore must fail and the switch roll back to lmdb
 #   fail-late  ./haven db-switch badger --yes, hook fails after a complete
 #              restore: the restored badger database is set aside, lmdb back
+#   rep-*      the reporter's state of issue #15: badger with the golden set,
+#              DB_ENGINE flipped to lmdb by hand and the relay started with
+#              plain compose (served: 0, all five directories mixed), one more
+#              event published on lmdb; then ./haven start on it (goes ahead,
+#              one warning), db-switch lmdb --from badger (golden set, the
+#              extra event not served), --rollback (mixed layout and lmdb back:
+#              the extra event is served again, so it was kept), and the R3
+#              arm: badger only, DB_ENGINE flipped, relay never started —
+#              ./haven start refuses, db-switch lmdb serves the golden set
 
 set -u
 set -o pipefail
@@ -407,6 +416,75 @@ failed_dir=$(newest "-d $SB/db/.failed-*")
 check fail-late-restored-set-aside "$( [ -f "$failed_dir/private/MANIFEST" ] && echo yes || echo no)" "set aside with badger files: ${failed_dir#"$SB/"}"
 wait_ready fail-late && snap fail-late
 check fail-late-serves "$( [ "${R[fail-late.eq]:-no}" = yes ] && [ "${R[fail-late.blob]:-no}" = yes ] && echo yes || echo no)" "sorted ID set equals golden: ${R[fail-late.eq]:-?} (${R[fail-late.n]:-?} ids); blob by hash: ${R[fail-late.blob]:-?}"
+
+# ===========================================================================
+# the reporter's state (issue #15): DB_ENGINE flipped by hand, relay started
+# ===========================================================================
+# badger with the golden set first (from the lmdb state the steps above leave)
+sleep 1
+haven rep-seed --plain db-switch badger --yes
+switch_checks rep-seed badger
+sleep 1
+
+# the flip by hand, then a start the way the reporter did it: plain compose
+# (./haven start now refuses exactly this, see the R3 arm below)
+sed -i -E 's/^DB_ENGINE=.*/DB_ENGINE="lmdb"/' "$SB/.env"
+dc up -d relay >"$EVID/rep-flip.up.log" 2>&1
+wait_ready rep-flip && snap rep-flip
+mixed_all() { # yes when all five directories hold files of both engines
+  local n b l
+  for n in $DIRS; do
+    b=$(find "$SB/db/$n" -maxdepth 1 \( -name MANIFEST -o -name KEYREGISTRY -o -name '*.vlog' -o -name '*.sst' \) 2>/dev/null | wc -l)
+    l=$(find "$SB/db/$n" -maxdepth 1 \( -name data.mdb -o -name lock.mdb \) 2>/dev/null | wc -l)
+    [ "$b" -gt 0 ] && [ "$l" -gt 0 ] || { echo no; return; }
+  done
+  echo yes
+}
+check rep-flip-state "$( [ "${R[rep-flip.n]:-x}" = 0 ] && [ "$(mixed_all)" = yes ] && echo yes || echo no)" "after the flip the relay serves ${R[rep-flip.n]:-?} events (want 0); all five directories mixed: $(mixed_all) ($(disk_report))"
+
+# ONE more event while on lmdb — it exists only on the lmdb side
+out=$(nakx event -k 1 -c "p3 published while on lmdb after the flip" --ts 1790009999 "ws://127.0.0.1:$PORT" 2>>"$EVID/rep-extra.err")
+EXTRA=$(printf '%s\n' "$out" | grep '^{' | jq -r .id)
+printf '%s\n' "$EXTRA" >"$EVID/rep-extra.id"
+snap rep-extra
+check rep-extra-published "$( [ -n "$EXTRA" ] && [ "$(cat "$EVID/rep-extra.ids")" = "$EXTRA" ] && echo yes || echo no)" "the lmdb side serves exactly the extra event ${EXTRA:0:16}… (ids: ${R[rep-extra.n]:-?})"
+
+# (i) ./haven start on the mixed state: goes ahead, one warning line
+t5=$(relay_started_at)
+haven rep-start --plain start --no-build
+wait_ready rep-start && snap rep-start
+check rep-start-mixed "$( [ "${R[rep-start.rc]}" = 0 ] && [ "$(grep -c 'db/ holds files of both engines' "$EVID/rep-start.log")" = 1 ] && grep -q -- '--from' "$EVID/rep-start.log" && [ "$(relay_state)" = running ] && [ "$(cat "$EVID/rep-start.ids")" = "$EXTRA" ] && echo yes || echo no)" "rc=${R[rep-start.rc]}; warning: $(grep -o 'db/ holds files of both engines.*' "$EVID/rep-start.log" | head -n1); relay $(relay_state) (StartedAt $t5 -> $(relay_started_at)), still serving only the lmdb side: $(cat "$EVID/rep-start.ids" 2>/dev/null | head -c 16)…"
+
+# (ii) db-switch lmdb --from badger: a clean lmdb database with the golden set
+haven rep-switch --plain db-switch lmdb --from badger --yes
+switch_checks rep-switch lmdb
+mixed_dir=$(newest "-d $SB/db/.pre-switch-mixed-*")
+stash_mixed() { local n; for n in $DIRS; do [ -n "$(find "$mixed_dir/$n" -maxdepth 1 -name MANIFEST)" ] && [ -n "$(find "$mixed_dir/$n" -maxdepth 1 -name data.mdb)" ] || { echo no; return; }; done; echo yes; }
+check rep-switch-mixed-kept "$( [ -n "$mixed_dir" ] && [ "$(stash_mixed)" = yes ] && echo yes || echo no)" "set aside: ${mixed_dir#"$SB/"}; MANIFEST and data.mdb in all five: $(stash_mixed)"
+check rep-switch-backup-side "$(grep -q 'read with DB_ENGINE=badger' "$EVID/rep-switch.log" && echo yes || echo no)" "$(grep -o 'first a verified backup, read with DB_ENGINE=[a-z]*' "$EVID/rep-switch.log")"
+# (iii) the extra event is NOT served now ...
+check rep-switch-extra-not-served "$( [ -s "$EVID/rep-switch.ids" ] && ! grep -qxF "$EXTRA" "$EVID/rep-switch.ids" && echo yes || echo no)" "extra event in the served ID set: $(grep -cxF "$EXTRA" "$EVID/rep-switch.ids")"
+sleep 1
+
+# ... and IS still in the set-aside lmdb files: --rollback puts the mixed layout
+# and DB_ENGINE=lmdb back, the relay reads the lmdb side again
+haven rep-undo --plain db-switch --rollback --yes
+wait_ready rep-undo && snap rep-undo
+check rep-undo-mixed-back "$( [ "${R[rep-undo.rc]}" = 0 ] && grep -qx '::result rolled-back' "$EVID/rep-undo.log" && [ "$(env_engine)" = lmdb ] && [ "$(mixed_all)" = yes ] && marker_absent && echo yes || echo no)" "rc=${R[rep-undo.rc]}; DB_ENGINE=$(env_engine); all five mixed: $(mixed_all)"
+check rep-undo-extra-served "$( [ "$(cat "$EVID/rep-undo.ids")" = "$EXTRA" ] && echo yes || echo no)" "with DB_ENGINE=lmdb on the restored mixed layout the relay serves: $(tr '\n' ' ' <"$EVID/rep-undo.ids" | head -c 70)"
+sleep 1
+
+# (iv) the R3 arm: badger only on disk, DB_ENGINE flipped, relay never started
+haven rep-r3-prep --plain db-switch badger --from badger --yes
+switch_checks rep-r3-prep badger
+haven rep-r3-stop --plain stop
+sed -i -E 's/^DB_ENGINE=.*/DB_ENGINE="lmdb"/' "$SB/.env"
+haven rep-r3-start --plain start --no-build
+check rep-r3-start-refused "$( [ "${R[rep-r3-start.rc]}" != 0 ] && grep -q 'db/ holds badger data, but .env runs the relay on lmdb' "$EVID/rep-r3-start.log" && [ "$(relay_state)" != running ] && [ "$(only_engine badger)" = yes ] && echo yes || echo no)" "rc=${R[rep-r3-start.rc]}; relay $(relay_state); disk still badger only: $(only_engine badger) ($(disk_report))"
+haven rep-r3 --plain db-switch lmdb --yes
+check rep-r3-found "$(grep -q '.env says DB_ENGINE=lmdb, the data on disk is badger' "$EVID/rep-r3.log" && echo yes || echo no)" "$(grep -o '.env says DB_ENGINE=[a-z]*, the data on disk is [a-z]*' "$EVID/rep-r3.log")"
+haven rep-r3-up --plain start --no-build
+switch_checks rep-r3 lmdb
 
 # ===========================================================================
 # closing checks
