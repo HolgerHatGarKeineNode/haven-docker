@@ -197,7 +197,20 @@ snap() { # label ; sorted ID set, blob by hash, blossom list
   if [ -s "$WORK/ids.expected" ] && cmp -s "$f.ids" "$WORK/ids.expected"; then R[$1.eq]=yes; else R[$1.eq]=no; fi
   if [ "$bsha" = "$BLOBSHA" ]; then R[$1.blob]=yes; else R[$1.blob]=no; fi
   if [ "$list" = "[\"$BLOBSHA\"]" ]; then R[$1.list]=yes; else R[$1.list]=no; fi
+  # the media index in numbers: entries for the blob, and all entries
+  R[$1.listn]=$(jq -r --arg s "$BLOBSHA" '[.[] | select(. == $s)] | length' <<<"$list" 2>/dev/null || echo INVALID)
+  R[$1.listt]=$(jq -r 'length' <<<"$list" 2>/dev/null || echo INVALID)
   result "snap-$1" "ids=${R[$1.n]} sha256=${R[$1.ids]} equals_golden=${R[$1.eq]} blob_http=$code blob_hash_ok=${R[$1.blob]} blossom_list_ok=${R[$1.list]}"
+}
+
+# list_row <row> <snap label> <entries> <why> — the Blossom list after an arm
+# holds exactly <entries> entries, all for the seeded blob. The expectation is
+# measured (2026-11-12, v1.2.2-6): a restore into an empty database (and every
+# db-switch, which restores into one) lists the blob once; on badger a restore
+# into a database that already lists it adds nothing; on lmdb it adds one more
+# identical entry per restore. Notes are never doubled (the serves rows).
+list_row() {
+  check "$1" "$( [ "${R[$2.listn]:-x}" = "$3" ] && [ "${R[$2.listt]:-x}" = "$3" ] && echo yes || echo no)" "/list after $2: ${R[$2.listn]:-?} entries for the blob, ${R[$2.listt]:-?} in all (want $3: $4)"
 }
 
 # ===========================================================================
@@ -336,6 +349,7 @@ switch_checks() {
   check "$label-crc" "$( [ "$(wc -l <"$EVID/$label.pre.crc")" = 5 ] && cmp -s "$EVID/$label.pre.crc" "$EVID/$label.post.crc" && echo yes || echo no)" "per-entry CRC32 of ${pre##*/} and ${post##*/}: $(tr '\n' ' ' <"$EVID/$label.pre.crc")"
   wait_ready "$label" && snap "$label"
   check "$label-serves" "$( [ "${R[$label.eq]:-no}" = yes ] && [ "${R[$label.blob]:-no}" = yes ] && echo yes || echo no)" "sorted ID set equals golden: ${R[$label.eq]:-?} (${R[$label.n]:-?} ids sha256=${R[$label.ids]:-?}); blob by hash: ${R[$label.blob]:-?}"
+  list_row "$label-list" "$label" 1 "a switch restores into an empty $e database"
 }
 
 # ===========================================================================
@@ -366,6 +380,7 @@ post_dir=$(newest "-d $SB/db/.post-switch-badger-*")
 check undo-post-kept "$( [ -n "$post_dir" ] && [ -f "$post_dir/private/MANIFEST" ] && echo yes || echo no)" "set aside: ${post_dir#"$SB/"}"
 wait_ready undo && snap undo
 check undo-serves "$( [ "${R[undo.eq]:-no}" = yes ] && [ "${R[undo.blob]:-no}" = yes ] && echo yes || echo no)" "sorted ID set equals golden: ${R[undo.eq]:-?} (${R[undo.n]:-?} ids); blob by hash: ${R[undo.blob]:-?}"
+list_row undo-list undo 1 "the undo puts the earlier directories back, which listed it once"
 sleep 1
 
 # ===========================================================================
@@ -400,6 +415,7 @@ check fail-partial-kept "$( [ -n "$failed_dir" ] && echo yes || echo no)" "set a
 check fail-relay-restarted "$( [ "$t4" != "$(relay_started_at)" ] && [ "$(relay_state)" = running ] && echo yes || echo no)" "StartedAt before=$t4 after=$(relay_started_at)"
 wait_ready fail && snap fail
 check fail-serves "$( [ "${R[fail.eq]:-no}" = yes ] && [ "${R[fail.blob]:-no}" = yes ] && echo yes || echo no)" "sorted ID set equals golden: ${R[fail.eq]:-?} (${R[fail.n]:-?} ids); blob by hash: ${R[fail.blob]:-?}"
+list_row fail-list fail 1 "the rollback puts the earlier directories back"
 sleep 1
 
 # ===========================================================================
@@ -416,6 +432,7 @@ failed_dir=$(newest "-d $SB/db/.failed-*")
 check fail-late-restored-set-aside "$( [ -f "$failed_dir/private/MANIFEST" ] && echo yes || echo no)" "set aside with badger files: ${failed_dir#"$SB/"}"
 wait_ready fail-late && snap fail-late
 check fail-late-serves "$( [ "${R[fail-late.eq]:-no}" = yes ] && [ "${R[fail-late.blob]:-no}" = yes ] && echo yes || echo no)" "sorted ID set equals golden: ${R[fail-late.eq]:-?} (${R[fail-late.n]:-?} ids); blob by hash: ${R[fail-late.blob]:-?}"
+list_row fail-late-list fail-late 1 "the rollback puts the earlier directories back"
 
 # ===========================================================================
 # the reporter's state (issue #15): DB_ENGINE flipped by hand, relay started

@@ -175,7 +175,20 @@ snap() { # label ; sorted ID set, blob by hash, blossom list
   if [ -s "$WORK/ids.expected" ] && cmp -s "$f.ids" "$WORK/ids.expected"; then R[$1.eq]=yes; else R[$1.eq]=no; fi
   if [ "$bsha" = "$BLOBSHA" ]; then R[$1.blob]=yes; else R[$1.blob]=no; fi
   if [ "$list" = "[\"$BLOBSHA\"]" ]; then R[$1.list]=yes; else R[$1.list]=no; fi
+  # the media index in numbers: entries for the blob, and all entries
+  R[$1.listn]=$(jq -r --arg s "$BLOBSHA" '[.[] | select(. == $s)] | length' <<<"$list" 2>/dev/null || echo INVALID)
+  R[$1.listt]=$(jq -r 'length' <<<"$list" 2>/dev/null || echo INVALID)
   result "snap-$1" "ids=${R[$1.n]} sha256=${R[$1.ids]} equals_golden=${R[$1.eq]} blob_http=$code blob_hash_ok=${R[$1.blob]} blossom_list_ok=${R[$1.list]}"
+}
+
+# list_row <row> <snap label> <entries> <why> — the Blossom list after an arm
+# holds exactly <entries> entries, all for the seeded blob. The expectation is
+# measured (2026-11-12, v1.2.2-6): a restore into an empty database (and every
+# db-switch, which restores into one) lists the blob once; on badger a restore
+# into a database that already lists it adds nothing; on lmdb it adds one more
+# identical entry per restore. Notes are never doubled (the serves rows).
+list_row() {
+  check "$1" "$( [ "${R[$2.listn]:-x}" = "$3" ] && [ "${R[$2.listt]:-x}" = "$3" ] && echo yes || echo no)" "/list after $2: ${R[$2.listn]:-?} entries for the blob, ${R[$2.listt]:-?} in all (want $3: $4)"
 }
 
 # ===========================================================================
@@ -308,8 +321,13 @@ wait_text() { # text seconds
 }
 keys() { tmx send-keys -t p6 "$@"; sleep 0.4; }
 printf '+ tmux -L %s: COMPOSE_PROJECT_NAME=%s HAVEN_CONTAINER_NAME=%s ./haven --plain tui\n' "$TSOCK" "$PROJ" "$RELAY_NAME" >>"$CMDLOG"
+# TMPDIR of the TUI: its own directory in the work dir, so the step check can
+# hard-link the switch's output file (haven-task.*/out) and read it whole after
+# the TUI has removed its name
+TUITMP=$WORK/tuitmp
+mkdir -p "$TUITMP"
 tmx new-session -d -x "$TUI_W" -y "$TUI_H" -s p6 \
-  "cd $(printf '%q' "$SB") && export TERM=xterm-256color LC_ALL=C.UTF-8 COMPOSE_PROJECT_NAME=$PROJ HAVEN_CONTAINER_NAME=$RELAY_NAME && ./haven --plain tui 2>$(printf '%q' "$WORK/tui.stderr"); echo \$? >$(printf '%q' "$WORK/tui.rc"); sleep 600"
+  "cd $(printf '%q' "$SB") && export TERM=xterm-256color LC_ALL=C.UTF-8 TMPDIR=$(printf '%q' "$TUITMP") COMPOSE_PROJECT_NAME=$PROJ HAVEN_CONTAINER_NAME=$RELAY_NAME && ./haven --plain tui 2>$(printf '%q' "$WORK/tui.stderr"); echo \$? >$(printf '%q' "$WORK/tui.rc"); sleep 600"
 wait_text "▸ s Start" 30 || die "the TUI did not start"
 
 # --- Back up now
@@ -326,6 +344,7 @@ check backup-zip "$([ $bk_box = yes ] && [ $zip_ok = yes ] && echo yes || echo n
 keys x
 wait_ready after-backup && snap after-backup
 check backup-serves "$([ "${R[after-backup.eq]:-no}" = yes ] && [ "${R[after-backup.blob]:-no}" = yes ] && echo yes || echo no)" "after the TUI backup the relay serves the golden set and the blob"
+list_row list-backup after-backup 1 "badger, as seeded"
 
 # --- Switch engine badger -> lmdb, typed confirmation
 keys d
@@ -335,9 +354,18 @@ keys Enter
 wait_text "Type lmdb:" 10 || die "no typed confirmation"
 tmx send-keys -t p6 -l lmdb; sleep 0.3
 keys Enter
+# the step check reads the verb's own output, whole: the TUI runs the switch
+# with its output in $TUITMP/haven-task.*/out (the file the task pane reads)
+# and removes that directory once the box is up; a hard link made while the
+# switch runs keeps the complete file. Sampling the screen (until 2026-11-12)
+# missed a short last step in 1 of 5 runs; the screen samples stay as facts.
 : >"$WORK/steps.seen"
+rm -f "$WORK/switch.out"
 done_sw=no
 for ((i = 0; i < 3000; i++)); do
+  if [ ! -e "$WORK/switch.out" ]; then
+    for o in "$TUITMP"/haven-task.*/out; do [ -f "$o" ] && ln "$o" "$WORK/switch.out" 2>/dev/null && break; done
+  fi
   cap | grep -oE '[✓▸] [a-z]+' >>"$WORK/steps.seen"
   if has "Engine switched"; then done_sw=yes; break; fi
   if has "Switch rolled back" || has "Switch failed" || has "Switch not started"; then break; fi
@@ -346,20 +374,17 @@ done
 cap >"$EVID/switch-box.screen"
 seen=$(sed 's/^. //' "$WORK/steps.seen" | awk '!s[$0]++' | tr '\n' ' ')
 echo "$seen" >"$EVID/switch-steps-seen.txt"
-# the steps must appear in the verb's order (each seen at least once, as ✓ or ▸)
-order_ok=no
-python3 -I - "$seen" <<'PY2' && order_ok=yes
-import sys
-want = "preflight stop backup move config restore start".split()
-seen = sys.argv[1].split()
-sys.exit(0 if seen == want else 1)
-PY2
+steps=""
+[ -f "$WORK/switch.out" ] && steps=$(sed -n 's/^::step \([0-9]*\)\/\([0-9]*\) \([a-z]*\)$/\1\/\2 \3/p' "$WORK/switch.out" | tr '\n' ' ')
+[ -f "$WORK/switch.out" ] && cp "$WORK/switch.out" "$EVID/switch.out"
+result switch-steps-screen "steps sampled from the screen (facts, not judged): $seen"
 check switch-box "$done_sw" "the TUI shows 'Engine switched'"
-check switch-steps "$order_ok" "steps shown on screen in order: $seen"
+check switch-steps "$( [ "$steps" = "1/7 preflight 2/7 stop 3/7 backup 4/7 move 5/7 config 6/7 restore 7/7 start " ] && grep -qx '::result ok' "$WORK/switch.out" && echo yes || echo no)" "the switch's own output (::step lines, in order): $steps; $(grep -E '^::result' "$WORK/switch.out" 2>/dev/null)"
 check switch-disk "$([ "$(env_engine)" = lmdb ] && [ "$(only_engine lmdb)" = yes ] && echo yes || echo no)" ".env DB_ENGINE=$(env_engine), db/ $(disk_report)"
 keys x
 wait_ready after-switch && snap after-switch
 check switch-serves "$([ "${R[after-switch.eq]:-no}" = yes ] && [ "${R[after-switch.blob]:-no}" = yes ] && echo yes || echo no)" "on lmdb the relay serves the identical sorted ID set and the blob"
+list_row list-switch after-switch 1 "the switch restores into an empty lmdb"
 
 # --- Restore the earlier backup (the oldest zip: the one of the first step)
 keys e
@@ -378,6 +403,7 @@ chosen=$(grep -oE 'restore /app/backups/[^ ]+' "$EVID/commands.log" 2>/dev/null 
 keys x
 wait_ready after-restore && snap after-restore
 check restore-serves "$([ $rs_box = yes ] && [ "${R[after-restore.eq]:-no}" = yes ] && [ "${R[after-restore.blob]:-no}" = yes ] && echo yes || echo no)" "after restoring $(basename "$ZIP") in the TUI: box=$rs_box, identical ID set and blob"
+list_row list-restore after-restore 2 "a restore into a populated lmdb lists the blob once more"
 
 # --- quit, console
 keys q
@@ -391,7 +417,7 @@ grep -rlF "$KEY" "$EVID" >/dev/null 2>&1 && check key-leak no "the owner key app
 
 echo
 echo "summary:"
-for k in backup-zip backup-serves switch-box switch-steps switch-disk switch-serves restore-serves tui-exit tui-stderr repo-untouched key-leak; do
+for k in backup-zip backup-serves list-backup switch-box switch-steps switch-disk switch-serves list-switch restore-serves list-restore tui-exit tui-stderr repo-untouched key-leak; do
   printf '  %-15s %s\n' "$k" "${R[$k]:-no}"
 done
 exit "$FAIL"

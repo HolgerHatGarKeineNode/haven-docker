@@ -192,7 +192,20 @@ snap() { # label ; sorted ID set, blob by hash, blossom list
   if [ -s "$WORK/ids.expected" ] && cmp -s "$f.ids" "$WORK/ids.expected"; then R[$1.eq]=yes; else R[$1.eq]=no; fi
   if [ "$bsha" = "$BLOBSHA" ]; then R[$1.blob]=yes; else R[$1.blob]=no; fi
   if [ "$list" = "[\"$BLOBSHA\"]" ]; then R[$1.list]=yes; else R[$1.list]=no; fi
+  # the media index in numbers: entries for the blob, and all entries
+  R[$1.listn]=$(jq -r --arg s "$BLOBSHA" '[.[] | select(. == $s)] | length' <<<"$list" 2>/dev/null || echo INVALID)
+  R[$1.listt]=$(jq -r 'length' <<<"$list" 2>/dev/null || echo INVALID)
   result "snap-$1" "ids=${R[$1.n]} sha256=${R[$1.ids]} equals_golden=${R[$1.eq]} blob_http=$code blob_hash_ok=${R[$1.blob]} blossom_list_ok=${R[$1.list]}"
+}
+
+# list_row <row> <snap label> <entries> <why> — the Blossom list after an arm
+# holds exactly <entries> entries, all for the seeded blob. The expectation is
+# measured (2026-11-12, v1.2.2-6): a restore into an empty database (and every
+# db-switch, which restores into one) lists the blob once; on badger a restore
+# into a database that already lists it adds nothing; on lmdb it adds one more
+# identical entry per restore. Notes are never doubled (the serves rows).
+list_row() {
+  check "$1" "$( [ "${R[$2.listn]:-x}" = "$3" ] && [ "${R[$2.listt]:-x}" = "$3" ] && echo yes || echo no)" "/list after $2: ${R[$2.listn]:-?} entries for the blob, ${R[$2.listt]:-?} in all (want $3: $4)"
 }
 
 # ===========================================================================
@@ -306,6 +319,7 @@ t1=$(relay_started_at)
 check backup-relay-restarted "$( [ "$t0" != "$t1" ] && [ "$(relay_state)" = running ] && echo yes || echo no)" "StartedAt before=$t0 after=$t1 state=$(relay_state)"
 wait_ready after-backup && snap after-backup
 check backup-relay-serves "${R[after-backup.eq]:-no}" "after the backup the restarted relay serves the golden set"
+list_row list-after-backup after-backup 1 "badger, as seeded"
 
 # ===========================================================================
 # SIGTERM to ./haven backup while the one-shot container runs
@@ -379,6 +393,7 @@ ls -A "$SB/db" >"$EVID/db-emptied.txt"
 dc start relay >>"$EVID/empty.stop.log" 2>&1
 wait_ready emptied && snap emptied
 check emptied-serves-nothing "$( [ "${R[emptied.n]:-x}" = 0 ] && echo yes || echo no)" "negative control: the emptied db serves ${R[emptied.n]:-?} events (blob file still in blossom/: list_ok=${R[emptied.list]:-?})"
+list_row list-emptied emptied 0 "the index lives in db/blossom, which was moved aside"
 
 t4=$(relay_started_at)
 haven restore --plain restore p2.zip --yes
@@ -387,6 +402,7 @@ check restore-rc "$( [ "${R[restore.rc]}" = 0 ] && grep -q 'Restore finished' "$
 wait_ready after-restore && snap after-restore
 check restore-same-ids "${R[after-restore.eq]:-no}" "sorted ID set after the restore: ${R[after-restore.n]:-?} ids sha256=${R[after-restore.ids]:-?} vs golden ${R[golden.ids]}"
 check restore-blob "$( [ "${R[after-restore.blob]:-no}" = yes ] && [ "${R[after-restore.list]:-no}" = yes ] && echo yes || echo no)" "blob fetched by hash: ${R[after-restore.blob]:-?}; blossom list: ${R[after-restore.list]:-?}"
+list_row list-after-restore after-restore 1 "a restore into an empty badger database"
 
 # ===========================================================================
 # confirmation gate: non-empty db, no tty, no --yes
