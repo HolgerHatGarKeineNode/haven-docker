@@ -11,6 +11,10 @@
 #   14. frame geometry (capture -N) at five sizes and after a resize
 #   15. NO_COLOR; 16. restart after an .env change asks before it stops
 #   17. TUI stderr stays empty through every view
+#   18-21. data flows, settings editor, leftovers (P6)
+#   22-25. the P6 security audit: pasted .env lines, empty Enter on a masked
+#          value, crafted child output, Ctrl-C at the result box, cleanup with
+#          a piped stdin, the restart after a saved setting
 #
 # Isolation (enforced here, not requested): every check runs in its OWN copy of
 # the repository's tracked files under a temp dir, with .env.example as .env, a
@@ -1797,6 +1801,239 @@ else
   bad "TUI did not start for the settings check"
 fi
 kill_pane t20
+
+# --- 22-26: P6 rework — the security audit at terminal level -----------------
+# open_setting <session> <KEY> <row label> — the settings list filtered to KEY,
+# that row opened (the setting's own menu: Edit value, Reveal value, ...)
+open_setting() {
+  local s="$1" key="$2" label="$3"
+  tmx send-keys -t "$s" /
+  wait_for "$s" "Filter settings:" || return 1
+  tmx send-keys -t "$s" -l "$key"
+  poll_until "$WAIT_T" prompt_cell_is "$s" "Filter settings:" "$key" || return 1
+  tmx send-keys -t "$s" Enter
+  wait_for "$s" " found" || return 1
+  goto_item "$s" "$label" || return 1
+  send_settled "$s" Enter
+  wait_for "$s" "Reveal value"
+}
+# left_joined <session> — the left pane's cells of the content rows, joined by
+# one blank (a message wrapped over several rows reads as one sentence)
+left_joined() {
+  local r all=""
+  while IFS= read -r r; do all+="$(left_cell "$r") "; done < <(capture "$1" | sed -n '3,$p')
+  tr -s ' ' <<<"$all"
+}
+left_has() { [[ "$(left_joined "$1")" == *"$2"* ]]; }
+
+section "22 pasted .env lines, empty Enter on a masked value (F1, F5)"
+new_sandbox t22
+seed_jsons "$SB"
+printf 'S3_SECRET_KEY=my secret value\n' >> "$SB/.env"   # stored invalid: unquoted spaces
+cp "$SB/.env" "$SB/.rig/env-before"
+t22_lines="$(grep -c '' "$SB/.env")"
+t22_npub="$(grep '^OWNER_NPUB=' "$SB/.env")"
+start_pane t22 120 30 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr'
+T22_CAPS="$SB/.rig/captures"
+: > "$T22_CAPS"
+grab22() { capture t22 >> "$T22_CAPS"; }
+if ! wait_for t22 "▸ s Start"; then
+  bad "TUI did not start for the paste check"
+else
+  send_settled t22 c
+  wait_for t22 "Add setting"
+  if open_setting t22 PRIVATE_RELAY_NAME "name" && goto_item t22 "Edit value"; then
+    prompt_open t22 "New value"
+    # the audit's payload, pasted (bracketed paste: tmux sends ESC[200~ … ESC[201~
+    # because the TUI asked for it); the \n are the two printable characters
+    tmx set-buffer -b t22 -- '"a"\nOWNER_NPUB=x\nY="b"'
+    tmx paste-buffer -p -d -b t22 -t t22
+    poll_until "$WAIT_T" prompt_cell_is t22 "New value:" '"a"\nOWNER_NPUB=x\nY="b"'
+    tmx send-keys -t t22 Enter
+    if poll_until "$WAIT_T" left_has t22 "A value that starts with a quote must end with the same quote"; then
+      ok "paste: the pasted \"a\"\\nOWNER_NPUB=x\\nY=\"b\" is refused at the prompt"
+    else
+      bad "paste: no refusal at the prompt ($(left_joined t22 | head -c 200))"
+    fi
+    tmx send-keys -t t22 Escape
+    wait_absent t22 "New value:"
+    if [[ "$(grep -c '' "$SB/.env")" == "$t22_lines" && "$(grep -c '^OWNER_NPUB=' "$SB/.env")" == 1 \
+      && "$(grep '^OWNER_NPUB=' "$SB/.env")" == "$t22_npub" ]] && cmp -s "$SB/.env" "$SB/.rig/env-before"; then
+      ok "paste: .env byte-identical ($t22_lines lines, one OWNER_NPUB line with its old value)"
+    else
+      bad "paste: .env changed ($(grep -c '' "$SB/.env") lines, $(grep -c '^OWNER_NPUB=' "$SB/.env") OWNER_NPUB lines)"
+    fi
+  else
+    bad "paste: PRIVATE_RELAY_NAME's Edit value not reachable"
+  fi
+  # F5: the stored S3_SECRET_KEY is invalid (unquoted spaces); Edit, then Enter on
+  # the empty field: no change, no validation, the value never drawn. Esc twice:
+  # back to the filtered list, then the filter cleared
+  send_settled t22 Escape
+  send_settled t22 Escape
+  wait_for t22 "Add setting"
+  if open_setting t22 S3_SECRET_KEY "secret key" && goto_item t22 "Edit value"; then
+    grab22
+    prompt_open t22 "New value"
+    grab22
+    tmx send-keys -t t22 Enter
+    grab22
+    if wait_absent t22 "New value:"; then
+      ok "empty Enter: the prompt closes at once (no change)"
+    else
+      bad "empty Enter: the prompt stayed open ($(left_joined t22 | head -c 160))"
+    fi
+    settle_after t22 "$(sync_n t22)"
+    grab22
+    if ! grep -qF 'my secret value' "$T22_CAPS" && ! grep -qF 'must be quoted' "$T22_CAPS"; then
+      ok "empty Enter: the clear value and a validation error appear in none of $(grep -c '' "$T22_CAPS") captured rows"
+    else
+      bad "empty Enter: the clear value or a validation error was drawn ($(grep -m1 -E 'my secret value|must be quoted' "$T22_CAPS" | head -c 120))"
+    fi
+    if cmp -s "$SB/.env" "$SB/.rig/env-before"; then ok "empty Enter: .env byte-identical"; else bad "empty Enter: .env changed"; fi
+  else
+    bad "empty Enter: S3_SECRET_KEY's Edit value not reachable"
+  fi
+  expect_calls t22 "F1/F5: nothing written, nothing restarted (no state-changing docker call)"
+fi
+kill_pane t22
+
+section "23 crafted output of a flow's child (F2)"
+flow_sandbox t23
+printf 'osc52 \033]52;c;SGVsbG8gd29ybGQ=\007 end\ncsi \2332J 8-bit and \302\2332J c1\nfake Backup written: backups/forged.zip (9 KiB, x)   ::result ok\n\033]2;PWNED-TITLE\007title\n' > "$SB/.rig/crafted"
+flow_pane t23 120 30 "MOCK_RUN_OUTPUT_FILE=$SB/.rig/crafted"
+tmx set -s set-clipboard on   # an OSC 52 that reaches tmux would create a buffer
+if ! wait_for t23 "▸ s Start"; then
+  bad "TUI did not start for the crafted-output check"
+else
+  t23_title="$(tmx display -p -t t23 '#{pane_title}')"
+  send_settled t23 b
+  wait_for t23 "Back up now? A verified"
+  tmx send-keys -t t23 Enter
+  if wait_for t23 "Backup finished" && wait_for t23 "Written and verified:"; then
+    raw="$(tmx capture-pane -p -e -t t23)"
+    if [[ "$raw" != *$'\e]'* && "$raw" != *$'\x9b'* && "$raw" != *$'\xc2\x9b'* && "$raw" != *"PWNED"* ]] \
+      && has_text t23 "osc52 end" && has_text t23 "csi 2J 8-bit and 2J c1"; then
+      ok "crafted output: shown as text, no OSC, 8-bit CSI or C1 CSI in capture-pane -e"
+    else
+      bad "crafted output: an escape reached the screen ($(printf '%s' "$raw" | LC_ALL=C grep -aoE $'\e\\][^\a]{0,20}|\x9b.{0,4}' | head -2 | od -c | head -2 | tr '\n' ' '))"
+    fi
+    if [[ -z "$(tmx list-buffers 2>/dev/null)" && "$(tmx display -p -t t23 '#{pane_title}')" == "$t23_title" ]]; then
+      ok "crafted output: no tmux buffer set (OSC 52), the pane title is unchanged (OSC 2)"
+    else
+      bad "crafted output: buffers [$(tmx list-buffers 2>/dev/null | head -1)], title [$(tmx display -p -t t23 '#{pane_title}')]"
+    fi
+    # the forged line stays text in the output pane; the box (left pane) must
+    # be built from the verb's own line
+    t23_box="$(left_joined t23)"
+    if [[ "$t23_box" == *"Written and verified: backups/haven-backup-"* && "$t23_box" != *forged* ]]; then
+      ok "crafted output: the box names the real backup, not the forged line"
+    else
+      bad "crafted output: the box took the forged line ($(head -c 160 <<<"$t23_box"))"
+    fi
+  else
+    bad "crafted output: no result box ($(capture t23 | tr '\n' '|' | head -c 200))"
+  fi
+  expect_calls t23 "crafted output: the verb's sequence is unchanged (stop, backup run, start)" \
+    "$T_STOP" "$T_RUN ${T_BK}haven-backup-TS.zip.partial-X" "$T_START"
+fi
+kill_pane t23
+
+section "24 Ctrl-C at the result box, cleanup with a piped stdin (F4)"
+# The window "child reaped, box not yet dismissed" made deterministic: the box
+# waits for a key, so once its title is on screen the child has been reaped
+# (tui_flow_run waited for it) and the box is still up — Ctrl-C lands inside it.
+flow_sandbox t24
+flow_pane t24 120 30 ""
+if ! wait_for t24 "▸ s Start"; then
+  bad "TUI did not start for the Ctrl-C check"
+else
+  send_settled t24 b
+  wait_for t24 "Back up now? A verified"
+  tmx send-keys -t t24 Enter
+  if wait_for t24 "Backup finished"; then
+    send_settled t24 C-c
+    send_settled t24 C-c
+    if tui_pid_found t24 && has_text t24 "Backup finished" && [[ "$(tmx display -p -t t24 '#{alternate_on}')" == 1 ]]; then
+      ok "Ctrl-C at the result box: the TUI keeps running and the box stays"
+    else
+      bad "Ctrl-C at the result box: TUI pid $(tui_pid t24 || echo gone), alternate_on $(tmx display -p -t t24 '#{alternate_on}' 2>/dev/null)"
+    fi
+    send_settled t24 x
+    if wait_for t24 "▸ s Start"; then
+      t24_pid="$(tui_pid t24)"
+      tmx send-keys -t t24 C-c
+      t24_gone() { ! kill -0 "$t24_pid" 2>/dev/null; }
+      if [[ -n "$t24_pid" ]] && poll_until "$WAIT_T" t24_gone; then
+        ok "after the box is dismissed Ctrl-C quits the TUI again"
+      else
+        bad "after the box Ctrl-C did not quit the TUI"
+      fi
+    else
+      bad "the box did not close with a key"
+    fi
+  else
+    bad "Ctrl-C check: no result box"
+  fi
+  if [[ -f "$SB/.rig/stderr" && ! -s "$SB/.rig/stderr" ]]; then
+    ok "Ctrl-C check: TUI stderr is 0 bytes"
+  else
+    bad "Ctrl-C check: TUI stderr $(wc -c < "$SB/.rig/stderr" 2>/dev/null) bytes: $(head -c 120 "$SB/.rig/stderr" 2>/dev/null | tr '\n' '|')"
+  fi
+  expect_calls t24 "Ctrl-C check: the backup's sequence only (stop, backup run, start)" \
+    "$T_STOP" "$T_RUN ${T_BK}haven-backup-TS.zip.partial-X" "$T_START"
+fi
+kill_pane t24
+new_sandbox t24c
+# tui_init in a subshell, then tui_cleanup with stdin from a pipe and no EXIT
+# trap to mend it: the terminal modes and the alternate screen must be back
+SYNC=0 start_pane t24c 80 24 "$SB" 'b0="$(stty -g)"; ( source ./haven; tui_init; trap - EXIT INT TERM; echo x | tui_cleanup ); echo "rc=$?" > @RIG@/rc.tmp; b1="$(stty -g)"; [ "$b0" = "$b1" ] && echo same > @RIG@/stty || echo differ > @RIG@/stty; mv @RIG@/rc.tmp @RIG@/rc; sleep 30'
+if poll_until "$WAIT_T" test -s "$SB/.rig/rc"; then
+  alt="$(tmx display -p -t t24c '#{alternate_on}')"
+  if [[ "$(cat "$SB/.rig/rc")" == rc=0 && "$alt" == 0 && "$(cat "$SB/.rig/stty")" == same ]]; then
+    ok "tui_cleanup with a piped stdin: rc 0, alternate screen off, terminal modes restored"
+  else
+    bad "tui_cleanup with a piped stdin: $(cat "$SB/.rig/rc"), alternate_on=$alt, stty $(cat "$SB/.rig/stty")"
+  fi
+else
+  bad "tui_cleanup check did not finish"
+fi
+kill_pane t24c
+
+section "25 restart after a saved setting keeps the frame"
+new_sandbox t25
+seed_jsons "$SB"
+T25_DOWN="compose -f SB/docker-compose.yml down --remove-orphans"
+T25_UP="compose -f SB/docker-compose.yml up -d --build"
+start_pane t25 120 30 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr'
+if ! wait_for t25 "▸ s Start"; then
+  bad "TUI did not start for the restart-frame check"
+else
+  send_settled t25 c
+  wait_for t25 "Add setting"
+  if open_setting t25 PRIVATE_RELAY_NAME "name" && goto_item t25 "Edit value"; then
+    prompt_open t25 "New value"
+    tmx send-keys -t t25 -l '"Renamed relay"'
+    poll_until "$WAIT_T" prompt_cell_is t25 "New value:" '"Renamed relay"'
+    tmx send-keys -t t25 Enter
+    if poll_until "$WAIT_T" left_has t25 ".env was saved and the relay restarted"; then
+      settle_after t25 "$(sync_n t25)"
+      geometry_case t25 120 30 "after the restart of a saved setting"
+      if no_text t25 "STATUS" && no_text t25 "Up 2 hours" && no_text t25 "Starting services"; then
+        ok "restart: none of compose's output (ps lines with a tab) is on the screen"
+      else
+        bad "restart: compose output on the screen ($(capture t25 | grep -m1 -E 'STATUS|Up 2|Starting' | head -c 100))"
+      fi
+    else
+      bad "restart: no result box after the save ($(capture t25 | tr '\n' '|' | head -c 200))"
+    fi
+  else
+    bad "restart: PRIVATE_RELAY_NAME's Edit value not reachable"
+  fi
+  grep -qx 'PRIVATE_RELAY_NAME="Renamed relay"' "$SB/.env" || bad "restart: the value did not reach .env"
+  expect_calls t25 "restart: down, then up (as before)" "$T25_DOWN" "$T25_UP"
+fi
+kill_pane t25
 
 section "21 leftovers"
 new_sandbox t21

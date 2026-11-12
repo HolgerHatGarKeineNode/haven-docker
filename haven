@@ -461,9 +461,11 @@ tui_cleanup() {
     return 0
   fi
   stop_log_stream || true
-  tui_disable_bracketed_paste
+  tui_disable_bracketed_paste || true
+  # the terminal by name: inside a `done < <(…)` loop stdin is a pipe, stty on
+  # it fails, and under errexit the rest of the cleanup (rmcup) never ran
   if [[ -n "$TUI_STTY_ORIG" ]]; then
-    stty "$TUI_STTY_ORIG"
+    stty "$TUI_STTY_ORIG" </dev/tty 2>/dev/null || true
     TUI_STTY_ORIG=""
   fi
   tput cnorm 2>/dev/null || true
@@ -1160,10 +1162,13 @@ tui_prompt() {
 
     # Enter → confirm (validate inline when a validator is set)
     if [[ -z "$ch" || "$ch" == $'\n' || "$ch" == $'\r' ]]; then
-      if [[ -z "$PI_TEXT" && -n "$default" ]]; then
+      # an empty field means "no change": the default comes back as it is,
+      # neither validated nor drawn
+      if [[ -z "$PI_TEXT" ]]; then
         PI_TEXT="$default"
+        break
       fi
-      if [[ -n "$validator" && -n "$PI_TEXT" ]]; then
+      if [[ -n "$validator" ]]; then
         VALIDATION_ERROR=""
         PROMPT_RESULT=""
         if "$validator" "$PI_TEXT"; then
@@ -1364,21 +1369,26 @@ tui_message() {
   TUI_FOOTER=""
 }
 
+# info, success, warn and die print the message with %s, never %b: messages
+# carry file names, paths, arguments and tool output, where %b would turn a
+# literal "\033", "\a" or "\n" into a control byte or an extra line (a backup
+# named "-\033]52;c;<b64>\a.zip" set the terminal's clipboard through die).
+# %b is kept for the script's own colour constants only.
 info() {
-  printf "%b\n" "${CLR_BLUE}INFO${CLR_RESET} $*"
+  printf "%b%s\n" "${CLR_BLUE}INFO${CLR_RESET} " "$*"
 }
 
 success() {
-  printf "%b\n" "${CLR_GREEN}OK${CLR_RESET} $*"
+  printf "%b%s\n" "${CLR_GREEN}OK${CLR_RESET} " "$*"
 }
 
 warn() {
-  printf "%b\n" "${CLR_YELLOW}WARN${CLR_RESET} $*"
+  printf "%b%s\n" "${CLR_YELLOW}WARN${CLR_RESET} " "$*"
 }
 
-# The *_plain variants print the message with %s: for text that carries file
-# names, paths or tool output, where %b would turn a literal "\033" into an
-# escape sequence. Pass foreign strings through printable_text first.
+# The *_plain variants are the same as the above since info, success and warn
+# print with %s; they stay for the call sites that pass text through
+# printable_text (a raw control byte in it becomes "?").
 info_plain() {
   printf "%b%s\n" "${CLR_BLUE}INFO${CLR_RESET} " "$*"
 }
@@ -1404,7 +1414,7 @@ die() {
   if [[ "${TUI_ACTIVE:-0}" == "1" ]]; then
     tui_cleanup
   fi
-  printf "%b\n" "${CLR_RED}ERROR${CLR_RESET} $*" >&2
+  printf "%b%s\n" "${CLR_RED}ERROR${CLR_RESET} " "$*" >&2
   exit 1
 }
 
@@ -1596,25 +1606,119 @@ replace_file_from() {
   return 0
 }
 
+# env_value_has_control <text> — true when <text> holds a control character
+# (C0 incl. CR, LF, ESC and TAB, DEL, or C1): no .env value may carry one. A
+# line break in a value is a new .env line — a pasted "a\nOWNER_NPUB=…" used to
+# add a line Compose reads — and ESC reaches the terminal of whoever shows it.
+env_value_has_control() {
+  [[ "$1" == *[[:cntrl:]]* ]]
+}
+
+# env_key_stats <file> <key> — _ENV_LINES (records in <file>), _ENV_KEY_LINES
+# (lines that set <key>) and _ENV_LAST (the raw text after "<key>=" on the last
+# of them, the line Compose uses), compared literally: the key is no pattern.
+env_key_stats() {
+  local out
+  # shellcheck disable=SC2016  # an awk program: $0 belongs to awk, not to the shell
+  out="$(HAVEN_K="$2" awk '
+    BEGIN { key = ENVIRON["HAVEN_K"]; klen = length(key) }
+    {
+      t = $0
+      if (substr(t, 1, klen + 1) != key "=") { if (!sub(/^[ \t]*export[ \t]+/, "", t) || substr(t, 1, klen + 1) != key "=") next }
+      n++; last = substr(t, klen + 2)
+    }
+    END { printf "%d\t%d\t%s", NR, n, last }
+  ' "$1" 2>/dev/null)" || return 1
+  IFS=$'\t' read -r _ENV_LINES _ENV_KEY_LINES _ENV_LAST <<<"$out" || true
+}
+
+# env_write_check <file> <snapshot> <want lines> <want key lines> <key> [<value>]
+# — after a write: <file> must have <want lines> records and <want key lines>
+# lines for <key> (and, with <value>, <value> on the last of them, byte for
+# byte); otherwise <snapshot> (the file before the write) is put back and the
+# check fails with REPLACE_ERR set. A value that slipped a line break past the
+# checks, or a writer that went wrong, never stays in .env.
+env_write_check() {
+  local file="$1" snap="$2" want="$3" want_k="$4" key="$5"
+  if env_key_stats "$file" "$key" && [[ "$_ENV_LINES" == "$want" && "$_ENV_KEY_LINES" == "$want_k" ]] \
+    && { (( $# < 6 )) || [[ "$_ENV_LAST" == "$6" ]]; }; then
+    return 0
+  fi
+  if cat -- "$snap" > "$file" 2>/dev/null; then
+    REPLACE_ERR="${file#"$ROOT_DIR/"} came out different from what was written for $key ($want lines expected, ${_ENV_LINES:-?} found, ${_ENV_KEY_LINES:-?} for $key); the file before the write was put back"
+  else
+    REPLACE_ERR="${file#"$ROOT_DIR/"} came out different from what was written for $key, and the file before the write could not be put back: restore it from ${file##*/}.bak.<time>"
+  fi
+  return 1
+}
+
+# set_env_var <key> <value> — <key>=<value> into .env, the value byte for byte
+# (awk reads key and value from its environment, which processes no escapes: a
+# typed "\n" stays a backslash and an n). A key that is in .env more than once
+# gets the new value on its LAST line, the one Compose uses; the earlier ones
+# stay as they are. A value with a control character is refused, and after the
+# write the file must have the same lines as before (one more for a new key),
+# or it is put back (env_write_check).
 set_env_var() {
   local key="$1"
   local value="$2"
   local env_file="$ROOT_DIR/.env"
+  local snap lines keys rc=0
+
+  if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    warn_plain "Not written: $(printable_text "$key") is not a valid key name."
+    return 1
+  fi
+  if env_value_has_control "$value"; then
+    warn "Not written: the value for $key contains a control character (a line break, tab or escape)."
+    return 1
+  fi
 
   if [[ ! -f "$env_file" ]]; then
     touch "$env_file"
   else
     backup_config_file "$env_file"
   fi
+  if ! env_key_stats "$env_file" "$key"; then
+    warn "cannot read ${env_file#"$ROOT_DIR/"}; it was not changed"
+    return 1
+  fi
+  lines="$_ENV_LINES" keys="$_ENV_KEY_LINES"
+  if ! snap="$(umask 077 && mktemp "$env_file.pre.XXXXXX" 2>/dev/null)" || ! cat -- "$env_file" > "$snap"; then
+    [[ -z "${snap:-}" ]] || rm -f -- "$snap"
+    warn "cannot create a temporary file next to ${env_file#"$ROOT_DIR/"}; it was not changed"
+    return 1
+  fi
 
   # shellcheck disable=SC2016  # an awk program: $0 belongs to awk, not to the shell
-  if ! replace_file_from "$env_file" awk -v key="$key" -v value="$value" '
-    BEGIN { found=0 }
-    $0 ~ "^[ \t]*export[ \t]+" key "=" { print "export " key "=" value; found=1; next }
-    $0 ~ "^" key "=" { print key "=" value; found=1; next }
+  if ! replace_file_from "$env_file" env HAVEN_K="$key" HAVEN_V="$value" awk '
+    function match_kind(line,    t) {
+      if (substr(line, 1, klen + 1) == key "=") return 1
+      t = line
+      if (sub(/^[ \t]*export[ \t]+/, "", t) && substr(t, 1, klen + 1) == key "=") return 2
+      return 0
+    }
+    BEGIN { key = ENVIRON["HAVEN_K"]; value = ENVIRON["HAVEN_V"]; klen = length(key) }
+    NR == FNR { if (match_kind($0)) last = FNR; next }
+    FNR == last {
+      if (match_kind($0) == 2) print "export " key "=" value
+      else print key "=" value
+      next
+    }
     { print }
-    END { if (!found) print key "=" value }
-  ' "$env_file"; then
+    END { if (!last) print key "=" value }
+  ' "$env_file" "$env_file"; then
+    rm -f -- "$snap"
+    warn "$REPLACE_ERR"
+    return 1
+  fi
+  if (( keys == 0 )); then
+    env_write_check "$env_file" "$snap" $((lines + 1)) 1 "$key" "$value" || rc=1
+  else
+    env_write_check "$env_file" "$snap" "$lines" "$keys" "$key" "$value" || rc=1
+  fi
+  rm -f -- "$snap"
+  if (( rc )); then
     warn "$REPLACE_ERR"
     return 1
   fi
@@ -1781,6 +1885,29 @@ ensure_json_file_value() {
   return 1
 }
 
+# env_value_quotes_ok <raw> — false for a value that starts with a quote but is
+# not one quoted string to its end: Compose reads a double-quoted value up to
+# the first unescaped ", a single-quoted one up to the next ', and refuses the
+# whole file when anything follows on the line ("a"\nX="b" typed as text).
+env_value_quotes_ok() {
+  local v="$1" q inner
+  case "${v:0:1}" in
+    \"|\') q="${v:0:1}" ;;
+    *) return 0 ;;
+  esac
+  (( ${#v} >= 2 )) && [[ "${v: -1}" == "$q" ]] || return 1
+  inner="${v:1:${#v}-2}"
+  if [[ "$q" == "'" ]]; then
+    [[ "$inner" != *"'"* ]]
+    return
+  fi
+  # escape pairs first (\\ and \"), then no bare " may be left and no
+  # backslash that would escape the closing quote
+  inner="${inner//\\\\/}"
+  inner="${inner//\\\"/}"
+  [[ "$inner" != *\"* && "$inner" != *\\ ]]
+}
+
 validate_env_value() {
   local key="$1"
   local raw="$2"
@@ -1792,6 +1919,16 @@ validate_env_value() {
 
   if [[ -n "$raw" ]]; then
     value="$(strip_quotes "$raw")"
+  fi
+
+  # every key: a value is one .env line, and its quotes are Compose's
+  if env_value_has_control "$raw"; then
+    VALIDATION_ERROR="No line breaks, tabs or other control characters in a value."
+    return 1
+  fi
+  if ! env_value_quotes_ok "$raw"; then
+    VALIDATION_ERROR="A value that starts with a quote must end with the same quote and hold no other one (inside double quotes write \\\" for a quote)."
+    return 1
   fi
 
   if value_has_unquoted_spaces "$raw"; then
@@ -2133,14 +2270,38 @@ list_env_keys() {
 remove_env_var() {
   local key="$1"
   local env_file="$ROOT_DIR/.env"
+  local snap lines keys rc=0
   [[ -f "$env_file" ]] || return 1
   backup_config_file "$env_file"
+  if ! env_key_stats "$env_file" "$key"; then
+    warn "cannot read ${env_file#"$ROOT_DIR/"}; it was not changed"
+    return 1
+  fi
+  lines="$_ENV_LINES" keys="$_ENV_KEY_LINES"
+  if ! snap="$(umask 077 && mktemp "$env_file.pre.XXXXXX" 2>/dev/null)" || ! cat -- "$env_file" > "$snap"; then
+    [[ -z "${snap:-}" ]] || rm -f -- "$snap"
+    warn "cannot create a temporary file next to ${env_file#"$ROOT_DIR/"}; it was not changed"
+    return 1
+  fi
+  # every line of the key goes (the key is compared literally, from awk's
+  # environment: no escape processing, no pattern)
   # shellcheck disable=SC2016  # an awk program: $0 belongs to awk, not to the shell
-  if ! replace_file_from "$env_file" awk -v key="$key" '
-    $0 ~ "^[ \t]*export[ \t]+" key "=" { next }
-    $0 ~ "^" key "=" { next }
-    { print }
+  if ! replace_file_from "$env_file" env HAVEN_K="$key" awk '
+    BEGIN { key = ENVIRON["HAVEN_K"]; klen = length(key) }
+    {
+      t = $0
+      if (substr(t, 1, klen + 1) == key "=") next
+      if (sub(/^[ \t]*export[ \t]+/, "", t) && substr(t, 1, klen + 1) == key "=") next
+      print
+    }
   ' "$env_file"; then
+    rm -f -- "$snap"
+    warn "$REPLACE_ERR"
+    return 1
+  fi
+  env_write_check "$env_file" "$snap" $((lines - keys)) 0 "$key" || rc=1
+  rm -f -- "$snap"
+  if (( rc )); then
     warn "$REPLACE_ERR"
     return 1
   fi
@@ -5042,6 +5203,67 @@ log_sanitize_line() {
   done
 }
 
+# strip_terminal_controls <line> — _STRIPPED: <line> with every escape sequence
+# removed (CSI, the OSC/DCS/SOS/PM/APC strings up to BEL or ESC \, two-byte
+# ESC sequences) and every C0 control, DEL and C1 control (U+0080..U+009F, and
+# a stray byte that is no UTF-8, such as an 8-bit CSI 0x9B) dropped; a tab
+# becomes two blanks. For the output of a child the TUI draws: nothing in it
+# may reach the terminal as a control (an OSC 52 sets the clipboard). A line
+# of printable characters only takes the fast path.
+strip_terminal_controls() {
+  local s="${1//$'\t'/  }"
+  if [[ "$s" =~ ^[[:print:]]*$ ]]; then
+    _STRIPPED="$s"
+    return 0
+  fi
+  # byte by byte in the C locale; UTF-8 sequences are decoded to tell a C1
+  # character (C2 80..C2 9F) from a printable one
+  # shellcheck disable=SC2016  # an awk program: $0 belongs to awk, not to the shell
+  _STRIPPED="$(printf '%s\n' "$s" | LC_ALL=C awk '
+    BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+    function b(j) { return (j <= n) ? ord[substr(line, j, 1)] + 0 : -1 }
+    {
+      line = $0; n = length(line); out = ""; i = 1
+      while (i <= n) {
+        c = b(i)
+        if (c == 27) {
+          d = b(i + 1)
+          if (d == 91) {                                   # CSI: params, intermediates, final
+            i += 2
+            while (i <= n && b(i) >= 32 && b(i) <= 63) i++
+            if (i <= n && b(i) >= 64 && b(i) <= 126) i++
+          } else if (d == 93 || d == 80 || d == 88 || d == 94 || d == 95) {   # a string
+            i += 2
+            while (i <= n) {
+              e = b(i)
+              if (e == 7) { i++; break }
+              if (e == 27) { i += (b(i + 1) == 92) ? 2 : 1; break }
+              i++
+            }
+          } else if (d >= 32 && d <= 47) {                 # intermediates, then the final
+            i += 2
+            while (i <= n && b(i) >= 32 && b(i) <= 47) i++
+            if (i <= n) i++
+          } else if (d >= 48 && d <= 126) {
+            i += 2
+          } else {
+            i++
+          }
+          continue
+        }
+        if (c < 32 || c == 127) { i++; continue }
+        if (c < 128) { out = out substr(line, i, 1); i++; continue }
+        k = (c >= 194 && c <= 223) ? 1 : (c >= 224 && c <= 239) ? 2 : (c >= 240 && c <= 244) ? 3 : 0
+        ok = (k > 0)
+        for (j = 1; ok && j <= k; j++) { e = b(i + j); if (e < 128 || e > 191) ok = 0 }
+        if (!ok) { i++; continue }                         # no UTF-8: a stray byte
+        if (c == 194 && b(i + 1) <= 159) { i += 2; continue }   # C1 control
+        out = out substr(line, i, k + 1); i += k + 1
+      }
+      printf "%s", out
+    }')"
+}
+
 log_append() {
   local line="$1"
   LOG_LINES+=("$line")
@@ -5380,7 +5602,8 @@ tui_setting_details() {
   fi
   while IFS= read -r line; do DETAIL_LINES+=("$line"); done < <(printf '%s\n' "$v" | tui_wrap "$w")
   DETAIL_LINES+=("")
-  v="$(read_env_var "$key" 2>/dev/null | head -n 1 || true)"
+  env_effective_value "$key"
+  v="$_EFFECTIVE"
   env_stored_value_note "$key" "$v"
   settings_shown_value "$key" "$v"
   v="$_SHOWN"
@@ -5391,6 +5614,9 @@ tui_setting_details() {
   fi
   detail_field "Current" "$v" "$TUI_BOLD"
   [[ -z "$_STORED_NOTE" ]] || detail_field "" "$_STORED_NOTE" "$TUI_FG_LOG_WARN"
+  if (( _EFFECTIVE_LINES > 1 )); then
+    detail_field "" "$key is in .env $_EFFECTIVE_LINES times; Compose uses the last line, shown here, and Edit changes that line only." "$TUI_FG_LOG_WARN"
+  fi
   env_rule_text "$key"
   [[ -z "$_RULE" ]] || detail_field "Allowed" "$_RULE"
   if [[ -n "${EX_SEC[$key]+x}" ]]; then
@@ -5680,7 +5906,7 @@ pause() {
 
 print_header() {
   printf "%b\n" "${CLR_BLUE}Haven Control${CLR_RESET}"
-  printf "%b\n\n" "${CLR_DIM}$ROOT_DIR${CLR_RESET}"
+  printf "%b%s%b\n\n" "$CLR_DIM" "$ROOT_DIR" "$CLR_RESET"
 }
 
 show_help_screen() {
@@ -5898,6 +6124,16 @@ mask_env_value() {
   fi
 }
 
+# env_effective_value <key> — _EFFECTIVE: the raw value of the LAST line that
+# sets <key> in .env (the one Compose uses; read_env_var prints every line),
+# _EFFECTIVE_LINES: how many lines set it.
+env_effective_value() {
+  _EFFECTIVE="$(read_env_var "$1" 2>/dev/null | tail -n 1 || true)"
+  _EFFECTIVE_LINES=0
+  [[ -f "$ROOT_DIR/.env" ]] && env_key_stats "$ROOT_DIR/.env" "$1" && _EFFECTIVE_LINES="$_ENV_KEY_LINES"
+  return 0
+}
+
 # settings_shown_value <key> <raw value> — _SHOWN: the value as the settings
 # editor shows it: without the quotes around it ("" stays for an empty quoted
 # value), masked for a credential (env_key_is_sensitive).
@@ -5915,21 +6151,47 @@ settings_shown_value() {
   _SHOWN="$v"
 }
 
-# env_key_is_sensitive <key> [value] — true for a credential: a key with one of
-# the words below as a whole "_"-separated word of its name, or any value that
-# is a Nostr secret key (nsec1…). Whole words, so the rate limiters'
-# *_TOKENS_PER_INTERVAL and *_MAX_TOKENS (counts, not credentials) stay visible
-# while S3_SECRET_KEY, S3_ACCESS_KEY_ID, an API_TOKEN or a DB_PASSWORD are
-# masked. Of .env.example's keys this masks S3_ACCESS_KEY_ID and S3_SECRET_KEY.
-ENV_SECRET_WORDS=" SECRET SECRETS PASSWORD PASSWD PASS PASSPHRASE TOKEN KEY APIKEY NSEC CREDENTIAL CREDENTIALS AUTH "
+# env_key_is_sensitive <key> [value] — true for a credential. By name: the key
+# is cut into words at "_" and at camelCase humps (apiToken: api, Token), case
+# ignored; it is a credential when a word ENDS in KEY, KEYS, TOKEN, SECRET,
+# SECRETS, PASSWORD, PASSWORDS, PASSWD, PASS, PASSPHRASE, PW or PWD (so
+# S3_SECRETKEY, APITOKEN, PRIVKEY, NGROK_AUTHTOKEN, DB_PWD), or a word IS one
+# of NSEC, SK, SEED, MNEMONIC, XPRV, MACAROON, RUNE, CREDENTIAL, CREDENTIALS,
+# AUTH, AUTHORIZATION, BUNKER, NWC or DSN. The word TOKENS is a count, not a
+# credential (*_TOKENS_PER_INTERVAL, *_MAX_TOKENS stay visible), and a key whose
+# last word is FILE, PATH or DIR holds a file path (IMPORT_SEED_RELAYS_FILE).
+# By value, whatever the key: a value that starts with nsec1 or ncryptsec1, is
+# exactly 64 hex characters, contains "secret=" (bunker://…, nostr+walletconnect
+# …) or is a URL with a user:password@ part. OWNER_NPUB and the other *_NPUB,
+# RELAY_URL, the *_ICON URLs, file paths and the limiters' numbers stay visible.
+# Of .env.example's keys this masks S3_ACCESS_KEY_ID and S3_SECRET_KEY.
+ENV_SECRET_ENDINGS=(KEY KEYS TOKEN SECRET SECRETS PASSWORD PASSWORDS PASSWD PASS PASSPHRASE PW PWD)
+ENV_SECRET_WORDS=" NSEC SK SEED MNEMONIC XPRV MACAROON RUNE CREDENTIAL CREDENTIALS AUTH AUTHORIZATION BUNKER NWC DSN "
 env_key_is_sensitive() {
-  local word v="${2:-}"
+  local word end k="$1" v="${2:-}" lv
   local -a words=()
+  # the value, without the quotes around it
+  if (( ${#v} >= 2 )) && { [[ "$v" == \"*\" ]] || [[ "$v" == \'*\' ]]; }; then
+    v="${v:1:${#v}-2}"
+  fi
   v="${v#[\"\']}"
-  [[ "${v,,}" == nsec1* ]] && return 0
-  IFS=_ read -ra words <<<"$1"
+  lv="${v,,}"
+  [[ "$lv" == nsec1* || "$lv" == ncryptsec1* || "$lv" == *secret=* ]] && return 0
+  [[ "$v" =~ ^[0-9A-Fa-f]{64}$ ]] && return 0
+  [[ "$v" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/@?#]*:[^/@?#]*@ ]] && return 0
+  # camelCase humps become "_" (only keys with a lower-case letter have any)
+  while [[ "$k" == *[a-z]* && "$k" =~ ^(.*[a-z0-9])([A-Z].*)$ ]]; do
+    k="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"
+  done
+  IFS=_ read -ra words <<<"${k^^}"
+  (( ${#words[@]} )) || return 1
+  case "${words[${#words[@]}-1]}" in FILE|PATH|DIR) return 1 ;; esac
   for word in "${words[@]}"; do
-    [[ "$ENV_SECRET_WORDS" == *" ${word^^} "* ]] && return 0
+    [[ -n "$word" && "$word" != TOKENS ]] || continue
+    [[ "$ENV_SECRET_WORDS" == *" $word "* ]] && return 0
+    for end in "${ENV_SECRET_ENDINGS[@]}"; do
+      [[ "$word" == *"$end" ]] && return 0
+    done
   done
   return 1
 }
@@ -6005,18 +6267,25 @@ env_example_load() {
 }
 
 # env_values_load — ENV_ORDER (keys of .env in file order, as list_env_keys
-# reads them) and ENV_VALUE (key -> raw value of its first line, as
-# read_env_var reads it), in one pass.
+# reads them), ENV_VALUE (key -> raw value of its LAST line, the one Compose
+# uses, as read_env_var reads it) and ENV_COUNT (key -> lines that set it), in
+# one pass.
 ENV_ORDER=()
 declare -A ENV_VALUE=()
+declare -A ENV_COUNT=()
 env_values_load() {
   local key value
-  ENV_ORDER=() ENV_VALUE=()
+  ENV_ORDER=() ENV_VALUE=() ENV_COUNT=()
   [[ -f "$ROOT_DIR/.env" ]] || return 0
   while IFS=$'\t' read -r key value; do
-    [[ -n "${ENV_VALUE[$key]+x}" ]] && continue
+    if [[ -n "${ENV_VALUE[$key]+x}" ]]; then
+      ENV_VALUE[$key]="$value"
+      ENV_COUNT[$key]=$(( ${ENV_COUNT[$key]} + 1 ))
+      continue
+    fi
     ENV_ORDER+=("$key")
     ENV_VALUE[$key]="$value"
+    ENV_COUNT[$key]=1
   done < <(awk '
     function strip_inline(v,    i, c, quote, out) {
       quote = ""; out = ""
@@ -6188,6 +6457,7 @@ settings_rows() {
     for k in "${here[@]}"; do
       settings_shown_value "$k" "${ENV_VALUE[$k]}"
       v="$_SHOWN"
+      (( ${ENV_COUNT[$k]:-1} > 1 )) && v="(${ENV_COUNT[$k]}×) $v"
       MENU_IDS+=("key:$k") MENU_LABELS+=("${SET_LABEL[$k]}") MENU_VALUES+=("$v")
       n=$((n + 1))
     done
@@ -6201,6 +6471,7 @@ settings_rows() {
     for k in "${other[@]}"; do
       settings_shown_value "$k" "${ENV_VALUE[$k]}"
       v="$_SHOWN"
+      (( ${ENV_COUNT[$k]:-1} > 1 )) && v="(${ENV_COUNT[$k]}×) $v"
       MENU_IDS+=("key:$k") MENU_LABELS+=("${SET_LABEL[$k]}") MENU_VALUES+=("$v")
       n=$((n + 1))
     done
@@ -6667,6 +6938,7 @@ TASK_RELAY_TEXT=""      # running state: what happens to the relay
 TASK_KEYS_TEXT=""       # running state: what the keys do
 TASK_CTRLC_HINT=""      # the bottom row's word for Ctrl-C
 TUI_TASK_ACTIVE=0
+FLOW_SAVED_INT=""        # the INT trap before tui_flow_run, put back by tui_flow_finish
 FLOW_RELAY="unknown"    # running | stopped | unknown: the relay when the flow began
 
 # tui_flow_relay_now — FLOW_RELAY from the state the main view last showed
@@ -6729,9 +7001,12 @@ tui_flow_elapsed() {
 # protocol lines into the step list and the result.
 tui_flow_take() {
   local line="$1" n
-  log_sanitize_line "$line"
-  line="$_SANITIZED"
+  strip_terminal_controls "$line"
+  line="$_STRIPPED"
   TASK_LINES+=("$line")
+  # a protocol line is one the verb printed as such: "::" as its first bytes,
+  # not a line that only starts with "::" once its escapes are gone
+  [[ "$1" == ::* ]] || return 0
   if [[ "$line" =~ ^::step\ ([0-9]+)/([0-9]+)\ (.+)$ ]]; then
     n="${BASH_REMATCH[1]}"
     TASK_STEP="$n"
@@ -6841,7 +7116,7 @@ tui_render_right_task() {
 # one-shot and starts the relay again. The TUI's own log stream pauses for
 # the duration. Sets TASK_RC, TASK_RESULT, TASK_STEPS, TASK_LINES.
 tui_flow_run() {
-  local kind="$1" title="$2" head="$3" saved_int saved_left="$TUI_LEFT_TITLE" redraw=1 now last=0
+  local kind="$1" title="$2" head="$3" saved_left="$TUI_LEFT_TITLE" redraw=1 now last=0
   shift 3
   local -a cmd=("$ROOT_DIR/$SCRIPT_NAME")
   [[ "$MODE" == tor ]] && cmd+=(--tor)
@@ -6854,8 +7129,11 @@ tui_flow_run() {
   TASK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/haven-task.XXXXXX")"
   : > "$TASK_DIR/out"
   printf -v TASK_T0 '%(%s)T' -1
-  saved_int="$(trap -p INT)"
-  trap 'TASK_INT=1; [[ -n "$TASK_PID" ]] && kill -INT "$TASK_PID" 2>/dev/null' INT
+  # Ctrl-C goes to the child while it runs and is ignored once it ended, until
+  # tui_flow_finish closed the result box and puts the TUI's own trap back
+  # (FLOW_SAVED_INT): a Ctrl-C in between must not quit the TUI.
+  FLOW_SAVED_INT="$(trap -p INT)"
+  trap 'TASK_INT=1; if [[ -n "$TASK_PID" ]]; then kill -INT "$TASK_PID" 2>/dev/null || true; fi' INT
   # A background job of a shell without job control ignores SIGINT and
   # cannot trap it; with -m the child keeps the default, gets its own process
   # group (the terminal's Ctrl-C reaches the TUI, which passes it on) and its
@@ -6903,7 +7181,6 @@ tui_flow_run() {
   TASK_FD=""
   rm -rf -- "$TASK_DIR"
   TASK_DIR=""
-  if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
   TUI_TASK_ACTIVE=0
   TUI_FOOTER=""
   TUI_LEFT_TITLE="$saved_left"
@@ -6921,6 +7198,9 @@ tui_flow_finish() {
   [[ -z "$first" ]] || text="$first"$'\n\n'"$text"
   TUI_LEFT_TITLE="Haven / ${TASK_TITLE:-$title}"
   tui_message "$title" "$text"
+  # the box is closed: Ctrl-C quits the TUI again (tui_flow_run)
+  if [[ -n "$FLOW_SAVED_INT" ]]; then eval "$FLOW_SAVED_INT"; else trap - INT; fi
+  FLOW_SAVED_INT=""
   TUI_RIGHT_MODE="${TUI_RIGHT_PREV_TASK:-logs}"
   [[ "$TUI_RIGHT_MODE" == task || "$TUI_RIGHT_MODE" == details ]] && TUI_RIGHT_MODE="logs"
   tui_set_view main
@@ -6951,7 +7231,8 @@ tui_flow_summary() {
 }
 
 # tui_flow_find <ERE> — _FOUND: the first output line of the verb that
-# matches (INFO/OK/WARN word dropped, paths relative), BASH_REMATCH set by
+# matches (every caller anchors its ERE at the start of the line: a sentence
+# inside a foreign name or path in the middle of a line never counts) (INFO/OK/WARN word dropped, paths relative), BASH_REMATCH set by
 # the match against it; false when there is none.
 tui_flow_find() {
   local line
@@ -6973,18 +7254,18 @@ tui_flow_find() {
 # back is said first). Empty when the verb said nothing about it.
 tui_flow_relay_note() {
   _RELAY_NOTE=""
-  if tui_flow_find 'relay is NOT running|relay did not start|relay was not started'; then
+  if tui_flow_find '^The relay is NOT running|^The relay did not start|^The relay was not started'; then
     if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
       # an unfinished switch blocks every start until it is undone
       _RELAY_NOTE="The relay is NOT running; it can start once the switch is undone."
     else
       _RELAY_NOTE="The relay is NOT running: start it with s in the main view."
     fi
-  elif tui_flow_find 'The relay is running on ([a-z]+)\.|The relay is running \(([a-z]+)\)'; then
+  elif tui_flow_find '^The relay is running on ([a-z]+)\.|^The relay is running \(([a-z]+)\)'; then
     _RELAY_NOTE="The relay is running on ${BASH_REMATCH[1]:-${BASH_REMATCH[2]}}."
   elif tui_flow_find '^The relay is running\.$|^Starting the relay again'; then
     _RELAY_NOTE="The relay is running again."
-  elif tui_flow_find 'relay was not running'; then
+  elif tui_flow_find '^The relay was not running'; then
     _RELAY_NOTE="The relay was not running and stays stopped."
   elif ! tui_flow_find '^Stopping the relay'; then
     _RELAY_NOTE="The relay was not touched."
@@ -7015,7 +7296,7 @@ tui_flow_box() {
       if tui_flow_find '^Switched the relay database from ([a-z]+) to ([a-z]+)\.'; then
         local from="${BASH_REMATCH[1]}" to="${BASH_REMATCH[2]}"
         box="The relay database moved from $from to $to.${nl}$_RELAY_NOTE"
-        if tui_flow_find 'directories are kept in (db/[^ ]+)'; then
+        if tui_flow_find '^The old [a-z]+ directories are kept in (db/[^ ]+)'; then
           box+="${nl}${nl}The old $from data is kept in ${BASH_REMATCH[1]%.}"
         fi
         if tui_flow_find '^Backup of the old [a-z]+ database: ([^ ]+)'; then
@@ -7026,9 +7307,9 @@ tui_flow_box() {
       ;;
     switch:*:rolled-back|switch:*:failed)
       if (( TASK_STEP > 1 )); then
-        tui_flow_find 'The engine switch failed: (.+)$' && box="Cause: ${BASH_REMATCH[1]}${nl}"
+        tui_flow_find '^The engine switch failed: (.+)$' && box="Cause: ${BASH_REMATCH[1]}${nl}"
         box+="$_RELAY_NOTE"
-        if tui_flow_find 'failed run produced is kept in (db/[^ ]+)'; then
+        if tui_flow_find '^What the failed run produced is kept in (db/[^ ]+)'; then
           box+="${nl}${nl}What the failed run made is kept in ${BASH_REMATCH[1]%.}"
         fi
         [[ "$TASK_RESULT" == rolled-back ]] && box+="${nl}${nl}Next: fix the cause, then switch again."
@@ -7064,8 +7345,11 @@ tui_flow_backup() {
 }
 
 # tui_flow_backups_list — FLOW_FILES (newest first), FLOW_FILE_SIZE and
-# FLOW_FILE_TIME (by name) for the .zip files in backups/; FLOW_LIST_ERR when
-# the directory cannot be read.
+# FLOW_FILE_TIME (by name) for the .zip files in backups/ that the restore verb
+# accepts: regular files, no symlinks, and names that pass its own rule
+# (backup_normalize_name: letters, digits, . _ + -, not starting with "-"), so
+# a crafted name never reaches the screen or the verb; FLOW_LIST_ERR when the
+# directory cannot be read.
 FLOW_FILES=()
 declare -A FLOW_FILE_SIZE=()
 declare -A FLOW_FILE_TIME=()
@@ -7085,10 +7369,12 @@ tui_flow_backups_list() {
     FLOW_FILE_TIME[$name]="$t"
   done < <(
     for f in "$BACKUP_DIR"/*.zip; do
-      [[ -f "$f" ]] || continue
-      t="$(stat -L -c %Y "$f" 2>/dev/null || stat -L -f %m "$f" 2>/dev/null || echo 0)"
-      sz="$(stat -L -c %s "$f" 2>/dev/null || stat -L -f %z "$f" 2>/dev/null || echo 0)"
-      printf '%s\t%s\t%s\n' "$t" "$sz" "$(printable_text "${f##*/}")"
+      [[ -f "$f" && ! -L "$f" ]] || continue
+      backup_normalize_name "${f##*/}" >/dev/null 2>&1 || continue
+      [[ "$BACKUP_NAME" == "${f##*/}" ]] || continue
+      t="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+      sz="$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)"
+      printf '%s\t%s\t%s\n' "$t" "$sz" "$BACKUP_NAME"
     done | LC_ALL=C sort -t $'\t' -k1,1nr -k3,3
   )
 }
@@ -7532,11 +7818,14 @@ $(cat "$onion_torrc")"
         edit)
           local current=""
           local new_value=""
-          current="$(read_env_var "$CURRENT_ENV_KEY" 2>/dev/null || true)"
+          env_effective_value "$CURRENT_ENV_KEY"
+          current="$_EFFECTIVE"
           PROMPT_ENV_KEY="$CURRENT_ENV_KEY"
-          new_value="$(tui_prompt "New value:" "$current" _validate_prompt_env_value)"
-          # Esc, Ctrl-C and an empty Enter hand back the current value: nothing
-          # changed, so nothing is written and the relay is not restarted
+          # the current value is never handed to the prompt: it may be a
+          # credential, and a prompt draws what it holds (a refused value was
+          # redrawn in clear). Esc, Ctrl-C and an empty Enter mean no change:
+          # nothing is validated or written, the relay is not restarted.
+          new_value="$(tui_prompt "New value:" "" _validate_prompt_env_value)"
           if [[ -z "$new_value" || "$new_value" == "$current" ]]; then
             return 0
           fi
@@ -7547,7 +7836,8 @@ $(cat "$onion_torrc")"
         reveal)
           # Explicit reveal: the list view only ever shows masked values.
           local shown=""
-          shown="$(read_env_var "$CURRENT_ENV_KEY" 2>/dev/null || true)"
+          env_effective_value "$CURRENT_ENV_KEY"
+          shown="$_EFFECTIVE"
           if [[ -z "$shown" ]]; then
             shown="(empty)"
           fi
@@ -7957,12 +8247,75 @@ restart_after_env_change() {
     return 0
   fi
 
-  info "Restarting services ($mode) to apply .env changes..."
   # The start's preparation (missing JSON lists ask one dialog each) runs
   # BEFORE the stop: an unanswered dialog must not leave the relay down.
+  if [[ "$TUI_ACTIVE" == "1" ]]; then
+    tui_restart_captured "$mode"
+    return 0
+  fi
+  info "Restarting services ($mode) to apply .env changes..."
   prepare_start
   local START_PREPARED=1
   restart_services "$mode"
+}
+
+# tui_restart_captured <mode> — the restart after a saved setting, as the main
+# menu's Start and Restart run (tui_run_action): the output is captured, never
+# written over the frame, and the result is shown in a box — the warnings in
+# it, or the whole output when something failed. The start's preparation runs
+# first and captured too, except the one step that asks (a missing JSON list,
+# one dialog each), which needs the terminal; a refusal there leaves the relay
+# running.
+tui_restart_captured() {
+  local mode="$1" text="" line warns="" out streaming=0
+  if [[ "$FOLLOW_LOGS" == "1" ]]; then
+    stop_log_stream
+    streaming=1
+  fi
+  run_capture tui_prepare_start_quiet
+  out="$RUN_OUTPUT"
+  if [[ "$RUN_STATUS" -ne 0 ]]; then
+    text=".env was saved; the restart to apply it was not run: the start's checks failed (exit $RUN_STATUS). The relay keeps running with the settings it started with."
+  else
+    ensure_example_jsons
+    local START_PREPARED=1
+    run_capture restart_services "$mode"
+    out+="${out:+$'\n'}$RUN_OUTPUT"
+  fi
+  if [[ -n "$text" ]]; then
+    :
+  elif [[ "$RUN_STATUS" -ne 0 ]]; then
+    text=".env was saved; the restart to apply it failed (exit $RUN_STATUS)."
+  else
+    text=".env was saved and the relay restarted (${mode^}) to apply it."
+  fi
+  while IFS= read -r line; do
+    strip_terminal_controls "$line"
+    line="$_STRIPPED"
+    if [[ -n "$line" && ( "$RUN_STATUS" -ne 0 || "$line" == "WARN "* || "$line" == "ERROR "* ) ]]; then
+      warns+=$'\n'"${line//"$ROOT_DIR/"/}"
+    fi
+  done <<<"$out"
+  [[ -z "$warns" ]] || text+=$'\n'"$warns"
+  tui_message "Restart" "$text"
+  TUI_NEED_FRAME=1
+  TUI_NEED_MENU=1
+  TUI_NEED_LEFT=1
+  TUI_NEED_RIGHT=1
+  # the stream stopped above starts again; a paused log view stays as it was
+  (( streaming == 0 )) || start_log_stream
+}
+
+# tui_prepare_start_quiet — prepare_start without its dialog step
+# (ensure_example_jsons), for a captured run inside the TUI (run_capture, a
+# subshell): TUI_ACTIVE=0 there, so a die in it only ends the subshell and
+# does not restore the terminal under the running TUI.
+tui_prepare_start_quiet() {
+  TUI_ACTIVE=0
+  warn_missing_critical_env
+  ensure_docker_uid
+  ensure_data_dirs
+  warn_import_flag
 }
 
 menu_env_editor() {

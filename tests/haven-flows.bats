@@ -178,7 +178,7 @@ The relay is running (badger)." ]]
 fake_child() {
   cat > "$SB/haven" <<'SH'
 #!/usr/bin/env bash
-trap 'echo "child got INT"; exit 130' INT
+trap 'echo "child got INT"; : > "$(dirname "$0")/got-int"; exit 130' INT
 echo "::step 1/2 first"
 echo "args: $*"
 while [[ ! -e "$(dirname "$0")/release" ]]; do sleep 0.05; done
@@ -216,15 +216,25 @@ last line
     source '"$REPO_ROOT"'/haven; set +e
     ROOT_DIR='"$SB"' SCRIPT_NAME=haven FOLLOW_LOGS=0; tui_update_layout
     trap "echo TUI-would-quit" INT
-    ( sleep 1.5; kill -INT $$ ) &
+    # INT until the child has it: a single INT was lost now and then under
+    # parallel load (bats -j 8: the child never saw it and the test hung; the
+    # mechanism is not pinned down) — the run must not depend on one signal
+    ( sleep 1.5; for i in $(seq 100); do [[ -e '"$SB"'/got-int ]] && break; kill -INT $$; sleep 0.2; done ) &
+    sender=$!
     tui_flow_run backup "Back up now" "Backing up…" backup >/dev/null </dev/null
+    wait "$sender"
     echo "rc=$TASK_RC int=$TASK_INT"; printf "%s\n" "${TASK_LINES[@]}"
+    # until the result box is closed a Ctrl-C is ignored, then the TUI trap is back
+    kill -INT $$; echo "after the run: still here"
+    tui_message() { echo "box: $1"; }; tui_refresh_logs_view() { :; }
+    tui_flow_finish "Backup interrupted" "" >/dev/null 2>&1
     trap -p INT'
   echo "$output"
   [[ "$output" == "rc=130 int=1
 ::step 1/2 first
 args: backup
 child got INT
+after the run: still here
 trap -- 'echo TUI-would-quit' SIGINT" ]]
 }
 

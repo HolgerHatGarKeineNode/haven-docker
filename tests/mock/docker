@@ -37,6 +37,8 @@
 #                       one-shot container ends, so its held `run` returns) and
 #                       `docker stop|kill <name>` drops <name> from `running`
 #   MOCK_HOLD_AT=<n>    with MOCK_RUN_HOLD=1: hold only the n-th `run` (1-based)
+#   MOCK_RUN_OUTPUT_FILE=<file>  every `run` copies <file> to its stdout first,
+#                       byte for byte (crafted output: escapes, control bytes)
 #   MOCK_PAYLOAD_AT=<n> with MOCK_RUN_WRITES=1: the n-th `run` writes a copy of
 #   MOCK_PAYLOAD_AT_FILE instead of the usual payload (a second backup that
 #                       differs from the first)
@@ -161,6 +163,7 @@ mock_scripted() {
       [[ -f "$d/run-count" ]] && n="$(cat "$d/run-count")"
       n=$((n + 1))
       printf '%s' "$n" > "$d/run-count"
+      [[ -z "${MOCK_RUN_OUTPUT_FILE:-}" ]] || cat -- "$MOCK_RUN_OUTPUT_FILE"
       if [[ "${MOCK_RUN_HOLD:-0}" == "1" && ( -z "${MOCK_HOLD_AT:-}" || "$n" == "${MOCK_HOLD_AT:-}" ) ]]; then
         : > "$d/started"
         local waited=0 max="${MOCK_HOLD_MAX:-10}"
