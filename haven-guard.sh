@@ -51,6 +51,16 @@ if [ -n "$other_haven_pid" ]; then
     echo "       ./haven import" >&2
     echo >&2
     echo "   It stops the relay, imports once in the foreground, and starts the relay again." >&2
+  elif [ "${1:-}" = "backup" ]; then
+    echo >&2
+    echo "       ./haven backup" >&2
+    echo >&2
+    echo "   It stops the relay, writes a verified zip to backups/ in your checkout, and starts the relay again." >&2
+  elif [ "${1:-}" = "restore" ]; then
+    echo >&2
+    echo "       ./haven restore <file>" >&2
+    echo >&2
+    echo "   <file> is a zip in backups/ of your checkout. It stops the relay, adds the events that are missing, and starts the relay again." >&2
   else
     echo >&2
     echo "       ./haven stop" >&2
