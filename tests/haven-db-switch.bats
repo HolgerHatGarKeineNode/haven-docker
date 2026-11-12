@@ -1009,7 +1009,8 @@ editor_edit() { # <current db/ state is set up> <value>
   [[ "$output" == *"MESSAGE[DB_ENGINE] Not removed: without DB_ENGINE the relay runs lmdb. db/ holds badger data: use ./_ db-switch lmdb"* ]]
   cmp "$TEST_DIR/env.before" "$SB/.env"
 
-  # same value: accepted and written, no warning box
+  # same value: accepted and written, no warning box (the box after the save
+  # says what happened to the relay, nothing about the engine)
   run bash -c '
     source "$1"; set +e
     DOCKER_COMPOSE=(docker compose)
@@ -1019,7 +1020,8 @@ editor_edit() { # <current db/ state is set up> <value>
     tui_handle_enter; echo "rc=$?"
   ' _ "$SB/haven"
   echo "$output"
-  [[ "$output" != *"MESSAGE["* ]]
+  [[ "$output" != *"MESSAGE[DB_ENGINE]"* ]]
+  [[ "$output" == *"MESSAGE[Restart] .env was saved."* ]]
   grep -qx 'DB_ENGINE=badger' "$SB/.env"
 
   # empty db/: lmdb accepted and written, no warning box
@@ -1033,7 +1035,8 @@ editor_edit() { # <current db/ state is set up> <value>
     tui_handle_enter; echo "rc=$?"
   ' _ "$SB/haven"
   echo "$output"
-  [[ "$output" != *"MESSAGE["* ]]
+  [[ "$output" != *"MESSAGE[DB_ENGINE]"* ]]
+  [[ "$output" == *"MESSAGE[Restart] .env was saved."* ]]
   grep -qx 'DB_ENGINE=lmdb' "$SB/.env"
 }
 

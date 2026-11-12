@@ -234,7 +234,10 @@ good_payload() { export MOCK_RUN_WRITES=1 MOCK_RUN_PAYLOAD_FILE="$FIXTURES/good.
   cp "$FIXTURES/good.zip" "$SB/backups/good.zip"
   run hv restore good.zip
   [ "$status" -ne 0 ]
-  [[ "$output" == *"never deletes or duplicates"* ]]
+  [[ "$output" == *"deletes nothing"* ]]
+  # the measured duplicate behaviour (tests/real-docker blossom-list rows):
+  # notes skipped, the lmdb media index listed once more
+  [[ "$output" == *"Notes that are already there are skipped; on lmdb, a media index entry that is already there is listed once more"* ]]
   [[ "$output" == *"--yes"* ]]
   [ -z "$(state_changes)" ]
 

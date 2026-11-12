@@ -58,6 +58,9 @@
 #                       (and the TUI's producer-death restart does not fire, the
 #                       producer is alive). Works in both modes; unset or empty =
 #                       the endless counter stream (every 200 ms) below.
+#   MOCK_LOG_FILE=<file>  `compose logs` copies <file> to its stdout byte for byte
+#                       (crafted lines: escape strings, control bytes), then stays
+#                       attached and silent like MOCK_LOG_COUNT. Wins over it.
 # Without MOCK_LOG_COUNT `compose logs` keeps today's endless counter stream in
 # scripted mode.
 
@@ -278,6 +281,10 @@ case "${1:-}" in
       exit 2
     fi
     ( sleep 21777 ) &
+    if [[ -n "${MOCK_LOG_FILE:-}" ]]; then
+      cat -- "$MOCK_LOG_FILE"
+      wait   # attached and silent, as with MOCK_LOG_COUNT
+    fi
     n=0
     if [[ -n "${MOCK_LOG_COUNT:-}" ]]; then
       while (( n < MOCK_LOG_COUNT )); do

@@ -364,8 +364,17 @@ USAGE
 }
 
 tui_update_layout() {
-  TUI_COLS="$(tput cols 2>/dev/null || echo 80)"
-  TUI_LINES="$(tput lines 2>/dev/null || echo 24)"
+  local cols lines
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  lines="$(tput lines 2>/dev/null || echo 24)"
+  # a size that is no number (a tput killed by a signal prints nothing) keeps
+  # the previous one, or the default before there is one: every printf '%d'
+  # of the frame fails on an empty TUI_COLS
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols="${TUI_COLS:-0}"
+  [[ "$lines" =~ ^[0-9]+$ ]] || lines="${TUI_LINES:-0}"
+  [[ "$cols" =~ ^[1-9][0-9]*$ ]] || cols=80
+  [[ "$lines" =~ ^[1-9][0-9]*$ ]] || lines=24
+  TUI_COLS="$cols" TUI_LINES="$lines"
 
   if (( TUI_COLS < TUI_MIN_COLS || TUI_LINES < TUI_MIN_LINES )); then
     TUI_TOO_SMALL=1
@@ -446,13 +455,26 @@ tui_init() {
   export LC_CTYPE="${LC_CTYPE:-en_US.UTF-8}"
   TUI_ACTIVE=1
   TUI_STTY_ORIG="$(stty -g)"
+  TUI_STTY_EXIT="$TUI_STTY_ORIG"
   stty -echo -icanon time 0 min 0
   tput smcup
   tput civis
   tui_enable_bracketed_paste
   tui_update_layout
-  trap 'tui_cleanup' EXIT
+  # the terminal modes once more after the cleanup: a Ctrl-C or SIGTERM lands
+  # inside `read -rsn1` (tui_read_key), and the read builtin puts back the raw
+  # modes it saved AFTER the INT/TERM trap's stty — the shell was left
+  # -icanon -echo (measured in tmux, stty -g before/after). The EXIT trap runs
+  # once the read has unwound.
+  trap 'tui_cleanup; tui_restore_tty' EXIT
   trap 'tui_cleanup; exit 130' INT TERM
+}
+
+# tui_restore_tty — the terminal modes from before tui_init, by name (stdin may
+# be a pipe); for the EXIT trap, after tui_cleanup.
+TUI_STTY_EXIT=""
+tui_restore_tty() {
+  [[ -z "$TUI_STTY_EXIT" ]] || stty "$TUI_STTY_EXIT" </dev/tty 2>/dev/null || true
 }
 
 tui_cleanup() {
@@ -1501,11 +1523,17 @@ dc() {
   "${DOCKER_COMPOSE[@]}" -f "$compose_file" "$@"
 }
 
+# read_env_var <key> — the raw value (inline comment and trailing blanks cut)
+# of the LAST line that sets <key> in .env: Compose reads a key that is in the
+# file more than once with the value of its last line, so every reader in this
+# script goes through here and sees that value. The key is compared literally
+# (from awk's environment, no pattern). 1 when no line sets it.
 read_env_var() {
   local key="$1"
   local env_file="$ROOT_DIR/.env"
   [[ -f "$env_file" ]] || return 1
-  awk -v key="$key" '
+  # shellcheck disable=SC2016  # an awk program: $0 belongs to awk, not to the shell
+  HAVEN_K="$key" awk '
     function strip_inline(v,    i,c,quote,out) {
       quote=""
       out=""
@@ -1521,22 +1549,16 @@ read_env_var() {
       sub(/[ \t]+$/, "", out)
       return out
     }
-    $0 ~ "^[ \t]*export[ \t]+" key "=" {
-      line=$0
-      sub(/^[ \t]*export[ \t]+/, "", line)
-      sub(/^[^=]+=*/, "", line)
-      print strip_inline(line)
-      found=1
-      next
+    BEGIN { key = ENVIRON["HAVEN_K"]; klen = length(key) }
+    {
+      line = $0
+      if (substr(line, 1, klen + 1) != key "=") {
+        if (!sub(/^[ \t]*export[ \t]+/, "", line) || substr(line, 1, klen + 1) != key "=") next
+      }
+      last = strip_inline(substr(line, klen + 2))
+      found = 1
     }
-    $0 ~ "^" key "=" {
-      line=$0
-      sub(/^[^=]+=*/, "", line)
-      print strip_inline(line)
-      found=1
-      next
-    }
-    END {if(!found) exit 1}
+    END { if (!found) exit 1; print last }
   ' "$env_file"
 }
 
@@ -1572,6 +1594,7 @@ backup_config_file() {
 # returns 1 with REPLACE_ERR set and <file> untouched when any step fails,
 # including an owner that cannot be kept.
 REPLACE_ERR=""
+REPLACE_TMP=""
 replace_file_from() {
   local file="$1" tmp mode owner cur
   shift
@@ -1586,6 +1609,7 @@ replace_file_from() {
     REPLACE_ERR="cannot create a temporary file next to ${file#"$ROOT_DIR/"}; it was not changed"
     return 1
   fi
+  REPLACE_TMP="$tmp"   # for writer_guard's EXIT path; gone after the mv or an rm below
   # shellcheck disable=SC2094  # chmod narrows the file the redirection already opened; nothing reads it
   if ! { chmod "$(printf '%o' $(( 8#$mode & 8#600 )))" "$tmp" 2>/dev/null && "$@"; } > "$tmp"; then
     rm -f -- "$tmp" 2>/dev/null
@@ -1652,14 +1676,75 @@ env_write_check() {
   return 1
 }
 
+# writer_guard_on / writer_guard_off — around a rewrite of .env (set_env_var,
+# remove_env_var): INT, TERM and HUP that arrive meanwhile are held until the
+# write has finished or failed on its own paths — every one of which removes
+# the snapshot (.env.pre.*) and the temporary file (.env.tmp.*) — and are then
+# raised again against the trap that was there before (or the default). An
+# exit meanwhile (errexit) removes both first and then runs the previous EXIT
+# trap. Measured on 4c29cf3: 10 of 60 SIGTERMs left a .env.pre.* behind, a full
+# copy of .env.
+WG_SAVED=""
+WG_SIG=""
+WG_SNAP=""
+writer_guard_on() {
+  local exit_action=""
+  WG_SAVED="$(trap -p EXIT INT TERM HUP)"
+  WG_SIG="" WG_SNAP="" REPLACE_TMP=""
+  trap_action_of "$(trap -p EXIT)"
+  exit_action="$_TRAP_ACTION"
+  # shellcheck disable=SC2064  # the previous EXIT action is meant to be expanded now
+  trap "writer_guard_clean; $exit_action" EXIT
+  trap 'WG_SIG=INT' INT
+  trap 'WG_SIG=TERM' TERM
+  trap 'WG_SIG=HUP' HUP
+}
+
+# trap_action_of <`trap -p` line of one signal> — _TRAP_ACTION: its action
+# (the line is shell-quoted for reuse: `trap -- '<action>' <SIG>`); empty
+# when there is no trap
+trap_action_of() {
+  _TRAP_ACTION=""
+  [[ -n "$1" ]] || return 0
+  eval "set -- $1"
+  _TRAP_ACTION="$3"
+}
+
+writer_guard_clean() {
+  [[ -z "$WG_SNAP" ]] || rm -f -- "$WG_SNAP" 2>/dev/null || true
+  [[ -z "$REPLACE_TMP" ]] || rm -f -- "$REPLACE_TMP" 2>/dev/null || true
+  WG_SNAP="" REPLACE_TMP=""
+}
+
+writer_guard_off() {
+  local sig
+  writer_guard_clean
+  trap - EXIT INT TERM HUP
+  eval "$WG_SAVED"
+  # read only now: a signal held until here is in WG_SIG, a later one already
+  # met the trap put back above
+  sig="$WG_SIG"
+  WG_SAVED="" WG_SIG=""
+  [[ -z "$sig" ]] || kill -s "$sig" "$BASHPID" 2>/dev/null || true
+}
+
 # set_env_var <key> <value> — <key>=<value> into .env, the value byte for byte
 # (awk reads key and value from its environment, which processes no escapes: a
 # typed "\n" stays a backslash and an n). A key that is in .env more than once
 # gets the new value on its LAST line, the one Compose uses; the earlier ones
 # stay as they are. A value with a control character is refused, and after the
 # write the file must have the same lines as before (one more for a new key),
-# or it is put back (env_write_check).
+# or it is put back (env_write_check). Signals wait for the end of the write
+# (writer_guard_on).
 set_env_var() {
+  local rc=0
+  writer_guard_on
+  set_env_var_write "$@" || rc=$?
+  writer_guard_off
+  return "$rc"
+}
+
+set_env_var_write() {
   local key="$1"
   local value="$2"
   local env_file="$ROOT_DIR/.env"
@@ -1684,7 +1769,7 @@ set_env_var() {
     return 1
   fi
   lines="$_ENV_LINES" keys="$_ENV_KEY_LINES"
-  if ! snap="$(umask 077 && mktemp "$env_file.pre.XXXXXX" 2>/dev/null)" || ! cat -- "$env_file" > "$snap"; then
+  if ! snap="$(umask 077 && mktemp "$env_file.pre.XXXXXX" 2>/dev/null)" || ! { WG_SNAP="$snap"; cat -- "$env_file" > "$snap"; }; then
     [[ -z "${snap:-}" ]] || rm -f -- "$snap"
     warn "cannot create a temporary file next to ${env_file#"$ROOT_DIR/"}; it was not changed"
     return 1
@@ -1724,11 +1809,23 @@ set_env_var() {
   fi
 }
 
+# run_capture <command...> — RUN_OUTPUT (stdout and stderr) and RUN_STATUS of
+# the command, run in a subshell. errexit is off in there (a command
+# substitution under `set +e`): a function run this way has to return its
+# failures itself. TUI_ACTIVE=0 in the subshell: a die in a captured action
+# ends only the subshell and leaves the running TUI's terminal alone (no
+# tui_cleanup: no stty reset, no rmcup, bracketed paste stays on); the caller
+# shows the output, the error included.
+run_capture_child() {
+  TUI_ACTIVE=0
+  "$@"
+}
+
 run_capture() {
   RUN_OUTPUT=""
   RUN_STATUS=0
   set +e
-  RUN_OUTPUT="$("$@" 2>&1)"
+  RUN_OUTPUT="$(run_capture_child "$@" 2>&1)"
   RUN_STATUS=$?
   set -e
 }
@@ -1886,9 +1983,12 @@ ensure_json_file_value() {
 }
 
 # env_value_quotes_ok <raw> — false for a value that starts with a quote but is
-# not one quoted string to its end: Compose reads a double-quoted value up to
-# the first unescaped ", a single-quoted one up to the next ', and refuses the
-# whole file when anything follows on the line ("a"\nX="b" typed as text).
+# not one quoted string to its end. Compose 5.x reads a quoted value, double or
+# single, up to the first quote of its kind that follows an even number of
+# backslashes (\" and \' are escaped quotes, \\ is a pair); it refuses the
+# whole file when the closing quote is missing ('My relay\' is unterminated)
+# and drops what follows it ("a"b reads as a). Measured with `docker compose
+# config` on 45 values, tests/haven-security.bats ("D2").
 env_value_quotes_ok() {
   local v="$1" q inner
   case "${v:0:1}" in
@@ -1897,15 +1997,11 @@ env_value_quotes_ok() {
   esac
   (( ${#v} >= 2 )) && [[ "${v: -1}" == "$q" ]] || return 1
   inner="${v:1:${#v}-2}"
-  if [[ "$q" == "'" ]]; then
-    [[ "$inner" != *"'"* ]]
-    return
-  fi
-  # escape pairs first (\\ and \"), then no bare " may be left and no
-  # backslash that would escape the closing quote
+  # escape pairs first (\\, then \" or \'), then no bare quote of the kind may
+  # be left and no backslash that would escape the closing quote
   inner="${inner//\\\\/}"
-  inner="${inner//\\\"/}"
-  [[ "$inner" != *\"* && "$inner" != *\\ ]]
+  inner="${inner//"\\$q"/}"
+  [[ "$inner" != *"$q"* && "$inner" != *\\ ]]
 }
 
 validate_env_value() {
@@ -1927,7 +2023,7 @@ validate_env_value() {
     return 1
   fi
   if ! env_value_quotes_ok "$raw"; then
-    VALIDATION_ERROR="A value that starts with a quote must end with the same quote and hold no other one (inside double quotes write \\\" for a quote)."
+    VALIDATION_ERROR="A value that starts with a quote must end with the same quote and hold no other one of its kind, unless escaped: write \\\" inside double quotes, \\' inside single quotes; a single backslash right before the closing quote escapes it."
     return 1
   fi
 
@@ -2158,6 +2254,18 @@ env_stored_value_note() {
   esac
 }
 
+# env_dollar_note <raw value> — _DOLLAR_NOTE: one sentence when the value holds
+# a $ outside single quotes, empty otherwise. Compose expands $NAME and ${NAME}
+# in an unquoted or double-quoted .env value (measured: a relay name holding
+# ${S3_SECRET_KEY:-d} became the secret, published as relay metadata; ${X:?e}
+# makes Compose refuse the file) and keeps a single-quoted one literal. A
+# warning only: legitimate values contain $.
+env_dollar_note() {
+  _DOLLAR_NOTE=""
+  [[ "$1" == *'$'* && "${1:0:1}" != "'" ]] || return 0
+  _DOLLAR_NOTE="Docker Compose expands \$NAME and \${NAME} in this value (unquoted or in double quotes); put the value in single quotes to keep it literal."
+}
+
 ask_yes_no() {
   local prompt="$1"
   local default_answer="$2"
@@ -2267,7 +2375,17 @@ list_env_keys() {
   ' "$env_file"
 }
 
+# remove_env_var <key> — every line that sets <key> leaves .env, checked like
+# set_env_var's write and with the same signal guard.
 remove_env_var() {
+  local rc=0
+  writer_guard_on
+  remove_env_var_write "$@" || rc=$?
+  writer_guard_off
+  return "$rc"
+}
+
+remove_env_var_write() {
   local key="$1"
   local env_file="$ROOT_DIR/.env"
   local snap lines keys rc=0
@@ -2278,7 +2396,7 @@ remove_env_var() {
     return 1
   fi
   lines="$_ENV_LINES" keys="$_ENV_KEY_LINES"
-  if ! snap="$(umask 077 && mktemp "$env_file.pre.XXXXXX" 2>/dev/null)" || ! cat -- "$env_file" > "$snap"; then
+  if ! snap="$(umask 077 && mktemp "$env_file.pre.XXXXXX" 2>/dev/null)" || ! { WG_SNAP="$snap"; cat -- "$env_file" > "$snap"; }; then
     [[ -z "${snap:-}" ]] || rm -f -- "$snap"
     warn "cannot create a temporary file next to ${env_file#"$ROOT_DIR/"}; it was not changed"
     return 1
@@ -3647,7 +3765,11 @@ restore_relay_db() {
   info "backups/$name verified with $BACKUP_VERIFIED_BY: intact, five entries."
 
   if db_has_data; then
-    info "db/ already holds data (or cannot be read to check). A restore adds the events from backups/$name that are missing; it never deletes or duplicates anything, and events that exist only in the database stay."
+    # the duplicate sentences are measured (the list rows of
+    # tests/real-docker/p2, p3 and p6): notes are never doubled; on lmdb every
+    # restore into a database that already lists a file adds one more
+    # identical /list entry, on badger none
+    info "db/ already holds data (or cannot be read to check). A restore adds the events from backups/$name that are missing and deletes nothing; events that exist only in the database stay. Notes that are already there are skipped; on lmdb, a media index entry that is already there is listed once more (one more identical /list entry per restore)."
     if [[ "$ASSUME_YES" == "1" ]]; then
       :
     elif [[ -t 0 ]]; then
@@ -3677,7 +3799,7 @@ restore_relay_db() {
 
   if [[ "$status" -ne 0 ]]; then
     warn "The restore exited with status $status. The database may now be partially restored."
-    warn "Running the same restore again is safe: it adds what is missing and skips what is already there."
+    warn "Running the same restore again is safe: it adds what is missing and deletes nothing (on lmdb, a media index entry that is already there is listed once more)."
     oneshot_fail "$relay_rc"
     return 1
   fi
@@ -3686,7 +3808,7 @@ restore_relay_db() {
     relay_down_final_warning
     return 1
   fi
-  success "Restore finished: the events from backups/$name that were missing are now in the database; nothing was deleted or duplicated."
+  success "Restore finished: the events from backups/$name that were missing are now in the database; nothing was deleted, and notes that were already there were skipped. On lmdb, a media index entry that was already there is now listed once more."
   info "Media files are not part of a backup: list entries whose file is missing from blossom/ answer 404 until the files are copied back."
   return 0
 }
@@ -3859,7 +3981,14 @@ tui_engine_unknown_note() {
 env_key_lines() {
   local env_file="$ROOT_DIR/.env"
   [[ -f "$env_file" ]] || return 0
-  awk -v key="$1" '$0 ~ "^[ \t]*export[ \t]+" key "=" || $0 ~ "^" key "=" { print }' "$env_file"
+  # shellcheck disable=SC2016  # an awk program: $0 belongs to awk, not to the shell
+  HAVEN_K="$1" awk '
+    BEGIN { key = ENVIRON["HAVEN_K"]; klen = length(key) }
+    {
+      t = $0
+      if (substr(t, 1, klen + 1) == key "=" || (sub(/^[ \t]*export[ \t]+/, "", t) && substr(t, 1, klen + 1) == key "=")) print
+    }
+  ' "$env_file"
 }
 
 # env_engine_state — "unset", "badger", "lmdb" or "other" for DB_ENGINE in .env.
@@ -4544,7 +4673,7 @@ db_switch() {
     DBS_ENV_FIX="$state"
     DBS_ENV_SET=1
     n=""
-    [[ "$(env_key_lines DB_ENGINE)" =~ ^[[:blank:]]*export[[:blank:]] ]] && n="export "
+    [[ "$(env_key_lines DB_ENGINE | tail -n 1)" =~ ^[[:blank:]]*export[[:blank:]] ]] && n="export "
     DBS_ENV_LINE="${n}DB_ENGINE=$(wrap_like_raw "$(read_env_var DB_ENGINE 2>/dev/null || true)" "$source")"
   fi
   for n in "$BACKUP_DIR/$DBS_BACKUP" "$BACKUP_DIR/$DBS_BACKUP2" "$db/$DBS_STASH"; do
@@ -5023,7 +5152,7 @@ dbs_undo_last() {
   else
     raw="$(read_env_var DB_ENGINE 2>/dev/null || true)"
     prefix=""
-    [[ "$(env_key_lines DB_ENGINE)" =~ ^[[:blank:]]*export[[:blank:]] ]] && prefix="export "
+    [[ "$(env_key_lines DB_ENGINE | tail -n 1)" =~ ^[[:blank:]]*export[[:blank:]] ]] && prefix="export "
     DBS_ENV_SET=1
     DBS_ENV_LINE="${prefix}DB_ENGINE=$(wrap_like_raw "$raw" "$e_old")"
   fi
@@ -5124,8 +5253,16 @@ start_services() {
   fi
 
   info "Starting services ($mode)..."
-  dc "$compose_file" "${args[@]}"
-  dc "$compose_file" ps
+  # the failure is returned, not left to errexit: run_capture (the TUI's
+  # Start, Restart and the restart after a saved setting) runs this with
+  # errexit off, and a failed `up` used to end in the status of the lines below
+  local rc=0
+  dc "$compose_file" "${args[@]}" || rc=$?
+  if (( rc != 0 )); then
+    warn "docker compose up failed (exit $rc); the relay was not started."
+    return "$rc"
+  fi
+  dc "$compose_file" ps || true
 
   # After the start, so the image is guaranteed to be pulled.
   report_upstream_env_drift "$compose_file"
@@ -5133,6 +5270,7 @@ start_services() {
   if [[ "$mode" == "tor" ]]; then
     show_onion_host
   fi
+  return 0
 }
 
 stop_services() {
@@ -5152,7 +5290,8 @@ restart_services() {
   # before the stop: a refused start must not leave the relay stopped
   if start_blocked; then return 1; fi
   stop_services "$mode"
-  start_services "$mode"
+  # start_services returns its own failure (errexit is off in run_capture)
+  start_services "$mode" || return $?
 }
 
 show_status() {
@@ -5187,11 +5326,16 @@ stream_logs() {
   dc "$compose_file" "${args[@]}"
 }
 
+# log_sanitize_line <line> — _SANITIZED: a log line as the pane shows it. CR
+# and the common CSI colour codes go first in pure bash (the pane colours a
+# line by its level word, not by the producer's codes); whatever control is
+# left — an OSC 52 that would set the clipboard, an OSC 2 that would set the
+# window title, any other escape string or C0/C1 byte — goes through
+# strip_terminal_controls. Only CSI was removed until P6.
 log_sanitize_line() {
   _SANITIZED="$1"
   _SANITIZED="${_SANITIZED//$'\r'/}"
   _SANITIZED="${_SANITIZED//$'\t'/  }"
-  # Strip ANSI escape sequences using pure bash
   while [[ "$_SANITIZED" == *$'\x1b\x5b'* ]]; do
     local _before="${_SANITIZED%%$'\x1b\x5b'*}"
     local _after="${_SANITIZED#*$'\x1b\x5b'}"
@@ -5201,6 +5345,8 @@ log_sanitize_line() {
     [[ "${_after:0:1}" == [a-zA-Z] ]] && _after="${_after:1}"
     _SANITIZED="${_before}${_after}"
   done
+  strip_terminal_controls "$_SANITIZED"
+  _SANITIZED="$_STRIPPED"
 }
 
 # strip_terminal_controls <line> — _STRIPPED: <line> with every escape sequence
@@ -5614,6 +5760,8 @@ tui_setting_details() {
   fi
   detail_field "Current" "$v" "$TUI_BOLD"
   [[ -z "$_STORED_NOTE" ]] || detail_field "" "$_STORED_NOTE" "$TUI_FG_LOG_WARN"
+  env_dollar_note "$_EFFECTIVE"
+  [[ -z "$_DOLLAR_NOTE" ]] || detail_field "" "$_DOLLAR_NOTE" "$TUI_FG_LOG_WARN"
   if (( _EFFECTIVE_LINES > 1 )); then
     detail_field "" "$key is in .env $_EFFECTIVE_LINES times; Compose uses the last line, shown here, and Edit changes that line only." "$TUI_FG_LOG_WARN"
   fi
@@ -6125,10 +6273,10 @@ mask_env_value() {
 }
 
 # env_effective_value <key> — _EFFECTIVE: the raw value of the LAST line that
-# sets <key> in .env (the one Compose uses; read_env_var prints every line),
+# sets <key> in .env (the one Compose uses, as read_env_var reads it),
 # _EFFECTIVE_LINES: how many lines set it.
 env_effective_value() {
-  _EFFECTIVE="$(read_env_var "$1" 2>/dev/null | tail -n 1 || true)"
+  _EFFECTIVE="$(read_env_var "$1" 2>/dev/null || true)"
   _EFFECTIVE_LINES=0
   [[ -f "$ROOT_DIR/.env" ]] && env_key_stats "$ROOT_DIR/.env" "$1" && _EFFECTIVE_LINES="$_ENV_KEY_LINES"
   return 0
@@ -6894,10 +7042,12 @@ tui_run_action() {
   fi
   run_capture "$@"
   if [[ "$RUN_STATUS" -ne 0 ]]; then
-    local text="Failed (exit $RUN_STATUS)."
-    if [[ -n "$RUN_OUTPUT" ]]; then
-      text="$text\n\n$RUN_OUTPUT"
-    fi
+    # the output as text (a die's ERROR line included), its colours dropped
+    local text="Failed (exit $RUN_STATUS)." line sep=$'\n\n'
+    while IFS= read -r line; do
+      strip_terminal_controls "$line"
+      [[ -z "$_STRIPPED" ]] || { text+="$sep${_STRIPPED//"$ROOT_DIR/"/}"; sep=$'\n'; }
+    done <<<"$RUN_OUTPUT"
     tui_message "$title" "$text"
   elif [[ "$RUN_OUTPUT" == *"$MIXED_START_WARNING"* ]]; then
     # a start that went ahead on mixed directories: its warning would scroll by
@@ -7131,7 +7281,10 @@ tui_flow_run() {
   printf -v TASK_T0 '%(%s)T' -1
   # Ctrl-C goes to the child while it runs and is ignored once it ended, until
   # tui_flow_finish closed the result box and puts the TUI's own trap back
-  # (FLOW_SAVED_INT): a Ctrl-C in between must not quit the TUI.
+  # (FLOW_SAVED_INT): a Ctrl-C in between must not quit the TUI. While the child
+  # runs this is a handler, which no subshell inherits; from the moment the
+  # child is gone it is `trap '' INT`, which every subshell does inherit (see
+  # below).
   FLOW_SAVED_INT="$(trap -p INT)"
   trap 'TASK_INT=1; if [[ -n "$TASK_PID" ]]; then kill -INT "$TASK_PID" 2>/dev/null || true; fi' INT
   # A background job of a shell without job control ignores SIGINT and
@@ -7156,6 +7309,12 @@ tui_flow_run() {
     fi
     tui_flow_drain && redraw=2
     if ! kill -0 "$TASK_PID" 2>/dev/null; then
+      # the child is gone: ignore INT, inherited by every subshell from here
+      # to the dismissed box. A Ctrl-C reaches the whole foreground process
+      # group, and a handler is not inherited: the subshell of
+      # TUI_COLS="$(tput cols)" in the box's layout died of it, the size came
+      # out empty and the next frame ended the TUI under errexit.
+      trap '' INT
       tui_flow_drain || true
       [[ -z "$TASK_CARRY" ]] || { tui_flow_take "$TASK_CARRY"; TASK_CARRY=""; }
       break
@@ -7289,7 +7448,7 @@ tui_flow_box() {
       ;;
     restore:0:*)
       if tui_flow_find '^Restore finished: the events from ([^ ]+) that were missing'; then
-        box="Added the events of ${BASH_REMATCH[1]} that were missing; nothing was deleted or duplicated.${nl}${nl}$_RELAY_NOTE${nl}${nl}Media files are not in a backup: copy blossom/ back if some are missing."
+        box="Added the events of ${BASH_REMATCH[1]} that were missing; nothing was deleted, and notes that were already there were skipped (on lmdb, a media index entry that was already there is now listed once more).${nl}${nl}$_RELAY_NOTE${nl}${nl}Media files are not in a backup: copy blossom/ back if some are missing."
       fi
       ;;
     switch:*:ok)
@@ -7423,9 +7582,14 @@ tui_flow_restore() {
 }
 
 tui_flow_restore_pick() {
-  local name="$1"
+  local name="$1" what="It adds the events of this backup that are missing and deletes nothing."
   tui_flow_relay_sentence
-  tui_confirm "Restore $name? It adds the events of this backup that are missing; it never deletes or duplicates anything, and events that exist only in the database stay. $_SENTENCE" "n" || return 0
+  # into a database that holds data: what is measured to happen to what is
+  # already there (see restore_relay_db); db_has_data reads db/ only
+  if db_has_data; then
+    what="It adds the events of this backup that are missing and deletes nothing; events that exist only in the database stay. The database already holds data: notes that are already there are skipped, but on lmdb a media index entry that is already there is listed once more."
+  fi
+  tui_confirm "Restore $name? $what $_SENTENCE" "n" || return 0
   tui_flow_run restore "Restore a backup" "Restoring" restore "$name" --yes
   tui_flow_outcome "Restore"
   tui_flow_finish "$_TITLE" ""
@@ -7533,7 +7697,7 @@ tui_flow_details() {
       detail_field "Written" "$(date -d "@${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "${FLOW_FILE_TIME[$t]:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null) ($_AGE)"
       detail_field "Size" "$(human_size "${FLOW_FILE_SIZE[$t]:-0}")"
       DETAIL_LINES+=("")
-      v="A restore adds the events of this backup that are missing; it never deletes or duplicates anything. Enter asks before anything runs."
+      v="A restore adds the events of this backup that are missing and deletes nothing. Into a database that holds data, notes that are already there are skipped, while on lmdb a media index entry that is already there is listed once more. Enter asks before anything runs."
       ;;
     switch|from:*)
       # the verb's steps in order (stop, backup, move, restore, start), in
@@ -7799,8 +7963,7 @@ $(cat "$onion_torrc")"
             return
           fi
           tui_engine_unknown_note "$new_key"
-          set_env_var "$new_key" "$new_value"
-          restart_after_env_change
+          tui_env_save "$new_key" "$new_value"
           ;;
         back)
           tui_set_view "main"
@@ -7830,8 +7993,7 @@ $(cat "$onion_torrc")"
             return 0
           fi
           tui_engine_unknown_note "$CURRENT_ENV_KEY"
-          set_env_var "$CURRENT_ENV_KEY" "$new_value"
-          restart_after_env_change
+          tui_env_save "$CURRENT_ENV_KEY" "$new_value"
           ;;
         reveal)
           # Explicit reveal: the list view only ever shows masked values.
@@ -7852,8 +8014,7 @@ $(cat "$onion_torrc")"
           fi
           if tui_confirm "Remove $CURRENT_ENV_KEY?" "n"; then
             tui_engine_unknown_note "$CURRENT_ENV_KEY"
-            remove_env_var "$CURRENT_ENV_KEY"
-            restart_after_env_change
+            tui_env_save "$CURRENT_ENV_KEY" --remove
           fi
           ;;
         back)
@@ -8218,10 +8379,60 @@ tui_loop() {
   done
 }
 
+# tui_env_save <key> <value>|--remove — the settings editor's write:
+# set_env_var or remove_env_var, captured (their warnings never land on the
+# frame). A refused or failed write is shown in a box and nothing restarts —
+# the writer's status is checked before anything else. A write that went
+# through restarts a running relay (restart_after_env_change), whose box says
+# what happened; a value with a $ outside single quotes adds env_dollar_note.
+tui_env_save() {
+  local key="$1" line text
+  if [[ "$2" == --remove ]]; then
+    run_capture remove_env_var "$key"
+  else
+    run_capture set_env_var "$key" "$2"
+  fi
+  if [[ "$RUN_STATUS" -ne 0 ]]; then
+    text=".env was not changed, and the relay was not restarted."
+    while IFS= read -r line; do
+      strip_terminal_controls "$line"
+      line="${_STRIPPED#WARN }"
+      [[ -z "$line" ]] || text+=$'\n'"${line//"$ROOT_DIR/"/}"
+    done <<<"$RUN_OUTPUT"
+    tui_message "$key" "$text"
+    TUI_NEED_FRAME=1 TUI_NEED_MENU=1 TUI_NEED_LEFT=1 TUI_NEED_RIGHT=1
+    return 0   # shown; a non-zero status here would end the TUI (tui_handle_key)
+  fi
+  _DOLLAR_NOTE=""
+  [[ "$2" == --remove ]] || env_dollar_note "$2"
+  restart_after_env_change "$_DOLLAR_NOTE"
+}
+
+# tui_relay_state_sentence — _RELAY_STATE: the relay's state as Docker reports
+# it NOW, for a box written after an action (never what the action intended).
+tui_relay_state_sentence() {
+  if relay_container_running 2>/dev/null; then
+    _RELAY_STATE="The relay is running."
+  else
+    _RELAY_STATE="The relay is NOT running: start it with s in the main view."
+  fi
+}
+
+# restart_after_env_change [<note>] — after a saved setting: restart a running
+# relay to apply it. In the TUI every outcome ends in a box (<note> appended);
+# outside it, messages.
 restart_after_env_change() {
+  local note="${1:-}" text=""
   if ! docker info >/dev/null 2>&1; then
-    warn "Docker not running; restart skipped."
-    return
+    if [[ "$TUI_ACTIVE" == "1" ]]; then
+      text=".env was saved. Docker is not reachable, so nothing was restarted; the change applies at the next start."
+      [[ -z "$note" ]] || text+=$'\n\n'"$note"
+      tui_message "Restart" "$text"
+      TUI_NEED_FRAME=1 TUI_NEED_MENU=1 TUI_NEED_LEFT=1 TUI_NEED_RIGHT=1
+    else
+      warn "Docker not running; restart skipped."
+    fi
+    return 0
   fi
 
   local mode=""
@@ -8230,8 +8441,15 @@ restart_after_env_change() {
   elif relay_container_running; then
     mode="plain"
   else
-    warn "No running containers to restart."
-    return
+    if [[ "$TUI_ACTIVE" == "1" ]]; then
+      text=".env was saved. The relay is not running, so nothing was restarted; the change applies when it starts (s in the main view)."
+      [[ -z "$note" ]] || text+=$'\n\n'"$note"
+      tui_message "Restart" "$text"
+      TUI_NEED_FRAME=1 TUI_NEED_MENU=1 TUI_NEED_LEFT=1 TUI_NEED_RIGHT=1
+    else
+      warn "No running containers to restart."
+    fi
+    return 0
   fi
 
   # Runs with errexit active inside the TUI: a refusal from restart_services
@@ -8239,7 +8457,9 @@ restart_after_env_change() {
   local refusal=""
   if refusal="$(start_blocked 2>&1)"; then
     if [[ "$TUI_ACTIVE" == "1" ]]; then
-      tui_message "Restart" ".env was saved; the restart to apply it is skipped."$'\n\n'"$refusal"
+      text=".env was saved; the restart to apply it is skipped."$'\n\n'"$refusal"
+      [[ -z "$note" ]] || text+=$'\n\n'"$note"
+      tui_message "Restart" "$text"
     else
       printf '%s\n' "$refusal"
       warn ".env was saved; the restart to apply it is skipped."
@@ -8250,7 +8470,7 @@ restart_after_env_change() {
   # The start's preparation (missing JSON lists ask one dialog each) runs
   # BEFORE the stop: an unanswered dialog must not leave the relay down.
   if [[ "$TUI_ACTIVE" == "1" ]]; then
-    tui_restart_captured "$mode"
+    tui_restart_captured "$mode" "$note"
     return 0
   fi
   info "Restarting services ($mode) to apply .env changes..."
@@ -8259,15 +8479,16 @@ restart_after_env_change() {
   restart_services "$mode"
 }
 
-# tui_restart_captured <mode> — the restart after a saved setting, as the main
-# menu's Start and Restart run (tui_run_action): the output is captured, never
-# written over the frame, and the result is shown in a box — the warnings in
-# it, or the whole output when something failed. The start's preparation runs
-# first and captured too, except the one step that asks (a missing JSON list,
-# one dialog each), which needs the terminal; a refusal there leaves the relay
-# running.
+# tui_restart_captured <mode> [<note>] — the restart after a saved setting, as
+# the main menu's Start and Restart run (tui_run_action): the output is
+# captured, never written over the frame, and the result is shown in a box —
+# the warnings in it, or the whole output when something failed — with the
+# relay's state as Docker reports it after the restart (a failed `up` leaves it
+# stopped, and the box says so). The start's preparation runs first and
+# captured too, except the one step that asks (a missing JSON list, one dialog
+# each), which needs the terminal; a refusal there leaves the relay running.
 tui_restart_captured() {
-  local mode="$1" text="" line warns="" out streaming=0
+  local mode="$1" note="${2:-}" text="" line warns="" out streaming=0
   if [[ "$FOLLOW_LOGS" == "1" ]]; then
     stop_log_stream
     streaming=1
@@ -8275,19 +8496,22 @@ tui_restart_captured() {
   run_capture tui_prepare_start_quiet
   out="$RUN_OUTPUT"
   if [[ "$RUN_STATUS" -ne 0 ]]; then
-    text=".env was saved; the restart to apply it was not run: the start's checks failed (exit $RUN_STATUS). The relay keeps running with the settings it started with."
+    text=".env was saved; the restart to apply it was not run: the start's checks failed (exit $RUN_STATUS)."
   else
     ensure_example_jsons
     local START_PREPARED=1
     run_capture restart_services "$mode"
     out+="${out:+$'\n'}$RUN_OUTPUT"
   fi
+  tui_relay_state_sentence
   if [[ -n "$text" ]]; then
-    :
+    text+=" $_RELAY_STATE"
   elif [[ "$RUN_STATUS" -ne 0 ]]; then
-    text=".env was saved; the restart to apply it failed (exit $RUN_STATUS)."
-  else
+    text=".env was saved; the restart to apply it failed (exit $RUN_STATUS). $_RELAY_STATE"
+  elif [[ "$_RELAY_STATE" == "The relay is running." ]]; then
     text=".env was saved and the relay restarted (${mode^}) to apply it."
+  else
+    text=".env was saved; the restart reported no error, but ${_RELAY_STATE,}"
   fi
   while IFS= read -r line; do
     strip_terminal_controls "$line"
@@ -8297,6 +8521,7 @@ tui_restart_captured() {
     fi
   done <<<"$out"
   [[ -z "$warns" ]] || text+=$'\n'"$warns"
+  [[ -z "$note" ]] || text+=$'\n\n'"$note"
   tui_message "Restart" "$text"
   TUI_NEED_FRAME=1
   TUI_NEED_MENU=1
@@ -8308,10 +8533,8 @@ tui_restart_captured() {
 
 # tui_prepare_start_quiet — prepare_start without its dialog step
 # (ensure_example_jsons), for a captured run inside the TUI (run_capture, a
-# subshell): TUI_ACTIVE=0 there, so a die in it only ends the subshell and
-# does not restore the terminal under the running TUI.
+# subshell with TUI_ACTIVE=0, so a die in it only ends the subshell).
 tui_prepare_start_quiet() {
-  TUI_ACTIVE=0
   warn_missing_critical_env
   ensure_docker_uid
   ensure_data_dirs

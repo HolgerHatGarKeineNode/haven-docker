@@ -4,6 +4,7 @@
 .env.bak.*
 .env.tmp
 .env.tmp.*
+.env.pre.*
 relays_import.json
 relays_blastr.json
 blacklisted_npubs.json

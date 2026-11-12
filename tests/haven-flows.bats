@@ -83,7 +83,7 @@ back|" ]]
 @test "flows: the chosen backup reaches the verb, --yes only after the TUI's own confirm" {
   run in_haven 'tui_flow_restore_pick "haven-backup-1.zip"; echo ---; CONFIRM=y tui_flow_restore_pick "haven-backup-1.zip"'
   echo "$output"
-  [[ "$(sed -n 1p <<<"$output")" == "confirm[Restore haven-backup-1.zip? It adds the events of this backup that are missing; it never deletes or duplicates anything"* ]]
+  [[ "$(sed -n 1p <<<"$output")" == "confirm[Restore haven-backup-1.zip? It adds the events of this backup that are missing and deletes nothing. A running relay"* ]]
   [ "$(sed -n 2p <<<"$output")" = "---" ]
   [ "$(grep -c '^run\[' <<<"$output")" -eq 1 ]
   [ "$(grep '^run\[' <<<"$output")" = "run[restore haven-backup-1.zip --yes]" ]

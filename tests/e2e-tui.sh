@@ -15,6 +15,10 @@
 #   22-25. the P6 security audit: pasted .env lines, empty Enter on a masked
 #          value, crafted child output, Ctrl-C at the result box, cleanup with
 #          a piped stdin, the restart after a saved setting
+#   26-30. the P6 final rework: the box after a saved setting (failing start,
+#          refused write, failing writer), Ctrl-C while the result box lays
+#          out, die inside a captured action, OSC in the log pane, terminal
+#          modes after q / Ctrl-C / SIGTERM
 #
 # Isolation (enforced here, not requested): every check runs in its OWN copy of
 # the repository's tracked files under a temp dir, with .env.example as .env, a
@@ -153,6 +157,9 @@ start_pane() {
   else
     inner+=" && unset HAVEN_TUI_SYNC_FILE"   # the caller's environment must not leak the seam in
   fi
+  # docker must be the mock before anything of the sandbox runs (a launch
+  # that reached the real daemon is refused, not run)
+  inner+=" && { [ \"\$(command -v docker)\" = $(printf '%q' "$sb/tests/mock/docker") ] || { echo 'REFUSED: docker is not the mock' >&2; exit 99; }; }"
   inner+=" && $cmd"
   tmx new-session -d -x "$cols" -y "$lines" -s "$name" "bash -c $(printf '%q' "$inner")"
 }
@@ -2034,6 +2041,259 @@ else
   expect_calls t25 "restart: down, then up (as before)" "$T25_DOWN" "$T25_UP"
 fi
 kill_pane t25
+
+# --- 26-30: P6 final rework at terminal level --------------------------------
+# save_setting <session> <value> [<hook>] — the settings list, PRIVATE_RELAY_NAME's
+# Edit value, <value> typed; <hook> runs right before the Enter that saves
+save_setting() {
+  local s="$1" v="$2" hook="${3:-}"
+  send_settled "$s" c
+  wait_for "$s" "Add setting" || return 1
+  open_setting "$s" PRIVATE_RELAY_NAME "name" && goto_item "$s" "Edit value" || return 1
+  prompt_open "$s" "New value" || return 1
+  tmx send-keys -t "$s" -l "$v"
+  poll_until "$WAIT_T" prompt_cell_is "$s" "New value:" "$v" || return 1
+  [[ -z "$hook" ]] || "$hook"
+  tmx send-keys -t "$s" Enter
+}
+# no_warn_row <session> — no screen row starts with WARN or ERROR (a message
+# written over the frame instead of into a box)
+no_warn_row() { ! capture "$1" | grep -qE '^(WARN|ERROR) '; }
+
+section "26 the box after a saved setting says what happened (D1)"
+T26_DOWN="compose -f SB/docker-compose.yml down --remove-orphans"
+T26_UP="compose -f SB/docker-compose.yml up -d --build"
+# a) the start fails: the relay is stopped and stays stopped
+new_sandbox t26a
+seed_jsons "$SB"
+start_pane t26a 120 30 "$SB" 'MOCK_START_FAILS=1 MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr'
+if ! wait_for t26a "▸ s Start"; then
+  bad "TUI did not start for the failing-start check"
+elif ! save_setting t26a '"Renamed relay"'; then
+  bad "failing start: PRIVATE_RELAY_NAME's Edit value not reachable"
+elif poll_until "$WAIT_T" left_has t26a "the restart to apply it failed"; then
+  t26a_box="$(left_joined t26a)"
+  if [[ "$t26a_box" == *"The relay is NOT running: start it with s in the main view."* && "$t26a_box" != *"restarted"* \
+    && ! -s "$SB/.rig/running" ]]; then
+    ok "failing start: the box says the restart failed and the relay is NOT running (mock: no running container)"
+  else
+    bad "failing start: box [$(head -c 220 <<<"$t26a_box")], running [$(cat "$SB/.rig/running")]"
+  fi
+  if no_warn_row t26a && [[ ! -s "$SB/.rig/stderr" ]]; then ok "failing start: nothing written over the frame, stderr empty"; else bad "failing start: a WARN row on the screen or stderr"; fi
+else
+  bad "failing start: no box naming the failure ($(left_joined t26a | head -c 200))"
+fi
+expect_calls t26a "failing start: down, then the up that fails" "$T26_DOWN" "$T26_UP"
+kill_pane t26a
+
+# b) the write is refused (directory read-only) and c) the writer fails (.env
+# unreadable): a box, .env unchanged, nothing restarted
+for t26 in b c; do
+  new_sandbox "t26$t26"
+  seed_jsons "$SB"
+  cp "$SB/.env" "$SB/.rig/env-before"
+  start_pane "t26$t26" 120 30 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr'
+  t26_sb="$SB"
+  if [[ "$t26" == b ]]; then
+    t26_break() { chmod 555 "$t26_sb"; }
+    t26_mend() { chmod 755 "$t26_sb"; }
+    t26_what="refused write (directory 555)"
+    t26_reason="cannot create a temporary file next to .env; it was not changed"
+  else
+    t26_break() { chmod 000 "$t26_sb/.env"; }
+    t26_mend() { chmod 644 "$t26_sb/.env"; }
+    t26_what="failing writer (.env unreadable)"
+    t26_reason="cannot read .env; it was not changed"
+  fi
+  if [[ "$(id -u)" == 0 ]]; then
+    bad "$t26_what: cannot be checked as root"
+  elif ! wait_for "t26$t26" "▸ s Start"; then
+    bad "$t26_what: TUI did not start"
+  elif ! save_setting "t26$t26" '"Renamed relay"' t26_break; then
+    t26_mend
+    bad "$t26_what: PRIVATE_RELAY_NAME's Edit value not reachable"
+  elif poll_until "$WAIT_T" left_has "t26$t26" ".env was not changed, and the relay was not restarted."; then
+    t26_box="$(left_joined "t26$t26")"
+    t26_mend
+    if [[ "$t26_box" == *"$t26_reason"* && "$t26_box" != *"saved"* && "$t26_box" != *"restarted (Plain)"* ]] \
+      && cmp -s "$SB/.env" "$SB/.rig/env-before" && [[ "$(cat "$SB/.rig/running")" == haven-relay ]]; then
+      ok "$t26_what: the box says .env was not changed and why; .env byte-identical, the relay still running"
+    else
+      bad "$t26_what: box [$(head -c 220 <<<"$t26_box")], .env same: $(cmp -s "$SB/.env" "$SB/.rig/env-before" && echo yes || echo no)"
+    fi
+    if no_warn_row "t26$t26" && [[ ! -s "$SB/.rig/stderr" ]]; then ok "$t26_what: no WARN over the frame, stderr empty"; else bad "$t26_what: a WARN row on the screen or stderr ($(capture "t26$t26" | grep -m1 -E '^(WARN|ERROR) '))"; fi
+    if send_settled "t26$t26" x && tui_pid_found "t26$t26" && wait_for "t26$t26" "Edit value"; then ok "$t26_what: the TUI goes on after the box"; else bad "$t26_what: the TUI did not go on"; fi
+  else
+    t26_mend
+    bad "$t26_what: no refusal box ($(left_joined "t26$t26" | head -c 200))"
+  fi
+  t26_mend
+  expect_calls "t26$t26" "$t26_what: no state-changing docker call"
+  kill_pane "t26$t26"
+done
+
+section "27 Ctrl-C while the result box lays out (D3)"
+# The window made deterministic: a tput shim first on PATH holds `tput cols`
+# while .rig/hold-tput exists and reports .rig/tput-held. The backup's `compose
+# run` is held (MOCK_RUN_HOLD) until the shim is armed, so the next `tput cols`
+# is the one of the result box's layout (tui_message -> tui_update_layout); the
+# Ctrl-C goes to the pane's foreground process group while that subshell waits.
+flow_sandbox t27
+mkdir -p "$SB/.rig/bin"
+cat > "$SB/.rig/bin/tput" <<TPUT
+#!/usr/bin/env bash
+if [[ "\${1:-}" == cols && -e "$SB/.rig/hold-tput" ]]; then
+  : > "$SB/.rig/tput-held"
+  while [[ -e "$SB/.rig/hold-tput" ]]; do sleep 0.05; done
+fi
+exec $(command -v tput) "\$@"
+TPUT
+chmod +x "$SB/.rig/bin/tput"
+SYNC=1 start_pane t27 120 30 "$SB" "stty -g > @RIG@/stty-before; PATH=@RIG@/bin:\$PATH ${FLOW_ENV//@SB@/$SB} MOCK_RUN_HOLD=1 MOCK_HOLD_MAX=60 MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr; echo \$? > @RIG@/rc; stty -g > @RIG@/stty-after; sleep 60"
+if ! wait_for t27 "▸ s Start"; then
+  bad "TUI did not start for the Ctrl-C-at-layout check"
+else
+  send_settled t27 b
+  wait_for t27 "Back up now? A verified"
+  tmx send-keys -t t27 Enter
+  if poll_until "$WAIT_T" test -e "$SB/.rig/started"; then
+    : > "$SB/.rig/hold-tput"
+    : > "$SB/.rig/release"
+    if poll_until "$WAIT_T" test -e "$SB/.rig/tput-held"; then
+      tmx send-keys -t t27 C-c
+      # the Ctrl-C has reached the process group once the terminal delivered it;
+      # a fixed pause is the only way to know a signal has landed, then the shim lets go
+      sleep 0.5
+      rm -f "$SB/.rig/hold-tput"
+      if wait_for t27 "Backup finished" && tui_pid_found t27; then
+        ok "Ctrl-C during the box's layout: the TUI lives and shows the box"
+      else
+        bad "Ctrl-C during the box's layout: TUI $(tui_pid t27 || echo gone), rc $(cat "$SB/.rig/rc" 2>/dev/null)"
+      fi
+      send_settled t27 x
+      if wait_for t27 "▸ s Start" && tui_pid_found t27 && [[ "$(tmx display -p -t t27 '#{alternate_on}')" == 1 ]]; then
+        ok "after the box the main view is drawn and the TUI keeps running (the size survived)"
+      else
+        bad "after the box: TUI $(tui_pid t27 || echo gone), rc $(cat "$SB/.rig/rc" 2>/dev/null), alternate_on $(tmx display -p -t t27 '#{alternate_on}' 2>/dev/null)"
+      fi
+      tmx send-keys -t t27 q
+      poll_until "$WAIT_T" test -s "$SB/.rig/stty-after"
+      if [[ "$(cat "$SB/.rig/rc" 2>/dev/null)" == 0 && ! -s "$SB/.rig/stderr" ]] && cmp -s "$SB/.rig/stty-before" "$SB/.rig/stty-after"; then
+        ok "the exit path is clean: q exits 0, stderr empty, terminal modes as before"
+      else
+        bad "exit path: rc $(cat "$SB/.rig/rc" 2>/dev/null), stderr $(head -c 160 "$SB/.rig/stderr" 2>/dev/null | tr '\n' '|'), stty same: $(cmp -s "$SB/.rig/stty-before" "$SB/.rig/stty-after" && echo yes || echo no)"
+      fi
+    else
+      rm -f "$SB/.rig/hold-tput"
+      bad "the box's tput cols was never held"
+    fi
+  else
+    bad "the backup's run never started"
+  fi
+  expect_calls t27 "Ctrl-C at layout: the backup's sequence only (stop, backup run, start)" \
+    "$T_STOP" "$T_RUN ${T_BK}haven-backup-TS.zip.partial-X" "$T_START"
+fi
+kill_pane t27
+
+section "28 die inside a captured action leaves the TUI's terminal alone (D5)"
+# no compose file: the restart after a saved setting and the menu's Start both
+# reach require_compose_file -> die inside run_capture
+new_sandbox t28
+seed_jsons "$SB"
+rm -f "$SB/docker-compose.yml" "$SB/docker-compose.tor.yml"
+start_pane t28 120 30 "$SB" 'MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr'
+t28_flags() { printf 'alt=%s paste=%s' "$(tmx display -p -t t28 '#{alternate_on}')" "$(tmx display -p -t t28 '#{bracket_paste_flag}')"; }
+if ! wait_for t28 "▸ s Start"; then
+  bad "TUI did not start without compose files"
+else
+  t28_f0="$(t28_flags)"
+  if save_setting t28 '"Renamed relay"' && poll_until "$WAIT_T" left_has t28 "the restart to apply it failed"; then
+    t28_box="$(left_joined t28)"
+    if [[ "$t28_box" == *"ERROR Compose file not found: docker-compose.yml"* && "$(t28_flags)" == "alt=1 paste=1" && "$t28_f0" == "alt=1 paste=1" ]] \
+      && tui_pid_found t28; then
+      ok "restart after a save: the box shows the error; alternate screen and bracketed paste still on ($(t28_flags))"
+    else
+      bad "restart after a save: box [$(head -c 200 <<<"$t28_box")], flags before [$t28_f0] after [$(t28_flags)]"
+    fi
+    send_settled t28 x
+    send_settled t28 Escape
+    send_settled t28 Escape
+    send_settled t28 Escape
+  else
+    bad "restart after a save: no failure box ($(left_joined t28 | head -c 200))"
+  fi
+  if wait_for t28 "▸ s Start" && send_settled t28 s && wait_for t28 "Start the relay?"; then
+    tmx send-keys -t t28 Enter
+    if poll_until "$WAIT_T" left_has t28 "ERROR Compose file not found: docker-compose.yml"; then
+      if [[ "$(t28_flags)" == "alt=1 paste=1" ]] && tui_pid_found t28 && left_has t28 "Failed (exit 1)."; then
+        ok "menu Start: the box shows the error; alternate screen and bracketed paste still on"
+      else
+        bad "menu Start: flags [$(t28_flags)], box [$(left_joined t28 | head -c 200)]"
+      fi
+      send_settled t28 x
+      if wait_for t28 "▸ s Start" && send_settled t28 Down && tui_pid_found t28; then ok "the TUI is usable after both boxes"; else bad "the TUI is not usable after the boxes"; fi
+    else
+      bad "menu Start: no error box ($(left_joined t28 | head -c 200))"
+    fi
+  else
+    bad "menu Start: no confirm"
+  fi
+  [[ ! -s "$SB/.rig/stderr" ]] && ok "die in a captured action: TUI stderr empty" || bad "die in a captured action: stderr $(head -c 160 "$SB/.rig/stderr" | tr '\n' '|')"
+fi
+expect_calls t28 "die in a captured action: no state-changing docker call"
+kill_pane t28
+
+section "29 OSC sequences in the log stream stay text (P1)"
+new_sandbox t29
+printf 'before-osc52 \033]52;c;SGVsbG8gd29ybGQ=\007 after-osc52\nbefore-title \033]2;PWNED-LOG-TITLE\007 after-title\nplain log line\n' > "$SB/.rig/crafted-log"
+start_pane t29 120 30 "$SB" "MOCK_LOG_FILE=$SB/.rig/crafted-log ./haven tui 2>@RIG@/stderr"
+tmx set -s set-clipboard on
+t29_title="$(tmx display -p -t t29 '#{pane_title}')"
+if wait_for t29 "plain log line"; then
+  settle_after t29 "$(sync_n t29)"
+  t29_raw="$(tmx capture-pane -p -e -t t29)"
+  if [[ -z "$(tmx list-buffers 2>/dev/null)" && "$(tmx display -p -t t29 '#{pane_title}')" == "$t29_title" ]]; then
+    ok "log pane: no tmux buffer set (OSC 52), pane title unchanged (OSC 2)"
+  else
+    bad "log pane: buffers [$(tmx list-buffers 2>/dev/null | head -1)], title [$(tmx display -p -t t29 '#{pane_title}')]"
+  fi
+  if has_text t29 "before-osc52  after-osc52" && has_text t29 "before-title  after-title" && [[ "$t29_raw" != *$'\e]'* && "$t29_raw" != *PWNED* ]]; then
+    ok "log pane: the text around the sequences is shown, no OSC in capture-pane -e"
+  else
+    bad "log pane: text or escape ($(capture t29 | grep -m2 -E 'before-' | tr '\n' '|'))"
+  fi
+else
+  bad "log pane: the crafted log never showed ($(capture t29 | tr '\n' '|' | head -c 200))"
+fi
+expect_calls t29 "OSC log check: no state-changing docker call"
+kill_pane t29
+
+section "30 terminal modes after q, Ctrl-C and SIGTERM (P3)"
+for t30 in q ctrlc term; do
+  new_sandbox "t30$t30"
+  start_pane "t30$t30" 100 30 "$SB" 'stty -g > @RIG@/stty-before; MOCK_LOG_COUNT=10 ./haven tui 2>@RIG@/stderr; echo $? > @RIG@/rc; stty -g > @RIG@/stty-after; sleep 30'
+  if ! wait_for "t30$t30" "▸ s Start"; then
+    bad "terminal modes ($t30): TUI did not start"
+  else
+    settle_after "t30$t30" "$(sync_n "t30$t30")"
+    case "$t30" in
+      q) tmx send-keys -t "t30$t30" q ;;
+      ctrlc) tmx send-keys -t "t30$t30" C-c ;;
+      term) t30_pid="$(tui_pid "t30$t30")"; [[ -n "$t30_pid" ]] && kill -TERM "$t30_pid" ;;
+    esac
+    if poll_until "$WAIT_T" test -s "$SB/.rig/stty-after"; then
+      if cmp -s "$SB/.rig/stty-before" "$SB/.rig/stty-after" && [[ "$(tmx display -p -t "t30$t30" '#{alternate_on}')" == 0 ]]; then
+        ok "terminal modes after $t30: stty -g identical before and after (rc $(cat "$SB/.rig/rc")), alternate screen off"
+      else
+        bad "terminal modes after $t30: before [$(cat "$SB/.rig/stty-before")] after [$(cat "$SB/.rig/stty-after")] rc $(cat "$SB/.rig/rc")"
+      fi
+    else
+      bad "terminal modes after $t30: the TUI did not exit"
+    fi
+  fi
+  expect_calls "t30$t30" "terminal modes ($t30): no state-changing docker call"
+  kill_pane "t30$t30"
+done
 
 section "21 leftovers"
 new_sandbox t21

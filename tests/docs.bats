@@ -117,3 +117,21 @@ readme_shows() { grep -qE "\./haven $1( |\`|\$)" "$README"; }
   [ "$n" -ge 10 ]
   [ -z "$missing" ]
 }
+
+# B3 (P6 final rework): two sentences that said more than the code does
+@test "docs: the CHANGELOG's control-character sentence says the prompt drops them from a paste" {
+  local flat
+  flat="$(tr '\n' ' ' < "$CHANGELOG" | tr -s ' ')"
+  [[ "$flat" == *"the prompt drops line breaks, tabs and other control characters from a paste, and a value that still holds one (line break, tab, escape) when it is checked or written is refused for every setting"* ]]
+  [[ "$flat" != *"(line break, tab, escape) is refused for every setting"* ]]
+}
+
+@test "docs: the README's masking sentence matches mask_env_value (… plus the last four above eight characters, … alone otherwise)" {
+  local flat
+  flat="$(tr '\n' ' ' < "$README" | tr -s ' ')"
+  [[ "$flat" == *'Credentials are masked: a value longer than eight characters shows `…` and its last four characters, a shorter one only `…`.'* ]]
+  [[ "$flat" != *"show only their last four characters"* ]]
+  run bash -c 'source "$1"; set +e; for v in 12345678 123456789; do mask_env_value "$v"; echo "$v=$_MASKED"; done' _ "$TEST_DIR/haven"
+  [ "${lines[0]}" = "12345678=…" ]
+  [ "${lines[1]}" = "123456789=…6789" ]
+}

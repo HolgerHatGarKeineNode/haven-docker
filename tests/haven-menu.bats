@@ -254,19 +254,20 @@ i rc=0" ]]
   printf 'DB_ENGINE="badger"\nRELAY_PORT=3355\n' > "$TEST_DIR/.env"
   run in_haven '
     TUI_ACTIVE=1
-    set_env_var() { echo "write[$1=$2]"; }
+    # the write runs captured (tui_env_save): the stand-in reports to a file
+    set_env_var() { echo "write[$1=$2]" >> "$SB/writes"; }
     restart_after_env_change() { echo "restart"; }
     tui_prompt() { printf "%s" "$2"; }   # Esc and an empty Enter hand back the default
     TUI_VIEW=env_item; CURRENT_ENV_KEY=RELAY_PORT; tui_build_menu
     TUI_SEL=0; tui_handle_enter; echo "same rc=$?"
     tui_prompt() { printf 4444; }       # a changed value is written and applied
-    TUI_SEL=0; tui_handle_enter; echo "changed rc=$?"'
+    TUI_SEL=0; tui_handle_enter; echo "changed rc=$?"; cat "$SB/writes"'
   echo "$output"
   [ "$status" -eq 0 ]
   [[ "$output" == "same rc=0
-write[RELAY_PORT=4444]
 restart
-changed rc=0" ]]
+changed rc=0
+write[RELAY_PORT=4444]" ]]
 }
 
 @test "message box: a \\n written by the caller is a line break, not text" {
