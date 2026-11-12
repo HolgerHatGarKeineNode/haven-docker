@@ -51,14 +51,18 @@ images published so far still show the old text.
   `--from` sides when `db/` holds both engines, and runs only after you type
   the engine name. The steps of a switch are listed as they pass, the title
   row counts how long the relay has been offline, and the result box names a
-  failed step. `Esc` and `q` wait while a command runs; `Ctrl-C` stops it and
-  the relay is started again. After an interrupted switch, *Undo interrupted
-  switch* runs `./haven db-switch --rollback`
+  failed step. Before anything runs, each says what happens to the relay and
+  the data; the result box says what happened, the relay's state, where the
+  data is and the next step. Other keys wait while a command runs; `Ctrl-C`
+  stops it (a switch puts everything back) and a relay that ran is started
+  again. After an interrupted switch, *Undo interrupted switch* runs
+  `./haven db-switch --rollback`
 - TUI settings editor: the settings in the sections of `.env.example` with a
-  short name and the value, a details pane with the full name, a
-  description, the example value, the rule for new values and the current
-  value; `/` finds settings by name or description; settings only in `.env`
-  are listed under *Other*
+  short name and the value (the section row stays at the top while the list
+  scrolls), a details pane with the full name, a description, the current
+  value, the values allowed and the example value; `/` finds settings by
+  name, short name or description; settings only in `.env` are listed under
+  *Other*
 - TUI status view (`Tab`): relay state and uptime, Docker or Tor, the relay
   address (and the onion host on Tor), the engine on disk with the size of
   `db/` (and a word when `.env` names another engine or `db/` holds both),
@@ -101,6 +105,18 @@ images published so far still show the old text.
 
 ### Fixed
 
+- The TUI masked every `.env` value whose key contains `TOKEN` or `KEY`
+  anywhere, so the rate limiters' `*_TOKENS_PER_INTERVAL` and `*_MAX_TOKENS`
+  showed as `…`. A credential is now a key with SECRET, PASSWORD, TOKEN, KEY
+  (or a similar word) as a whole word of its name, or an `nsec` value; of
+  `.env.example` that masks `S3_ACCESS_KEY_ID` and `S3_SECRET_KEY`
+- The settings editor refused `HAVEN_LOG_LEVEL=WARN`, the level Haven v1.2.2
+  reads, and accepted `WARNING`, which Haven logs as INFO; it now takes `WARN`
+  and refuses `WARNING` with a message naming `WARN`, and the details pane
+  points out a stored `WARNING`
+- The settings editor accepted day units in `WOT_REFRESH_INTERVAL` (`1d`),
+  which Go's `time.ParseDuration` does not know: Haven stopped at start. It
+  now asks for hours, minutes and seconds and refuses zero
 - With a filter set in the TUI log panel, the first line of the filtered
   window was never drawn (a single match showed the count and no line)
 - TUI input prompts took only as many characters as fit beside their label

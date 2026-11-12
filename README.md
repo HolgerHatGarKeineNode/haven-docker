@@ -266,18 +266,23 @@ log on the right. It runs the same commands as the CLI above; nothing in it
 works differently from the command line.
 
 - **Settings (.env)** lists your settings in the sections of `.env.example`,
-  each with a short name and its current value (secrets show only their last
-  four characters). The right side shows the selected setting in full: its
-  name, what it does, the example value, the rule a new value must follow and
-  the current value. `/` finds settings by name or description; `Esc` clears
-  the search. Settings that are only in your `.env` are listed under *Other*.
+  each with a short name and its current value; the section stays at the top
+  while the list scrolls. Credentials show only their last four characters:
+  keys with SECRET, PASSWORD, TOKEN, KEY (and similar) as a whole word of the
+  name, such as `S3_SECRET_KEY`, and any value that is an `nsec`. The rate
+  limiters' numbers are not credentials and are shown. The right side shows the
+  selected setting in full: its key, what it does, the current value, the
+  values allowed and the example value. `/` finds settings by name, short name
+  or description; `Esc` clears the search. Settings that are only in your
+  `.env` are listed under *Other*.
 - **Back up now**, **Restore a backup** and **Switch engine** run
   `./haven backup`, `./haven restore` and `./haven db-switch` for you. Each asks
   first (a switch asks you to type the engine name), then shows the command's
-  output while it runs and its result at the end. The relay is offline while
-  they run; `Esc` and `q` wait, `Ctrl-C` stops the command and the relay is
-  started again. If a switch was interrupted, *Undo interrupted switch* leads
-  the Data group and runs `./haven db-switch --rollback`.
+  output while it runs and its result at the end. A running relay is offline
+  while they run and starts again afterwards; other keys wait, `Ctrl-C` stops
+  the command (a switch puts everything back) and a relay that ran starts
+  again. If a switch was interrupted, *Undo interrupted switch* leads the Data
+  group and runs `./haven db-switch --rollback`.
 - **Tab** in the main view shows the status: relay state and uptime, Docker or
   Tor, the relay address, the database engine on disk and the size of `db/`,
   the size of `blossom/`, the newest backup (or *never*), the image and the
@@ -299,10 +304,10 @@ The interactive TUI (`./haven` without arguments) understands:
 | Letter in front of an entry | Open that main menu entry directly: `s` Start, `t` Start with Tor, `x` Stop, `r` Restart, `b` Back up now, `e` Restore a backup, `d` Switch engine, `i` Import notes, `c` Settings (.env), `l` Access lists (JSON), `u` Add missing settings, `o` Onion address, `?` Help, `a` About, `q` Quit |
 | `←` / `Esc` | Go back one view (in the settings list a search is cleared first); nothing in the main view |
 | `q` / `Q` | Back one view; from the main view, quit |
-| `Ctrl-C` | Quit the TUI; while a backup, restore or switch runs, stop that command instead (the relay is started again) |
+| `Ctrl-C` | Quit the TUI; while a backup, restore or switch runs, stop that command instead (a relay that ran is started again) |
 | `Tab` | Switch the right panel: log view and status view; in the settings, the restore list and the switch overview, the details of the selected entry and the log view |
 | `PgUp` / `PgDn` | Scroll the log panel backwards / forwards; `Paused` in the panel title marks the scroll position and new lines keep buffering |
-| `/` | Live filter for the log panel (case-insensitive substring) — the number of matching lines shows on the first panel row, an empty Enter clears the filter. In the settings list: find settings by name or description |
+| `/` | Live filter for the log panel (case-insensitive substring) — the number of matching lines shows on the first panel row, an empty Enter clears the filter. In the settings list: find settings by name, short name or description |
 | Bottom row | Names the keys that work in the current view or dialog |
 
 The TUI honours [`NO_COLOR`](https://no-color.org): with `NO_COLOR` set to any
