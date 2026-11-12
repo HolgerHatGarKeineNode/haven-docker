@@ -1,18 +1,18 @@
 # Changelog
 
-## CLI — unreleased (backup, restore and database engine switch)
+## Image v1.2.2-7 — 2026-11-12 (backup, restore and database engine switch; TUI rework)
 
-Changes to the `./haven` CLI on the host. No new image is needed: the new
-verbs run the relay binary of the image you already have (tested with
-`v1.2.2-6`) through `docker compose run`, with no change to `entrypoint.sh` or
-the compose files. Moving from badger to lmdb, or back, is what
+Mostly changes to the `./haven` CLI on the host. The new verbs do not depend on
+this image: they run the relay binary of the image you already have (tested
+with `v1.2.2-6`) through `docker compose run`, with no change to
+`entrypoint.sh`. Moving from badger to lmdb, or back, is what
 [#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15) asked
 for.
 
-One file of the image changed as well: `haven-guard.sh`, the message shown when
+The image was rebuilt for one file: `haven-guard.sh`, the message shown when
 `backup` or `restore` is run inside the running container, now names the host
-commands. That wording is in an image only once the image is rebuilt; the
-images published so far still show the old text.
+commands. Upstream Haven is unchanged (`v1.2.2`); images up to `v1.2.2-6` still
+show the old text.
 
 ### Added
 
