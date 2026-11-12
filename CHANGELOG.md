@@ -2,12 +2,17 @@
 
 ## CLI — unreleased (backup, restore and database engine switch)
 
-Changes to the `./haven` CLI on the host only. No new image is needed: the new
+Changes to the `./haven` CLI on the host. No new image is needed: the new
 verbs run the relay binary of the image you already have (tested with
 `v1.2.2-6`) through `docker compose run`, with no change to `entrypoint.sh` or
 the compose files. Moving from badger to lmdb, or back, is what
 [#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15) asked
 for.
+
+One file of the image changed as well: `haven-guard.sh`, the message shown when
+`backup` or `restore` is run inside the running container, now names the host
+commands. That wording is in an image only once the image is rebuilt; the
+images published so far still show the old text.
 
 ### Added
 
@@ -43,7 +48,8 @@ for.
 
 - Every start path (`start`, `restart`, the TUI menu, the restart after an
   `.env` edit) refuses to start the relay while an engine switch is unfinished,
-  while a one-shot container (backup, restore, import) exists, and when
+  while the temporary container of a running or interrupted backup, restore
+  or import still exists, and when
   `DB_ENGINE` names the other engine than the data in `db/` — started like
   that, the relay serves an empty database. Directories that hold both engines
   or disagree start with one warning line; when nothing in `db/` can be read,
@@ -53,8 +59,8 @@ for.
 - Every write to `.env` keeps the file's mode and owner; a `0600` `.env` no
   longer becomes `0644`
 - `./haven import`, `backup` and `restore` handle Ctrl-C, `kill` and a closed
-  terminal while the relay is stopped: the one-shot container is stopped and
-  the relay is started again before the script exits
+  terminal while the relay is stopped: the temporary container doing the work
+  is stopped and the relay is started again before the script exits
 - `./haven env-upgrade` adds a missing `DB_ENGINE` line with the engine found
   in `db/` when the data there is of one engine, and says so; the relay treats
   a missing line as lmdb, so the example's `badger` would have hidden lmdb data
@@ -77,12 +83,14 @@ for.
   never overwrite a file; a restore reads only a regular file owned by the
   container user, never a symlink
 - File names and arguments are printed with non-printable bytes replaced
-- `db-switch` moves directories only through real directories it made itself:
-  a symlinked stash or set-aside directory is refused, and (with GNU `mv`) a
-  move never lands inside a directory that appeared at the target name
-- `db-switch --rollback` refuses to undo from a stash that is missing some of
-  the directories the switch put there, instead of reporting success on less
-  data than before
+- `db-switch` keeps the old database in `db/.pre-switch-<engine>-<time>/` and
+  moves directories only through real directories it made itself: if one of
+  its own directories under `db/` has been replaced by a symlink it refuses,
+  and (with GNU `mv`) a move never lands inside a directory that appeared at
+  the target name
+- `db-switch --rollback` refuses to undo when the kept old database is missing
+  some of the directories the switch put there, instead of reporting success
+  on less data than before
 
 ## Image v1.2.2-6 — 2026-11-10 (Blossom BUD-11 fix)
 

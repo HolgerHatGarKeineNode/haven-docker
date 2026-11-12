@@ -298,8 +298,8 @@ Inside an input prompt:
 ./haven restore my-relay.zip   # reads backups/my-relay.zip
 ```
 
-Both stop the relay while they run and start it again afterwards. The database
-allows only one writer, so this is not optional.
+Both stop the relay while they run and start it again afterwards if it was
+running. The database allows only one writer, so this is not optional.
 
 Where the file lands: always in `backups/` inside this checkout. The directory
 is created with mode `700`, the zip with mode `600`. You give a file name, not a
@@ -393,8 +393,12 @@ on the other side. They are not copied over. All files of both engines are
 kept in `db/.pre-switch-mixed-<time>/`, and `./haven db-switch --rollback`
 puts that state back if you change your mind.
 
-To keep the notes received since the change instead, take that side:
-`./haven db-switch lmdb --from lmdb` when `.env` now says `lmdb`.
+To keep the notes received since the change instead, take that side. When
+`.env` now says `lmdb`:
+
+```bash
+./haven db-switch lmdb --from lmdb
+```
 
 ### Config backups (`.env.bak.<time>`)
 
