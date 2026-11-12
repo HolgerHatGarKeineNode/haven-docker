@@ -314,7 +314,8 @@ wait_text "▸ s Start" 30 || die "the TUI did not start"
 
 # --- Back up now
 keys b
-wait_text "Back up now? A verified copy of the relay database" 10 || die "no backup confirm"
+# the dialog wraps at the pane width: wait for words of its first row only
+wait_text "Back up now? A verified copy" 10 || die "no backup confirm"
 keys Enter
 if wait_text "Backup finished" 180; then bk_box=yes; else bk_box=no; fi
 cap >"$EVID/backup-box.screen"
