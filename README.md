@@ -265,15 +265,20 @@ The interactive TUI (`./haven` without arguments) understands:
 
 | Key | Action |
 |---|---|
-| `↑` `↓` or `k` `j` | Move the menu selection |
+| `↑` `↓` or `k` `j` | Move the menu selection (group names are skipped) |
 | `g` / `G`, `Home` / `End` | Jump to the first / last menu entry |
 | `1`–`9` | Select the nth menu entry directly (Enter opens it) |
 | `Enter` | Open the selected entry |
+| Letter in front of an entry | Open that main menu entry directly: `s` Start, `t` Start with Tor, `x` Stop, `r` Restart, `b` Back up now, `e` Restore a backup, `d` Switch database engine, `i` Import notes, `c` Settings (.env), `l` Access lists (JSON), `u` Update settings from template, `o` Onion address, `?` Help, `a` About, `q` Quit |
 | `←` / `Esc` | Go back one view |
 | `q` | Back one view; from the main view, quit |
 | `Tab` | Switch the right panel between the log view and the status view |
 | `PgUp` / `PgDn` | Scroll the log panel backwards / forwards; a `paused` banner marks the scroll position and new lines keep buffering |
 | `/` | Live filter for the log panel (case-insensitive substring) — the match count shows on the first panel row, an empty Enter clears the filter |
+
+The TUI honours [`NO_COLOR`](https://no-color.org): with `NO_COLOR` set to any
+value, or `TERM=dumb`, it draws without colours; the selection keeps its `▸`
+marker in reverse video and shortcut letters are underlined.
 
 Inside an input prompt:
 
