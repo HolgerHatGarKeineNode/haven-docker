@@ -107,9 +107,9 @@ images published so far still show the old text.
 
 - The TUI masked every `.env` value whose key contains `TOKEN` or `KEY`
   anywhere, so the rate limiters' `*_TOKENS_PER_INTERVAL` and `*_MAX_TOKENS`
-  showed as `…`. A credential is now a key with SECRET, PASSWORD, TOKEN, KEY
-  (or a similar word) as a whole word of its name, or an `nsec` value; of
-  `.env.example` that masks `S3_ACCESS_KEY_ID` and `S3_SECRET_KEY`
+  showed as `…`. The word TOKENS now stays visible; the rule that masks is
+  under *Security*. Of `.env.example` it masks `S3_ACCESS_KEY_ID` and
+  `S3_SECRET_KEY`
 - The settings editor refused `HAVEN_LOG_LEVEL=WARN`, the level Haven v1.2.2
   reads, and accepted `WARNING`, which Haven logs as INFO; it now takes `WARN`
   and refuses `WARNING` with a message naming `WARN`, and the details pane
@@ -147,6 +147,35 @@ images published so far still show the old text.
 - `db-switch --rollback` refuses to undo when the kept old database is missing
   some of the directories the switch put there, instead of reporting success
   on less data than before
+- A value typed or pasted into the TUI settings editor could add lines to
+  `.env`: `\n` typed as two characters became a line break on the way to the
+  file, so a pasted `"My relay"\nOWNER_NPUB=…` set a second `OWNER_NPUB` that
+  Compose used. Values are now written byte for byte (a typed `\n` stays a
+  backslash and an `n`); a value with a control character (line break, tab,
+  escape) is refused for every setting, and so is one that starts with a
+  quote but is not one quoted string; after every write `.env` must have the
+  same lines as before (one more for a new setting), or the previous file is
+  put back and the write fails
+- A setting that is in `.env` more than once is shown with the value Compose
+  uses (the last line), marked in the list and explained in the details;
+  editing it changes that last line
+- A backup file name could carry terminal escape sequences through the TUI's
+  restore flow (one crafted name set the terminal's clipboard). The restore
+  list now shows only regular files whose names the restore command accepts;
+  messages print file names and other foreign text as text, never as escape
+  codes; everything a command prints during a flow is shown with all escape
+  sequences and control characters removed, and the result box reads its
+  sentences only from lines that start with them
+- The settings editor masks more credentials: a key with a word (split at `_`
+  and at camelCase) that ends in KEY, KEYS, TOKEN, SECRET(S), PASSWORD(S),
+  PASSWD, PASS, PASSPHRASE, PW or PWD (`S3_SECRETKEY`, `APITOKEN`,
+  `NGROK_AUTHTOKEN`, `DB_PWD`), or that is NSEC, SK, SEED, MNEMONIC, XPRV,
+  MACAROON, RUNE, CREDENTIAL(S), AUTH, AUTHORIZATION, BUNKER, NWC or DSN; and
+  any value that starts with `nsec1` or `ncryptsec1`, is 64 hex characters,
+  contains `secret=` (a `bunker://` or `nostr+walletconnect://` URI) or is a
+  URL with a `user:password@` part. Keys ending in FILE, PATH or DIR hold
+  file paths and stay visible. Editing a setting no longer hands its current
+  value to the input prompt, where a refused value used to be drawn in clear
 
 ## Image v1.2.2-6 — 2026-11-10 (Blossom BUD-11 fix)
 

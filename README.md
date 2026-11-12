@@ -268,9 +268,14 @@ works differently from the command line.
 - **Settings (.env)** lists your settings in the sections of `.env.example`,
   each with a short name and its current value; the section stays at the top
   while the list scrolls. Credentials show only their last four characters:
-  keys with SECRET, PASSWORD, TOKEN, KEY (and similar) as a whole word of the
-  name, such as `S3_SECRET_KEY`, and any value that is an `nsec`. The rate
-  limiters' numbers are not credentials and are shown. The right side shows the
+  keys with a word (split at `_` and at camelCase humps) that ends in KEY,
+  KEYS, TOKEN, SECRET(S), PASSWORD(S), PASSWD, PASS, PASSPHRASE, PW or PWD,
+  such as `S3_SECRET_KEY`, `APITOKEN` or `DB_PWD`, or that is NSEC, SK, SEED,
+  MNEMONIC, XPRV, MACAROON, RUNE, CREDENTIAL(S), AUTH, AUTHORIZATION, BUNKER,
+  NWC or DSN; and, whatever the key, a value that starts with `nsec1` or
+  `ncryptsec1`, is 64 hex characters, contains `secret=` or is a URL with a
+  `user:password@` part. TOKENS (the rate limiters' numbers) and keys ending in
+  FILE, PATH or DIR (file paths) are shown. The right side shows the
   selected setting in full: its key, what it does, the current value, the
   values allowed and the example value. `/` finds settings by name, short name
   or description; `Esc` clears the search. Settings that are only in your
@@ -303,7 +308,7 @@ The interactive TUI (`./haven` without arguments) understands:
 | `Enter` | Open the selected entry |
 | Letter in front of an entry | Open that main menu entry directly: `s` Start, `t` Start with Tor, `x` Stop, `r` Restart, `b` Back up now, `e` Restore a backup, `d` Switch engine, `i` Import notes, `c` Settings (.env), `l` Access lists (JSON), `u` Add missing settings, `o` Onion address, `?` Help, `a` About, `q` Quit |
 | `←` / `Esc` | Go back one view (in the settings list a search is cleared first); nothing in the main view |
-| `q` / `Q` | Back one view; from the main view, quit |
+| `q` / `Q` | Back one view (in the settings list a search is cleared first); from the main view, quit |
 | `Ctrl-C` | Quit the TUI; while a backup, restore or switch runs, stop that command instead (a relay that ran is started again) |
 | `Tab` | Switch the right panel: log view and status view; in the settings, the restore list and the switch overview, the details of the selected entry and the log view |
 | `PgUp` / `PgDn` | Scroll the log panel backwards / forwards; `Paused` in the panel title marks the scroll position and new lines keep buffering |
