@@ -1,5 +1,26 @@
 # Changelog
 
+## CLI — unreleased (db-switch on a host without unzip)
+
+A change to the `./haven` CLI on the host; no new image. It comes from
+[#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15), where
+`db-switch` refused to run on a host that has no `unzip` and cannot install
+one.
+
+### Fixed
+
+- `./haven db-switch` no longer stops in its first step on a host without
+  `unzip`. It compares the two backups entry by entry with the host's `unzip`
+  when there is one and with the `unzip` inside the image otherwise, as
+  `backup` and `restore` already did for their own check. The output names the
+  one that was used. When neither can list the entries, the switch is undone
+  as before; it never reports success without the comparison
+
+### Changed
+
+- README: a Requirements part in the Quick start lists what the `./haven` CLI
+  needs on the host, what is optional, and which platforms are tested
+
 ## Image v1.2.2-7 — 2026-11-12 (backup, restore and database engine switch; TUI rework)
 
 Mostly changes to the `./haven` CLI on the host. The new verbs do not depend on

@@ -153,10 +153,11 @@ readme_shows() { grep -qE "\./haven $1( |\`|\$)" "$README"; }
   [[ "$flat" != *"a shorter one only"* ]]
 }
 
-# C1: the top CHANGELOG entry carries the behaviour the P6 final rework added
-@test "docs: the top CHANGELOG entry names the duplicated-key, restart-box, \$-note, quoting, writer, log-pane and terminal changes (C1)" {
+# C1: the v1.2.2-7 CHANGELOG entry carries the behaviour the P6 final rework added
+@test "docs: the v1.2.2-7 CHANGELOG entry names the duplicated-key, restart-box, \$-note, quoting, writer, log-pane and terminal changes (C1)" {
   local top missing="" l
-  top="$(awk '/^## / {n++} n == 1' "$CHANGELOG" | tr '\n' ' ' | tr -s ' ')"
+  top="$(awk '/^## / {on = ($0 ~ /^## Image v1\.2\.2-7 /)} on' "$CHANGELOG" | tr '\n' ' ' | tr -s ' ')"
+  [ -n "$top" ]
   while IFS= read -r l; do
     [[ -z "$l" || "$top" == *"$l"* ]] || missing+="[$l] "
   done <<'LINES'

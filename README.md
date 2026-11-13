@@ -6,7 +6,8 @@ This repository packages Haven as a Docker Compose setup with a TUI for configur
 
 ## Quick start
 
-1. Ensure **Docker** and **Docker Compose** are installed and running.
+1. Ensure **Docker** and **Docker Compose** are installed and running. What the
+   `./haven` CLI needs beyond that is listed under [Requirements](#requirements).
 
 2. Get this repository onto the host. The Compose files, the example configs and
    the `./haven` CLI all live here, and every command below is run from inside
@@ -63,6 +64,36 @@ All relay names, descriptions, icons, rate limiters, WOT, backup, and import set
 The TUI guides you through the remaining setup. Prefer plain Compose? `docker
 compose up -d` works just as well — see
 [Without the CLI](#without-the-cli-plain-docker-compose).
+
+### Requirements
+
+Running the relay needs **Docker** and **Docker Compose** (`docker compose`, or
+the older `docker-compose`) and nothing else. Plain `docker compose up -d` uses
+none of the tools below, see
+[Without the CLI](#without-the-cli-plain-docker-compose).
+
+The `./haven` CLI is a bash script that runs on the host. It needs:
+
+| | |
+|---|---|
+| Required | **bash 4.2 or newer** (`./haven help` runs on any bash) and the usual Unix tools, among them `awk`, `sed`, `grep`, `find`, `stat`, `date`, `id`, `od`, `du`, `df`, `mktemp`, `sort`, `tail`, `head`, `tr`, `cut`, `wc`, `cp`, `mv`, `rm`, `mkdir`, `chmod`, `chown` |
+| For the TUI (`./haven` without arguments) | a terminal, plus `tput`, `stty`, `mkfifo` and `seq` |
+| Optional | `unzip`: `backup`, `restore` and `db-switch` check the zips with the host's `unzip` and use the one inside the image when the host has none. `jq` or `python3`: only to edit the JSON lists through `./haven`; without both, edit the files by hand. `setsid`: used for the log pane when it is there |
+
+Platforms:
+
+- **Linux** with GNU tools: tested. The test suite and the real-Docker runs
+  happen here.
+- **macOS**: untested. It ships bash 3.2, and `./haven` stops with a message
+  that asks for a newer one (for example `brew install bash`). The script
+  carries the BSD forms of `stat` and `date` and does not depend on `setsid`,
+  but no run on macOS has confirmed the rest.
+- **Windows**: use WSL2 and run everything inside the Linux distribution.
+  Untested.
+- **NAS and other minimal hosts** (BusyBox tools, no package manager):
+  untested. Nothing has to be installed for `unzip`, the image brings its own.
+  Whether a BusyBox build has every option the script uses is not verified. If
+  `./haven` does not run on your host, plain `docker compose` does.
 
 ### File ownership (`db/` permission errors)
 
@@ -353,7 +384,8 @@ running. The database allows only one writer, so this is not optional.
 Where the file lands: always in `backups/` inside this checkout. The directory
 is created with mode `700`, the zip with mode `600`. You give a file name, not a
 path. A backup never overwrites an existing file. Every zip is checked with
-`unzip -t` before it is called a backup.
+`unzip -t` before it is called a backup: with the host's `unzip`, or with the
+one inside the image when the host has none.
 
 What a backup contains: the events of all five relay databases (private, chat,
 inbox, outbox, and the Blossom index), as five `.jsonl` files in one zip.
@@ -396,6 +428,11 @@ It asks once, then:
 3. sets `DB_ENGINE` in `.env`
 4. restores the backup into a new database and checks it against the first backup
 5. starts the relay again, if it was running
+
+The check in step 4 makes a second backup from the new database and compares
+it with the first, entry by entry (CRC32). It reads the entries with the
+host's `unzip`, or with the one inside the image when the host has none, and
+the output says which. No `unzip` has to be installed on the host.
 
 If a step fails, it puts the old directories back and sets `DB_ENGINE` to
 match them; if it cannot, it tells you what to do. Your old data stays in `db/.pre-switch-<old engine>-<time>/`. `./haven` never
@@ -485,7 +522,8 @@ docker compose start relay
 unzip -t backups/haven-backup.zip
 ```
 
-`unzip -t` must end with `No errors detected`. Do not rely on the exit code of
+`unzip -t` must end with `No errors detected`; that check is the only line
+here that needs a tool besides Docker on the host. Do not rely on the exit code of
 the backup alone: on a full disk it can report success and leave a broken zip.
 The zip itself is written with mode `644`; the `700` on `backups/` is what
 keeps it private.
