@@ -1,6 +1,6 @@
 # Changelog
 
-## Image v1.2.2-8 — unreleased (LMDB: a COUNT request no longer hangs the relay; db-switch without a host unzip)
+## Image v1.2.2-8 — 2026-11-13 (LMDB: a COUNT request no longer hangs the relay; db-switch without a host unzip)
 
 A new image and changes to the `./haven` CLI on the host. Both come from
 [#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15).
