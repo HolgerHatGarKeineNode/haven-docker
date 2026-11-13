@@ -50,7 +50,7 @@ All relay names, descriptions, icons, rate limiters, WOT, backup, and import set
 
 5. Edit the JSON lists to fit your needs:
 
-- `relays_import.json` — relays to import notes from
+- `relays_import.json` — relays Haven reads from: the import, the web of trust and the live inbox pull ([what to put in it](#what-relays_importjson-is-for))
 - `relays_blastr.json` — relays for blastr to broadcast to
 - `blacklisted_npubs.json` — npubs to block
 - `whitelisted_npubs.json` — npubs to allow (if whitelist mode)
@@ -296,16 +296,67 @@ What it fetches, from the relays in `relays_import.json`:
 - your own notes, in 10-day windows from `IMPORT_START_DATE` up to now, into the outbox relay
 - notes tagging you, into the inbox relay — gift-wrapped ones into the chat relay
 
-Do **not** empty `relays_import.json` when the import is done. The running relay
-reads it at every boot and needs it for three more things: the connectivity check
-at startup, building the web of trust (follow lists are fetched from exactly
-these relays), and the live inbox subscription. With an empty list the web of
-trust shrinks to your whitelist and the inbox stops receiving anything.
-
 After starting, `./haven start` compares your `.env` against the `.env.example`
 that upstream Haven ships inside the image and names any variable the relay
 supports but your `.env` leaves unset — it then runs on its built-in default.
 `./haven env-upgrade` adds the ones this repo documents.
+
+### What `relays_import.json` is for
+
+The name undersells it. Haven calls these its seed relays and reads from them in
+four places — only the first one is the import:
+
+| Use | When | What Haven asks these relays for |
+|---|---|---|
+| Import | `./haven import` | your own notes and the notes tagging you |
+| Connectivity check | every boot | a connection to each relay |
+| Web of trust | every boot, then every `WOT_REFRESH_INTERVAL` | your follow list; with `WOT_DEPTH=3` also the follow lists of the people you follow |
+| Inbox pull | as long as the relay runs | new notes tagging you |
+
+"You" means the owner and every npub in `whitelisted_npubs.json`.
+
+The inbox fills in two ways. A client that looks up your relay list (NIP-65)
+sends its reply straight to `wss://<your relay>/inbox` — if that address is in
+your list as a read relay, and the client authenticates when Haven asks it to.
+Not every client does: some publish the reply to their own relays and nowhere
+else. The inbox pull is for those — Haven keeps a subscription open on every
+relay in this file and copies notes tagging you into the inbox, provided the
+author is in your web of trust. Gift-wrapped messages go to the chat relay
+without that check: their author key is random by design, so there is nothing
+to check it against.
+
+So do **not** empty the file when the import is done:
+
+- **An empty list (`[]`)** still boots, but the web of trust is then your
+  whitelist alone and the pull stops. With `WOT_DEPTH` 1 to 3 that leaves only
+  the owner and whitelisted npubs able to write to the inbox and chat relays.
+- **A list where no relay answers** stops Haven at boot with `Unable to connect
+  to any import relays`. If only some fail, it logs a warning and carries on.
+
+What to put in it:
+
+- **The relays you published to before Haven** — the import finds your old notes
+  only there.
+- **A few large public relays** — the pull only sees a reply that lands on a
+  relay in this file.
+- **At least one relay that holds your current follow list.** Haven builds the
+  web of trust from these relays only, never from its own database. If your
+  follow list is on none of them, the web of trust is your whitelist alone.
+  With `WOT_DEPTH=3` the follow lists of the people you follow come from the
+  same relays, which is one more reason for large ones.
+- **Relays that answer without a login.** Haven does not authenticate to other
+  relays. One that demands it passes the connectivity check and then refuses
+  the subscription.
+
+Your own relay does not belong in it. The connectivity check and the web of
+trust run before Haven starts listening, so that entry fails at every boot — a
+warning as long as another relay connects, a failed start if it is the only
+one. Once Haven is up it would subscribe to itself, which adds nothing.
+
+The list does not have to match the relays set in your Nostr client: this file
+is where Haven itself reads from, whatever the client uses. It is also not
+`relays_blastr.json`, which is the other direction — where Haven sends your
+notes to.
 
 ## The TUI
 
