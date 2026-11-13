@@ -49,6 +49,14 @@
 #                       from `-e DB_ENGINE=<e>` (none given: lmdb, as upstream).
 #                       Written before the exit status is applied, so a failing
 #                       restore leaves a partial database like the real one
+#   MOCK_IMAGE_BIN=<dir>  the image's userland for an unzip one-shot: a `run ...
+#                       --entrypoint sh relay -c '<script naming unzip>' sh
+#                       /app/backups/<f>` really runs <script> with /bin/sh,
+#                       PATH=<dir> alone and $1 = <f> on the host side of the
+#                       `-v <host>:/app/backups` mount; its output and exit
+#                       status are the run's (MOCK_RUN_EXIT / MOCK_FAIL_AT win).
+#                       <dir> holds an `unzip` or none (an image without unzip).
+#                       Unset: such a run prints nothing, as before
 #   HAVEN_CONTAINER_NAME  name that start/up/restart mark as running
 #                         (default haven-relay)
 #   MOCK_LOG_COUNT=<n>  `compose logs` emits exactly n lines (MOCKLOG COUNTER=0 ..
@@ -230,6 +238,20 @@ mock_scripted() {
       local rc="${MOCK_RUN_EXIT:-0}"
       if [[ -n "${MOCK_FAIL_AT:-}" && "$n" == "$MOCK_FAIL_AT" ]]; then
         (( rc != 0 )) || rc=1
+      fi
+      if (( rc == 0 )) && [[ -n "${MOCK_IMAGE_BIN:-}" ]]; then
+        local k script="" bhost="" file="${args[*]: -1}"
+        for ((k = 0; k < ${#args[@]}; k++)); do
+          if [[ "${args[$k]}" == "-v" && "${args[$((k + 1))]:-}" == *":/app/backups" ]]; then
+            bhost="${args[$((k + 1))]%:/app/backups}"
+          elif [[ "${args[$k]}" == "-c" ]]; then
+            script="${args[$((k + 1))]:-}"
+          fi
+        done
+        if [[ "$script" == *unzip* && -n "$bhost" && "$file" == /app/backups/* ]]; then
+          PATH="$MOCK_IMAGE_BIN" /bin/sh -c "$script" sh "$bhost/${file#/app/backups/}"
+          exit $?
+        fi
       fi
       exit "$rc"
       ;;

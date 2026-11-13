@@ -271,7 +271,8 @@ DB_ENGINE_DIRS=(private chat outbox inbox blossom)
 DB_ENGINE_DIRS_TEXT="private chat outbox inbox blossom"
 # The five entries of an upstream backup zip, sorted with LC_ALL=C.
 BACKUP_ENTRIES=$'blossom.jsonl\nchat.jsonl\ninbox.jsonl\noutbox.jsonl\nprivate.jsonl'
-# Host unzip used to verify a backup; the image's own unzip is the fallback.
+# Host unzip used to verify a backup and to read its entry CRCs (db-switch);
+# the image's own unzip is the fallback.
 # HAVEN_HOST_UNZIP is a test seam (unset: unzip from PATH).
 HOST_UNZIP="${HAVEN_HOST_UNZIP:-unzip}"
 
@@ -4434,28 +4435,49 @@ dbs_fail() {
   return 1
 }
 
-# zip_entry_crcs <zip> — "name crc" per entry, sorted, from the host unzip.
+# zip_entry_crcs <compose_file> <zip in backups/> — "name crc" per entry,
+# sorted. The host unzip reads them when there is one; without it the image's
+# own (busybox) unzip does, one-shot as in verify_backup_zip: its -v listing has
+# the columns of Info-ZIP's (CRC-32 in field 7, name in field 8; measured on
+# v1.2.2-7). A listing that cannot be read gives no lines, never a made-up one.
 zip_entry_crcs() {
-  "$HOST_UNZIP" -v "$1" 2>/dev/null | awk 'NF >= 8 && $7 ~ /^[0-9a-f]{8}$/ {print $8, $7}' | LC_ALL=C sort
+  local compose_file="$1" f="$2" listing=""
+  if command -v "$HOST_UNZIP" >/dev/null 2>&1; then
+    listing="$("$HOST_UNZIP" -v "$f" 2>/dev/null)" || listing=""
+  else
+    # shellcheck disable=SC2016  # $1 expands inside the container's sh, not here
+    listing="$(dc "$compose_file" run --rm --no-deps -T --name "$ONESHOT_CONTAINER" \
+      -v "$BACKUP_DIR:/app/backups" --entrypoint sh relay \
+      -c 'command -v unzip >/dev/null 2>&1 || exit 99; unzip -v "$1"' \
+      sh "/app/backups/${f##*/}" 2>/dev/null)" || listing=""
+  fi
+  printf '%s\n' "$listing" | awk 'NF >= 8 && $7 ~ /^[0-9a-f]{8}$/ {print $8, $7}' | LC_ALL=C sort
 }
 
+# dbs_compare_crcs <compose_file> <zip> <zip> — 0 only when both backups list
+# the same five entries with the same CRC32. Sets DBS_CRCS_BY.
+DBS_CRCS_BY=""
 dbs_compare_crcs() {
-  local a b
-  a="$(zip_entry_crcs "$1")" || a=""
-  b="$(zip_entry_crcs "$2")" || b=""
+  local compose_file="$1" a b
+  DBS_CRCS_BY="the image's unzip"
+  if command -v "$HOST_UNZIP" >/dev/null 2>&1; then
+    DBS_CRCS_BY="host unzip"
+  fi
+  a="$(zip_entry_crcs "$compose_file" "$2")" || a=""
+  b="$(zip_entry_crcs "$compose_file" "$3")" || b=""
   if [[ "$(printf '%s\n' "$a" | awk 'NF {n++} END {print n + 0}')" -ne 5 ]]; then
-    DBS_ERR="cannot read the entry CRCs of ${1##*/}"
+    DBS_ERR="cannot read the entry CRCs of ${2##*/} with $DBS_CRCS_BY"
     return 1
   fi
   if [[ "$a" != "$b" ]]; then
-    DBS_ERR="the backup of the new database differs from the backup of the old one (per-entry CRC32) — old: ${a//$'\n'/, } — new: ${b//$'\n'/, }"
+    DBS_ERR="the backup of the new database differs from the backup of the old one (per-entry CRC32, read with $DBS_CRCS_BY) — old: ${a//$'\n'/, } — new: ${b//$'\n'/, }"
     return 1
   fi
   return 0
 }
 
-# dbs_common_checks <need_unzip:0|1> — read-only checks shared by the switch and
-# the undo; warns and returns 1 on the first that fails.
+# dbs_common_checks — read-only checks shared by the switch and the undo; warns
+# and returns 1 on the first that fails.
 dbs_common_checks() {
   local db="$ROOT_DIR/db" uid gid lines out=""
   if [[ -e "$DB_SWITCH_MARKER" || -L "$DB_SWITCH_MARKER" ]]; then
@@ -4493,10 +4515,6 @@ dbs_common_checks() {
   fi
   if [[ -n "$out" ]]; then
     warn_plain "$(printable_text "${out#"$ROOT_DIR/"}") is not owned by uid $uid, the user the container runs as; the restored database could not be written next to it. Fix with: sudo chown -R ${uid}:${gid} $db"
-    return 1
-  fi
-  if [[ "$1" == "1" ]] && ! command -v "$HOST_UNZIP" >/dev/null 2>&1; then
-    warn "db-switch compares the backups before and after entry by entry with unzip, and there is no unzip on this host. Install it (e.g. 'apt install unzip') and try again."
     return 1
   fi
   oneshot_leftover_check || return 1
@@ -4631,7 +4649,7 @@ db_switch() {
   mode="$(resolve_mode "db-switch")"
   compose_file="$(compose_file_for "$mode")"
   require_compose_file "$compose_file"
-  if ! dbs_common_checks 1; then
+  if ! dbs_common_checks; then
     dbs_result failed
     return 1
   fi
@@ -4893,13 +4911,13 @@ dbs_run() {
     dbs_fail "$compose_file" "the backup of the new database did not succeed."
     return 1
   fi
-  if ! dbs_compare_crcs "$BACKUP_DIR/$DBS_BACKUP" "$BACKUP_DIR/$DBS_BACKUP2"; then
+  if ! dbs_compare_crcs "$compose_file" "$BACKUP_DIR/$DBS_BACKUP" "$BACKUP_DIR/$DBS_BACKUP2"; then
     dbs_fail "$compose_file" "$DBS_ERR."
     return 1
   fi
   DBS_STEP="verified"
   dbs_write_marker || { dbs_fail "$compose_file" "cannot update db/.switch-in-progress."; return 1; }
-  success "The new $DBS_TARGET database holds the same entries as the old one (per-entry CRC32 of both backups)." || true
+  success "The new $DBS_TARGET database holds the same entries as the old one (per-entry CRC32 of both backups, read with $DBS_CRCS_BY)." || true
 
   # --- 7 start ---
   dbs_progress 7 "$DBS_STEPS" start
@@ -5116,7 +5134,7 @@ dbs_undo_last() {
     fi
   done
 
-  if ! dbs_common_checks 0; then
+  if ! dbs_common_checks; then
     dbs_result failed
     return 1
   fi

@@ -53,7 +53,7 @@ SH
   mkdir -p "$MOCK_DOCKER_STATE_DIR"
   unset MOCK_STOP_FAILS MOCK_RUN_EXIT MOCK_FAIL_AT MOCK_RUN_HOLD MOCK_HOLD_MAX MOCK_HOLD_AT \
     MOCK_RUN_PAYLOAD MOCK_PAYLOAD_AT MOCK_PAYLOAD_AT_FILE HAVEN_HOST_UNZIP \
-    MOCK_START_FAILS MOCK_STOP_SLEEP HAVEN_TEST_SWITCH_HOOK
+    MOCK_START_FAILS MOCK_STOP_SLEEP HAVEN_TEST_SWITCH_HOOK MOCK_IMAGE_BIN IMAGE_UNZIP_FAIL
   export HAVEN_CONTAINER_NAME=havensw-relay
   export MOCK_RUN_WRITES=1 MOCK_RUN_PAYLOAD_FILE="$FIXTURES/good.zip" MOCK_DB_DIR="$SB/db"
 }
@@ -1562,4 +1562,149 @@ SH
   run hv env-upgrade
   grep -qx 'DB_ENGINE=badger' "$SB/.env"
   [ "$(grep -c '^DB_ENGINE=' "$SB/.env")" -eq 1 ]
+}
+
+# ---------- a host without unzip (issue #15: a NAS that cannot install it) ----------
+# The image's userland is $TEST_DIR/image-bin (MOCK_IMAGE_BIN): its `unzip` logs
+# every call to $TEST_DIR/image-unzip.log and hands it to the real unzip, so the
+# one-shot scripts ./haven passes really run. IMAGE_UNZIP_FAIL=<option> makes
+# the calls with that first option fail without output.
+
+UNZIP_ONESHOT=' run --rm --no-deps -T --name havensw-relay-oneshot -v [^ ]*/backups:/app/backups --entrypoint sh relay -c .*unzip -v "\$1" sh /app/backups/'
+
+image_unzip() { # [none] — none: an image without unzip
+  mkdir -p "$TEST_DIR/image-bin"
+  export MOCK_IMAGE_BIN="$TEST_DIR/image-bin" IMAGE_UNZIP_LOG="$TEST_DIR/image-unzip.log"
+  : > "$IMAGE_UNZIP_LOG"
+  [[ "${1:-}" != none ]] || return 0
+  local real bash_bin
+  real="$(command -v unzip)"
+  bash_bin="$(command -v bash)"
+  cat > "$TEST_DIR/image-bin/unzip" <<SH
+#!$bash_bin
+printf '%s\n' "\$*" >> "\$IMAGE_UNZIP_LOG"
+[[ -z "\${IMAGE_UNZIP_FAIL:-}" || "\${1:-}" != "\$IMAGE_UNZIP_FAIL" ]] || exit 1
+exec "$real" "\$@"
+SH
+  chmod +x "$TEST_DIR/image-bin/unzip"
+}
+no_host_unzip() { export HAVEN_HOST_UNZIP=no-such-unzip-4711; ! command -v "$HAVEN_HOST_UNZIP"; }
+
+@test "U1 no host unzip, the image has one: the switch completes and the image's unzip read the CRCs of both backups" {
+  fake_engine badger
+  relay_running
+  snapshot
+  no_host_unzip
+  image_unzip
+  run hv db-switch lmdb --yes
+  echo "$output"; calls; cat "$IMAGE_UNZIP_LOG"
+  [ "$status" -eq 0 ]
+  [ "$(result_line)" = "::result ok" ]
+  [[ "$output" != *"no unzip on this host"* ]]
+  [[ "$output" == *"holds the same entries as the old one (per-entry CRC32 of both backups, read with the image's unzip)."* ]]
+  # one CRC one-shot per backup, after the second backup and before the start
+  local c1 c2 r3 t
+  r3="$(line_of " run .* -e DB_ENGINE=lmdb --entrypoint sh relay -c .* /app/backups/$BK_POST\\.partial-[0-9a-f]{16}$")"
+  c1="$(line_of "$UNZIP_ONESHOT$BK_PRE$")"
+  c2="$(line_of "$UNZIP_ONESHOT$BK_POST$")"
+  t="$(line_of ' up -d relay$')"
+  [ -n "$r3" ] && [ -n "$c1" ] && [ -n "$c2" ] && [ -n "$t" ]
+  (( r3 < c1 && c1 < c2 && c2 < t ))
+  [ "$(grep -c -- "$UNZIP_ONESHOT" "$MOCK_DOCKER_STATE_DIR/calls.log")" -eq 2 ]
+  # the image's unzip really listed both
+  grep -qE -- "^-v .*/backups/haven-pre-switch-lmdb-$TS\\.zip$" "$IMAGE_UNZIP_LOG"
+  grep -qE -- "^-v .*/backups/haven-post-switch-lmdb-$TS\\.zip$" "$IMAGE_UNZIP_LOG"
+  [ "$(env_engine)" = lmdb ] && [ "$(disk_engine)" = lmdb ]
+  [ ! -e "$SB/db/.switch-in-progress" ]
+  relay_is_running
+  nothing_lost
+}
+
+@test "U2a no host unzip and none in the image: stopped at the first backup, nothing changed, result failed" {
+  fake_engine badger
+  relay_running
+  snapshot
+  no_host_unzip
+  image_unzip none
+  run hv db-switch lmdb --yes
+  invariants 0 1 failed
+  [[ "$output" != *"holds the same entries"* ]]
+  [[ "$output" == *"could not be verified"* ]]
+  [ -z "$(line_of ' relay restore ')" ]
+  cmp "$TEST_DIR/env.before" "$SB/.env"
+  [ "$(disk_engine)" = badger ]
+  relay_is_running
+}
+
+@test "U2b no host unzip and the image's unzip cannot list the CRCs: rolled back, never ok without a comparison" {
+  fake_engine badger
+  relay_running
+  snapshot
+  no_host_unzip
+  image_unzip
+  export IMAGE_UNZIP_FAIL=-v
+  run hv db-switch lmdb --yes
+  cat "$IMAGE_UNZIP_LOG"
+  invariants 1 1 rolled-back
+  # the comparison was reached and both listings were asked for
+  [ "$(grep -c -- "$UNZIP_ONESHOT" "$MOCK_DOCKER_STATE_DIR/calls.log")" -eq 2 ]
+  [[ "$output" == *"cannot read the entry CRCs of haven-pre-switch-lmdb-$TS.zip with the image's unzip"* ]]
+  [[ "$output" != *"holds the same entries"* ]]
+  [ -f "$SB/db/.failed-$TS/chat/data.mdb" ]
+  cmp "$TEST_DIR/env.before" "$SB/.env"
+  [ "$(disk_engine)" = badger ]
+  relay_is_running
+}
+
+@test "U2c no host unzip and the CRC one-shot of the second backup does not run: rolled back" {
+  fake_engine badger
+  relay_running
+  snapshot
+  no_host_unzip
+  image_unzip
+  # runs without a host unzip: 1 backup, 2 verify, 3 verify again, 4 restore,
+  # 5 backup, 6 verify, 7 CRCs of the first, 8 CRCs of the second
+  export MOCK_FAIL_AT=8
+  run hv db-switch lmdb --yes
+  invariants 1 1 rolled-back
+  [ "$(grep -n -- "$UNZIP_ONESHOT$BK_POST$" "$MOCK_DOCKER_STATE_DIR/calls.log" | cut -d: -f1)" = "$(grep -n ' run ' "$MOCK_DOCKER_STATE_DIR/calls.log" | sed -n '8p' | cut -d: -f1)" ]
+  [[ "$output" == *"differs from the backup of the old one (per-entry CRC32, read with the image's unzip)"* ]]
+  [[ "$output" != *"holds the same entries"* ]]
+  cmp "$TEST_DIR/env.before" "$SB/.env"
+  relay_is_running
+}
+
+@test "U3 no host unzip and the second backup differs: the image's CRCs differ, rolled back" {
+  fake_engine badger
+  relay_running
+  snapshot
+  no_host_unzip
+  image_unzip
+  # run 5 is the second backup (see U2c)
+  export MOCK_PAYLOAD_AT=5 MOCK_PAYLOAD_AT_FILE="$FIXTURES/other.zip"
+  run hv db-switch lmdb --yes
+  invariants 1 1 rolled-back
+  cmp "$FIXTURES/other.zip" "$SB/backups/haven-post-switch-lmdb-$TS.zip"
+  [[ "$output" == *"differs from the backup of the old one (per-entry CRC32, read with the image's unzip)"* ]]
+  [[ "$output" != *"holds the same entries"* ]]
+  [ -f "$SB/db/.failed-$TS/chat/data.mdb" ]
+  cmp "$TEST_DIR/env.before" "$SB/.env"
+  relay_is_running
+}
+
+@test "U4 host unzip present: it reads the CRCs, no unzip one-shot reaches the image" {
+  fake_engine badger
+  relay_running
+  snapshot
+  command -v unzip
+  image_unzip
+  run hv db-switch lmdb --yes
+  echo "$output"; calls
+  [ "$status" -eq 0 ]
+  [ "$(result_line)" = "::result ok" ]
+  [[ "$output" == *"(per-entry CRC32 of both backups, read with host unzip)."* ]]
+  [ -z "$(line_of 'unzip')" ]
+  [ ! -s "$IMAGE_UNZIP_LOG" ]
+  # exactly the three one-shots of a switch: backup, restore, backup
+  [ "$(grep -c ' run ' "$MOCK_DOCKER_STATE_DIR/calls.log")" -eq 3 ]
 }
