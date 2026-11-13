@@ -26,6 +26,7 @@ in_haven() {
     source '"$REPO_ROOT"'/haven
     set +e
     ROOT_DIR="$SB" SCRIPT_NAME=haven
+    BACKUP_DIR="$SB/backups"
     TUI_DOCKER_OK=0
     tui_update_layout
     eval "$SNIP"
@@ -281,4 +282,18 @@ write[RELAY_PORT=4444]" ]]
 one
 
 two" ]]
+}
+
+@test "tui: a host without tput is told so before the terminal is touched" {
+  run in_haven '
+    stty() { echo "STTY-CALLED"; }
+    tput() { echo "TPUT-CALLED"; }
+    tui_init() { echo "INIT-REACHED"; exit 7; }   # a regression fails here instead of entering the loop
+    command() { if [[ "$1" == "-v" && "$2" == "tput" ]]; then return 1; fi; builtin command "$@"; }
+    tui_loop menu'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"the TUI needs tput, which is not installed on this host"* ]]
+  [[ "$output" == *"./haven help lists them all."* ]]
+  [[ "$output" != *"STTY-CALLED"* ]]
+  [[ "$output" != *"TPUT-CALLED"* ]]
 }

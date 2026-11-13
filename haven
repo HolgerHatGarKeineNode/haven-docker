@@ -4451,7 +4451,7 @@ zip_entry_crcs() {
       -c 'command -v unzip >/dev/null 2>&1 || exit 99; unzip -v "$1"' \
       sh "/app/backups/${f##*/}" 2>/dev/null)" || listing=""
   fi
-  printf '%s\n' "$listing" | awk 'NF >= 8 && $7 ~ /^[0-9a-f]{8}$/ {print $8, $7}' | LC_ALL=C sort
+  printf '%s\n' "$listing" | awk 'NF >= 8 && length($7) == 8 && $7 ~ /^[0-9a-f]+$/ {print $8, $7}' | LC_ALL=C sort
 }
 
 # dbs_compare_crcs <compose_file> <zip> <zip> — 0 only when both backups list
@@ -8339,6 +8339,17 @@ tui_loop() {
       "$SCRIPT_NAME" "${TERM:-}" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" >&2
     exit 1
   fi
+
+  # The TUI drives the terminal with tput and stty. A minimal host (BusyBox,
+  # no ncurses) may lack one; say which, before anything touches the terminal.
+  local tui_tool
+  for tui_tool in tput stty mkfifo; do
+    if ! command -v "$tui_tool" >/dev/null 2>&1; then
+      printf '%s: the TUI needs %s, which is not installed on this host; use the commands instead, e.g. ./%s status, ./%s start, ./%s backup — ./%s help lists them all.\n' \
+        "$SCRIPT_NAME" "$tui_tool" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" >&2
+      exit 1
+    fi
+  done
 
   # Size check BEFORE tui_init touches stty/the alternate screen, so a
   # too-small terminal leaves the shell state untouched.

@@ -15,6 +15,13 @@ one.
   `backup` and `restore` already did for their own check. The output names the
   one that was used. When neither can list the entries, the switch is undone
   as before; it never reports success without the comparison
+- `./haven db-switch` reads the CRC column of the zip listing without an awk
+  interval expression (`{8}`). Older `mawk` builds do not support intervals;
+  there the list would come out empty and every switch would be undone. Not
+  reproduced on such a host, the pattern was changed on reading
+- The TUI names the missing tool and exits when `tput`, `stty` or `mkfifo` is
+  not installed, before it changes the terminal, instead of dying in the
+  middle of its start
 
 ### Changed
 
