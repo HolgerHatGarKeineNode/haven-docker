@@ -28,12 +28,49 @@ RUN set -e; for p in /patches/*.patch; do \
       echo "applying $p"; git apply --verbose "$p"; \
     done
 
+# Carry a fix inside a dependency: fiatjaf/eventstore#78, the LMDB count that
+# never returns (see patches/README.md). The module is copied out of the module
+# cache at exactly the version Haven pins (go.sum has verified it), patched from
+# patches/eventstore/, and Haven is pointed at the copy with a `replace` — the
+# shape upstream proposes in barrydeen/haven#139. Every other dependency still
+# comes from the module cache.
+# The build fails on purpose when Haven requires another eventstore version or
+# replaces the module itself, and when a patch no longer applies: that is the
+# moment to check whether upstream carries the fix and to drop this step.
+RUN --mount=type=cache,target=/gomod-cache --mount=type=cache,target=/go-cache \
+    set -e; mod=github.com/fiatjaf/eventstore; want=v0.17.5; \
+    got="$(go list -m -f '{{.Version}}{{if .Replace}} (replaced by {{.Replace.Path}}){{end}}' "$mod")"; \
+    if [ "$got" != "$want" ]; then \
+      echo "ERROR: Haven builds against $mod $got, but patches/eventstore/ is cut for $want."; \
+      echo "       If that version carries fiatjaf/eventstore#78, drop this step, patches/eventstore/"; \
+      echo "       and the patches/README.md row; otherwise recut the patch for it."; \
+      exit 1; \
+    fi; \
+    go mod download "$mod"; \
+    src="$(go list -m -f '{{.Dir}}' "$mod")"; \
+    [ -n "$src" ] && [ -f "$src/lmdb/count.go" ] || { echo "ERROR: no source for $mod $want at '$src'"; exit 1; }; \
+    [ ! -e third_party/eventstore ] || { echo "ERROR: third_party/eventstore already exists upstream"; exit 1; }; \
+    mkdir -p third_party; cp -r "$src" third_party/eventstore; chmod -R u+w third_party/eventstore; \
+    n=0; for p in /patches/eventstore/*.patch; do \
+      [ -e "$p" ] || continue; \
+      echo "applying $p to $mod $want"; \
+      git apply --verbose --directory=third_party/eventstore "$p"; n=$((n+1)); \
+    done; \
+    [ "$n" -gt 0 ] || { echo "ERROR: patches/eventstore/ holds no patch; drop this step instead"; exit 1; }; \
+    go mod edit -replace="$mod=./third_party/eventstore"
+
 # Run the tests the patches bring along. Haven loads its config at package
 # init, so they need upstream's example files in place; removed right after.
+# The LMDB count test would spin forever without the eventstore fix: it gives
+# up after 10 s on its own, and `-timeout` bounds the run a second time. It is
+# looked up by name first, because `go test -run` passes when nothing matches.
 RUN --mount=type=cache,target=/gomod-cache --mount=type=cache,target=/go-cache \
     set -e; cp .env.example .env; \
     for f in *.example.json; do cp "$f" "${f%.example.json}.json"; done; \
     go test -count=1 -run 'TestNormalizeNostrAuthHeader' .; \
+    go test -list '^TestLMDBCountReturnsExactNumber$' . | grep -qx 'TestLMDBCountReturnsExactNumber' || \
+      { echo "ERROR: TestLMDBCountReturnsExactNumber is missing (patches/0002-*)"; exit 1; }; \
+    go test -count=1 -timeout 120s -v -run '^TestLMDBCountReturnsExactNumber$' .; \
     rm -f .env relays_import.json relays_blastr.json whitelisted_npubs.json blacklisted_npubs.json
 RUN --mount=type=cache,target=/gomod-cache --mount=type=cache,target=/go-cache \
     go build -a -tags netgo -ldflags '-w -s -extldflags "-static"' -o haven .

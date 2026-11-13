@@ -1,0 +1,125 @@
+diff --git a/lmdb_count_test.go b/lmdb_count_test.go
+new file mode 100644
+index 0000000..3fa06f3
+--- /dev/null
++++ b/lmdb_count_test.go
+@@ -0,0 +1,119 @@
++package main
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/nbd-wtf/go-nostr"
++)
++
++// Regression test carried by haven-docker until Haven ships an eventstore with
++// fiatjaf/eventstore#78 (barrydeen/haven#139).
++//
++// eventstore v0.17.5 counts a matching LMDB row and then loops without
++// advancing the cursor: a NIP-45 COUNT that matches at least one event never
++// returns and pegs a core, on a goroutine that ignores its context. It also
++// runs the extra author/kind/tag checks against nil slices, so a count that
++// needs one of them returns 0. Both are fixed by fiatjaf/eventstore#78.
++//
++// The backend comes from Haven's own constructor and Haven's own module
++// graph, so this fails when the image would be built without that fix.
++func TestLMDBCountReturnsExactNumber(t *testing.T) {
++	db := newLMDBBackend(t.TempDir())
++	db.EnableHLLCacheFor = func(kind int) (bool, bool) { return false, false }
++	if err := db.Init(); err != nil {
++		t.Fatal(err)
++	}
++	// A count that hangs keeps its read transaction open forever; closing the
++	// environment underneath it would crash instead of reporting the hang.
++	hung := false
++	t.Cleanup(func() {
++		if !hung {
++			db.Close()
++		}
++	})
++
++	ctx := context.Background()
++	target := "0000000000000000000000000000000000000000000000000000000000000001"
++	save := func(sk string, kind int, createdAt int, tags nostr.Tags) {
++		t.Helper()
++		evt := &nostr.Event{CreatedAt: nostr.Timestamp(createdAt), Kind: kind, Tags: tags}
++		if err := evt.Sign(sk); err != nil {
++			t.Fatal(err)
++		}
++		if err := db.SaveEvent(ctx, evt); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	alice, bob := nostr.GeneratePrivateKey(), nostr.GeneratePrivateKey()
++	alicePub, _ := nostr.GetPublicKey(alice)
++	for i := 0; i < 3; i++ {
++		save(alice, 1, 1000+i, nostr.Tags{{"e", target}, {"t", "haven"}})
++		save(alice, 7, 2000+i, nostr.Tags{{"e", target}})
++	}
++	// Noise the filters below must not count.
++	for i := 0; i < 2; i++ {
++		save(bob, 1, 3000+i, nostr.Tags{{"t", "other"}})
++		save(bob, 7, 4000+i, nostr.Tags{{"e", target}})
++	}
++
++	const limit = 10 * time.Second
++	within := func(what string, count func() (int64, error)) int64 {
++		t.Helper()
++		type result struct {
++			n   int64
++			err error
++		}
++		done := make(chan result, 1)
++		go func() {
++			n, err := count()
++			done <- result{n, err}
++		}()
++		select {
++		case r := <-done:
++			if r.err != nil {
++				t.Errorf("%s: %v", what, r.err)
++			}
++			return r.n
++		case <-time.After(limit):
++			hung = true
++			t.Fatalf("%s did not return within %s: the LMDB count hang is back "+
++				"(fiatjaf/eventstore#78). Is patches/eventstore still applied?", what, limit)
++			return 0
++		}
++	}
++
++	for _, tt := range []struct {
++		name   string
++		filter nostr.Filter
++		want   int64
++	}{
++		{"kind", nostr.Filter{Kinds: []int{1}}, 5},
++		{"author", nostr.Filter{Authors: []string{alicePub}}, 6},
++		{"author and kind", nostr.Filter{Authors: []string{alicePub}, Kinds: []int{1}}, 3},
++		{"tag", nostr.Filter{Tags: nostr.TagMap{"t": {"haven"}}}, 3},
++		{"tag and kind", nostr.Filter{Kinds: []int{7}, Tags: nostr.TagMap{"e": {target}}}, 5},
++		{"tag and author", nostr.Filter{Authors: []string{alicePub}, Tags: nostr.TagMap{"e": {target}}}, 6},
++		{"tag, author and kind", nostr.Filter{Authors: []string{alicePub}, Kinds: []int{7}, Tags: nostr.TagMap{"e": {target}}}, 3},
++		{"two tags", nostr.Filter{Tags: nostr.TagMap{"e": {target}, "t": {"haven"}}}, 3},
++	} {
++		what := "CountEvents(" + tt.name + ")"
++		got := within(what, func() (int64, error) { return db.CountEvents(ctx, tt.filter) })
++		if got != tt.want {
++			t.Errorf("%s = %d, want %d", what, got, tt.want)
++		}
++	}
++
++	// Haven v1.2.2 registers no CountEventsHLL hook, but the same loop lives
++	// there and a later khatru wiring would reach it.
++	hll := nostr.Filter{Kinds: []int{7}, Tags: nostr.TagMap{"e": {target}}}
++	got := within("CountEventsHLL(tag and kind)", func() (int64, error) {
++		n, _, err := db.CountEventsHLL(ctx, hll, 0)
++		return n, err
++	})
++	if got != 5 {
++		t.Errorf("CountEventsHLL(tag and kind) = %d, want 5", got)
++	}
++}

@@ -1,0 +1,190 @@
+From 292b3b6e0518199df33a5bb55e27ed9016dbbefb Mon Sep 17 00:00:00 2001
+From: Yasuhiro Matsumoto <mattn.jp@gmail.com>
+Date: Mon, 19 Oct 2026 09:29:34 +0900
+Subject: [PATCH] lmdb: advance the cursor when counting and skip absent extra
+ checks
+
+CountEvents and CountEventsHLL never called it.next() after counting a
+match, so the first matching key was counted again and again: any count
+that matched at least one event spun forever inside the read transaction.
+
+They also applied the extra author, kind and tag checks unconditionally,
+while prepareQueries returns nil for the checks a query does not need (and
+QueryEvents guards each one with "!= nil"). slices.Contains on a nil slice
+is false, so a count that needed some extra check, e.g. {"kinds":[7],
+"#e":[...]}, rejected every event and returned 0.
+
+New test cases cover an index-only count, counts checked against the
+event's author/kind and tag, and CountEventsHLL; each was verified to hang
+or return 0 against the unpatched code.
+---
+ lmdb/count.go      | 14 ++++---
+ lmdb/count_test.go | 92 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 101 insertions(+), 5 deletions(-)
+ create mode 100644 lmdb/count_test.go
+
+diff --git a/lmdb/count.go b/lmdb/count.go
+index a32fe1b..3f43be7 100644
+--- a/lmdb/count.go
++++ b/lmdb/count.go
+@@ -60,13 +60,13 @@ func (b *LMDBBackend) CountEvents(ctx context.Context, filter nostr.Filter) (int
+ 					}
+ 
+ 					// check it against pubkeys without decoding the entire thing
+-					if !slices.Contains(extraAuthors, [32]byte(val[32:64])) {
++					if extraAuthors != nil && !slices.Contains(extraAuthors, [32]byte(val[32:64])) {
+ 						it.next()
+ 						continue
+ 					}
+ 
+ 					// check it against kinds without decoding the entire thing
+-					if !slices.Contains(extraKinds, [2]byte(val[132:134])) {
++					if extraKinds != nil && !slices.Contains(extraKinds, [2]byte(val[132:134])) {
+ 						it.next()
+ 						continue
+ 					}
+@@ -78,13 +78,15 @@ func (b *LMDBBackend) CountEvents(ctx context.Context, filter nostr.Filter) (int
+ 					}
+ 
+ 					// if there is still a tag to be checked, do it now
+-					if !evt.Tags.ContainsAny(extraTagKey, extraTagValues) {
++					if extraTagValues != nil && !evt.Tags.ContainsAny(extraTagKey, extraTagValues) {
+ 						it.next()
+ 						continue
+ 					}
+ 
+ 					count++
+ 				}
++
++				it.next()
+ 			}
+ 		}
+ 
+@@ -150,7 +152,7 @@ func (b *LMDBBackend) CountEventsHLL(ctx context.Context, filter nostr.Filter, o
+ 					hll.AddBytes(val[32:64])
+ 				} else {
+ 					// check it against kinds without decoding the entire thing
+-					if !slices.Contains(extraKinds, [2]byte(val[132:134])) {
++					if extraKinds != nil && !slices.Contains(extraKinds, [2]byte(val[132:134])) {
+ 						it.next()
+ 						continue
+ 					}
+@@ -162,7 +164,7 @@ func (b *LMDBBackend) CountEventsHLL(ctx context.Context, filter nostr.Filter, o
+ 					}
+ 
+ 					// if there is still a tag to be checked, do it now
+-					if !evt.Tags.ContainsAny(extraTagKey, extraTagValues) {
++					if extraTagValues != nil && !evt.Tags.ContainsAny(extraTagKey, extraTagValues) {
+ 						it.next()
+ 						continue
+ 					}
+@@ -170,6 +172,8 @@ func (b *LMDBBackend) CountEventsHLL(ctx context.Context, filter nostr.Filter, o
+ 					count++
+ 					hll.Add(evt.PubKey)
+ 				}
++
++				it.next()
+ 			}
+ 		}
+ 
+diff --git a/lmdb/count_test.go b/lmdb/count_test.go
+new file mode 100644
+index 0000000..37d3ff3
+--- /dev/null
++++ b/lmdb/count_test.go
+@@ -0,0 +1,92 @@
++package lmdb
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/nbd-wtf/go-nostr"
++)
++
++// Counting must advance the cursor past every match: it used to count the
++// first matching key and then spin on it forever.
++func TestCountAdvancesPastMatches(t *testing.T) {
++	db := &LMDBBackend{Path: t.TempDir(), EnableHLLCacheFor: func(kind int) (bool, bool) { return false, false }}
++	if err := db.Init(); err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++
++	ctx := context.Background()
++	sk := nostr.GeneratePrivateKey()
++	target := "0000000000000000000000000000000000000000000000000000000000000001"
++	for i := 0; i < 3; i++ {
++		for _, kind := range []int{1, 7} {
++			evt := &nostr.Event{CreatedAt: nostr.Timestamp(1000 + i), Kind: kind, Tags: nostr.Tags{{"e", target}}}
++			if err := evt.Sign(sk); err != nil {
++				t.Fatal(err)
++			}
++			if err := db.SaveEvent(ctx, evt); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	pk, _ := nostr.GetPublicKey(sk)
++
++	within := func(t *testing.T, f func() int64) int64 {
++		t.Helper()
++		done := make(chan int64, 1)
++		go func() { done <- f() }()
++		select {
++		case n := <-done:
++			return n
++		case <-time.After(10 * time.Second):
++			t.Fatal("count did not return")
++			return 0
++		}
++	}
++
++	for _, tt := range []struct {
++		name   string
++		filter nostr.Filter
++		want   int64
++	}{
++		{"index only", nostr.Filter{Kinds: []int{1}}, 3},
++		{"checked against the event", nostr.Filter{Authors: []string{pk}, Kinds: []int{7}}, 3},
++		{"checked against a tag", nostr.Filter{Kinds: []int{7}, Tags: nostr.TagMap{"e": {target}}}, 3},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			got := within(t, func() int64 {
++				n, err := db.CountEvents(ctx, tt.filter)
++				if err != nil {
++					t.Error(err)
++				}
++				return n
++			})
++			if got != tt.want {
++				t.Errorf("CountEvents = %d, want %d", got, tt.want)
++			}
++		})
++	}
++
++	for _, tt := range []struct {
++		name   string
++		filter nostr.Filter
++		want   int64
++	}{
++		{"hll", nostr.Filter{Kinds: []int{7}, Tags: nostr.TagMap{"e": {target}}}, 3},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			got := within(t, func() int64 {
++				n, _, err := db.CountEventsHLL(ctx, tt.filter, 0)
++				if err != nil {
++					t.Error(err)
++				}
++				return n
++			})
++			if got != tt.want {
++				t.Errorf("CountEventsHLL = %d, want %d", got, tt.want)
++			}
++		})
++	}
++}
+-- 
+2.56.1
+
