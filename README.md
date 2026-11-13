@@ -137,6 +137,20 @@ end up executable. Nobody but your own user needs access here — the container
 runs as `${DOCKER_UID}:${DOCKER_GID}`, which is you. Use `750`/`640` instead if
 you want the group to read as well.
 
+### The admin dashboard is not in these images
+
+Upstream's admin dashboard (`/admin`, `MANAGEMENT_API_ENABLED`) exists only on
+Haven's `master` branch. No Haven release contains it, and the images published
+here are built from the release tag `v1.2.2`, so the `MANAGEMENT_*` variables
+have no effect in them.
+
+If you build an image from `master` yourself: the patches in `patches/` are cut
+for `v1.2.2` and the build stops when one does not apply. With
+`DB_ENGINE=lmdb` the Media tab of the dashboard never finishes loading and one
+CPU core stays busy, because the media list counts its entries with the same
+library call as the `COUNT` request above (read in upstream's source at
+`60b58ea`, reported in #15). On `badger` the tab loads.
+
 ### Optional: customize the web dashboard
 
 To override the baked-in templates, copy the examples and re-enable the volume in `docker-compose.yml` (and `docker-compose.tor.yml` if you use Tor):
@@ -433,6 +447,9 @@ The check in step 4 makes a second backup from the new database and compares
 it with the first, entry by entry (CRC32). It reads the entries with the
 host's `unzip`, or with the one inside the image when the host has none, and
 the output says which. No `unzip` has to be installed on the host.
+
+On `lmdb`, use image `v1.2.2-8` or later. In older images a single `COUNT`
+request from any client keeps one CPU core busy until the relay is restarted.
 
 If a step fails, it puts the old directories back and sets `DB_ENGINE` to
 match them; if it cannot, it tells you what to do. Your old data stays in `db/.pre-switch-<old engine>-<time>/`. `./haven` never

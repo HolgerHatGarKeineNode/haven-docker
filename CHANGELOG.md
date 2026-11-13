@@ -1,14 +1,24 @@
 # Changelog
 
-## CLI — unreleased (db-switch on a host without unzip)
+## Image v1.2.2-8 — unreleased (LMDB: a COUNT request no longer hangs the relay; db-switch without a host unzip)
 
-A change to the `./haven` CLI on the host; no new image. It comes from
-[#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15), where
-`db-switch` refused to run on a host that has no `unzip` and cannot install
-one.
+A new image and changes to the `./haven` CLI on the host. Both come from
+[#15](https://github.com/HolgerHatGarKeineNode/haven-docker/issues/15).
 
 ### Fixed
 
+- With `DB_ENGINE=lmdb`, a NIP-45 `COUNT` request that matches at least one
+  event is answered with the number of matching events. In images up to
+  `v1.2.2-7` such a request never got an answer and kept one CPU core busy
+  until the relay was restarted; any client could send it without logging in
+  (measured on `v1.2.2-7`: 99 % of a core 25 s after one request). A count
+  with an extra author, kind or tag condition returned 0. `badger` was not
+  affected
+- The fix is the library's own (fiatjaf/eventstore#78, merged there and not in
+  the version Haven `v1.2.2` uses), carried in `patches/eventstore/` and
+  tested in the image build. The database format is unchanged: an existing
+  lmdb database opens as it is, and an older image can still open it
+  afterwards
 - `./haven db-switch` no longer stops in its first step on a host without
   `unzip`. It compares the two backups entry by entry with the host's `unzip`
   when there is one and with the `unzip` inside the image otherwise, as
