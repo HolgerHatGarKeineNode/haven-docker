@@ -76,7 +76,7 @@ The `./haven` CLI is a bash script that runs on the host. It needs:
 
 | | |
 |---|---|
-| Required | **bash 4.2 or newer** (`./haven help` runs on any bash) and the usual Unix tools, among them `awk`, `sed`, `grep`, `find`, `stat`, `date`, `id`, `od`, `du`, `df`, `mktemp`, `sort`, `tail`, `head`, `tr`, `cut`, `wc`, `cp`, `mv`, `rm`, `mkdir`, `chmod`, `chown` |
+| Required | **bash 4.2 or newer** and the usual Unix tools, among them `awk`, `sed`, `grep`, `find`, `stat`, `date`, `id`, `od`, `du`, `df`, `mktemp`, `sort`, `tail`, `head`, `tr`, `cut`, `wc`, `cp`, `mv`, `rm`, `mkdir`, `chmod`, `chown` |
 | For the TUI (`./haven` without arguments) | a terminal, plus `tput`, `stty`, `mkfifo` and `seq` |
 | Optional | `unzip`: `backup`, `restore` and `db-switch` check the zips with the host's `unzip` and use the one inside the image when the host has none. `jq` or `python3`: only to edit the JSON lists through `./haven`; without both, edit the files by hand. `setsid`: used for the log pane when it is there |
 
@@ -84,10 +84,12 @@ Platforms:
 
 - **Linux** with GNU tools: tested. The test suite and the real-Docker runs
   happen here.
-- **macOS**: untested. It ships bash 3.2, and `./haven` stops with a message
-  that asks for a newer one (for example `brew install bash`). The script
-  carries the BSD forms of `stat` and `date` and does not depend on `setsid`,
-  but no run on macOS has confirmed the rest.
+- **macOS**: untested. It ships bash 3.2; on that version every `./haven`
+  call, `help` included, stops with a message that asks for bash 4.2 or newer
+  (measured with bash 3.2.57 in a Linux container, not on a Mac). Install one
+  (for example `brew install bash`) and make sure it comes first on your
+  `PATH`. The script carries the BSD forms of `stat` and `date` and does not
+  depend on `setsid`, but no run on macOS has confirmed the rest.
 - **Windows**: use WSL2 and run everything inside the Linux distribution.
   Untested.
 - **NAS and other minimal hosts** (BusyBox tools, no package manager):
@@ -148,7 +150,8 @@ If you build an image from `master` yourself: the patches in `patches/` are cut
 for `v1.2.2` and the build stops when one does not apply. With
 `DB_ENGINE=lmdb` the Media tab of the dashboard never finishes loading and one
 CPU core stays busy, because the media list counts its entries with the same
-library call as the `COUNT` request above (read in upstream's source at
+library call that hangs on a `COUNT` request (see
+[Switching the database engine](#switching-the-database-engine)) (read in upstream's source at
 `60b58ea`, reported in #15). On `badger` the tab loads.
 
 ### Optional: customize the web dashboard

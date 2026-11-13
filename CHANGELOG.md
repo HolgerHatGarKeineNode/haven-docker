@@ -29,7 +29,11 @@ A new image and changes to the `./haven` CLI on the host. Both come from
   interval expression (`{8}`). Older `mawk` builds do not support intervals;
   there the list would come out empty and every switch would be undone. Not
   reproduced on such a host, the pattern was changed on reading
-- The TUI names the missing tool and exits when `tput`, `stty` or `mkfifo` is
+- On bash older than 4.2 every `./haven` call stops with the message that asks
+  for a newer bash. Until now `./haven` and `./haven help` were let through
+  and died with `declare: -A: invalid option` (measured on bash 3.2.57, the
+  version macOS ships)
+- The TUI names the missing tool and exits when `tput`, `stty`, `mkfifo` or `seq` is
   not installed, before it changes the terminal, instead of dying in the
   middle of its start
 

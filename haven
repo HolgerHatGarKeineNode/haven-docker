@@ -6,19 +6,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
 
 # Bash version guard: the script needs bash >= 4.2 — `printf %(%s)T`
-# (tui_update_docker_status) requires 4.2 and `exec {fd}<` (start_log_stream)
-# requires 4.1. Help/usage stay reachable on older shells (macOS ships 3.2).
-case "${1:-}" in
-  help|-h|--help|"") : ;;
-  *)
-    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
-      printf 'haven: bash 4.2 or newer is required, found %s.\n' "$BASH_VERSION" >&2
-      printf 'haven: macOS ships bash 3.2 by default — install a newer bash (e.g. brew install bash).\n' >&2
-      printf 'haven: run "%s help" for usage on any bash.\n' "$SCRIPT_NAME" >&2
-      exit 1
-    fi
-    ;;
-esac
+# (tui_update_docker_status) requires 4.2, `exec {fd}<` (start_log_stream)
+# requires 4.1 and `declare -A` requires 4.0. It covers every call, help
+# included: on bash 3.2 (what macOS ships) the first `declare -A` further down
+# ends the script with "declare: -A: invalid option" (measured on 3.2.57).
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
+  printf 'haven: bash 4.2 or newer is required, found %s.\n' "$BASH_VERSION" >&2
+  printf 'haven: macOS ships bash 3.2 by default — install a newer bash (e.g. brew install bash) and run: bash ./%s\n' "$SCRIPT_NAME" >&2
+  printf 'haven: without it, plain "docker compose up -d" runs the relay; see "Without the CLI" in the README.\n' >&2
+  exit 1
+fi
 
 CLR_RESET=""
 CLR_RED=""
@@ -8343,7 +8340,7 @@ tui_loop() {
   # The TUI drives the terminal with tput and stty. A minimal host (BusyBox,
   # no ncurses) may lack one; say which, before anything touches the terminal.
   local tui_tool
-  for tui_tool in tput stty mkfifo; do
+  for tui_tool in tput stty mkfifo seq; do
     if ! command -v "$tui_tool" >/dev/null 2>&1; then
       printf '%s: the TUI needs %s, which is not installed on this host; use the commands instead, e.g. ./%s status, ./%s start, ./%s backup — ./%s help lists them all.\n' \
         "$SCRIPT_NAME" "$tui_tool" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" "$SCRIPT_NAME" >&2
